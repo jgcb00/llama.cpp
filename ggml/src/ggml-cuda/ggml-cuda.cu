@@ -290,6 +290,18 @@ static ggml_cuda_device_info ggml_cuda_init() {
 #else
         info.devices[id].smpbo = prop.sharedMemPerBlockOptin;
         info.devices[id].cc = 100*prop.major + 10*prop.minor;
+        // Some CUDA-toolkit / driver combinations return a corrupt
+        // sharedMemPerBlockOptin in cudaDeviceProp (observed: 0x100000001 on
+        // H100 under CUDA 13.2). Cross-check via the attribute API and fix up
+        // if they disagree — the attribute is the authoritative source.
+        {
+            int smpbo_attr = 0;
+            if (cudaDeviceGetAttribute(&smpbo_attr, cudaDevAttrMaxSharedMemoryPerBlockOptin, id) == cudaSuccess) {
+                if ((size_t) smpbo_attr != info.devices[id].smpbo) {
+                    info.devices[id].smpbo = (size_t) smpbo_attr;
+                }
+            }
+        }
         GGML_LOG_INFO("  Device %d: %s, compute capability %d.%d, VMM: %s, VRAM: %zu MiB\n",
                       id, prop.name, prop.major, prop.minor, device_vmm ? "yes" : "no",
                       (size_t)(prop.totalGlobalMem / (1024 * 1024)));

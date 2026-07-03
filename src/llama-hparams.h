@@ -162,6 +162,16 @@ struct llama_hparams {
     // for Kimi Linear KDA
     uint32_t n_embd_head_kda = 0;
 
+    // Dragon (Mamba3-MIMO + Diff-TPA-V2 + geodesic-residual)
+    uint32_t dragon_mamba_mimo_dim   = 0; // R, rank-dim of Q/K/MIMO
+    uint32_t dragon_mamba_headdim    = 0; // D_v, value-head dim inside the SSM
+    uint32_t dragon_n_signal_heads   = 0; // attention output: snr·n_noise = n_signal
+    uint32_t dragon_n_noise_heads    = 0; // KV-head count for V-layer attention
+    uint32_t dragon_tpa_rank         = 0; // TPA factorization rank
+    uint32_t dragon_num_rope_angles  = 0; // head-angle dimension inside Mamba3-MIMO
+    uint32_t dragon_slw_wsize        = 0; // scalable-softmax position clamp (and Phase 5+: SWA window)
+    float    dragon_gate_bias        = 0.0f; // additive bias inside the elementwise gate (silu(g+b))
+
     bool ssm_dt_b_c_rms = false;
 
     float f_clamp_kqv      = 0.0f;

@@ -140,6 +140,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_KIMI_LINEAR,      "kimi-linear"      },
     { LLM_ARCH_TALKIE,           "talkie"           },
     { LLM_ARCH_MELLUM,           "mellum"           },
+    { LLM_ARCH_DRAGON,           "dragon"           },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
@@ -497,6 +498,31 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_NEXTN_HNORM,                            "blk.%d.nextn.hnorm" },
     { LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,                 "blk.%d.nextn.shared_head_head" },
     { LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,                 "blk.%d.nextn.shared_head_norm" },
+    // Dragon: SSM (Mamba3-MIMO) per-block tensors. SSM_IN reused for the
+    // "static" projection (z,x,dt,A,trap); SSM_IN_DYN is the new dynamic part
+    // (B,C,angles). MIMO_X/Z/O are the up/up/down per-head projections.
+    { LLM_TENSOR_SSM_IN_DYN,                             "blk.%d.ssm_in_dyn" },
+    { LLM_TENSOR_SSM_B_BIAS,                             "blk.%d.ssm_b_bias" },
+    { LLM_TENSOR_SSM_C_BIAS,                             "blk.%d.ssm_c_bias" },
+    { LLM_TENSOR_SSM_DT_BIAS,                            "blk.%d.ssm_dt_bias" },
+    { LLM_TENSOR_SSM_MIMO_X,                             "blk.%d.ssm_mimo_x" },
+    { LLM_TENSOR_SSM_MIMO_Z,                             "blk.%d.ssm_mimo_z" },
+    { LLM_TENSOR_SSM_MIMO_O,                             "blk.%d.ssm_mimo_o" },
+    // Dragon: Differential-TPA-V2 attention (TPA factorization + token shift +
+    // diff combine + scalable softmax). c_q is loaded under LLM_TENSOR_ATTN_Q.
+    { LLM_TENSOR_ATTN_WA_K,                              "blk.%d.attn_wa_k" },
+    { LLM_TENSOR_ATTN_WA_V,                              "blk.%d.attn_wa_v" },
+    { LLM_TENSOR_ATTN_WB_K,                              "blk.%d.attn_wb_k" },
+    { LLM_TENSOR_ATTN_WB_V,                              "blk.%d.attn_wb_v" },
+    { LLM_TENSOR_ATTN_SHIFT_K,                           "blk.%d.attn_shift_k" },
+    { LLM_TENSOR_ATTN_SHIFT_V,                           "blk.%d.attn_shift_v" },
+    { LLM_TENSOR_ATTN_LAMBDA,                            "blk.%d.attn_lambda" },
+    { LLM_TENSOR_ATTN_SOFTMAX_SCALER,                    "blk.%d.attn_softmax_scaler" },
+    // Dragon: geodesic-residual update parameters (two pairs per block).
+    { LLM_TENSOR_GEODESIC_MIXER_SCALE,                   "blk.%d.geo_mixer_scale" },
+    { LLM_TENSOR_GEODESIC_MIXER_BIAS,                    "blk.%d.geo_mixer_bias" },
+    { LLM_TENSOR_GEODESIC_MLP_SCALE,                     "blk.%d.geo_mlp_scale" },
+    { LLM_TENSOR_GEODESIC_MLP_BIAS,                      "blk.%d.geo_mlp_bias" },
     { LLM_TENSOR_ATTN_SUB_NORM,                          "blk.%d.attn_sub_norm" },
     { LLM_TENSOR_FFN_SUB_NORM,                           "blk.%d.ffn_sub_norm" },
     { LLM_TENSOR_DEC_OUTPUT_NORM,                        "dec.output_norm" },
@@ -854,6 +880,26 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     // eagle3
     {LLM_TENSOR_FC,                         {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
     {LLM_TENSOR_D2T,                        {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_GET_ROWS}},
+    // Dragon (Mamba3-MIMO + Diff-TPA-V2 + geodesic-residual)
+    {LLM_TENSOR_SSM_IN_DYN,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_SSM_B_BIAS,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_SSM_C_BIAS,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_SSM_DT_BIAS,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_SSM_MIMO_X,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_SSM_MIMO_Z,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_SSM_MIMO_O,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_WA_K,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_WA_V,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_WB_K,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_WB_V,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_SHIFT_K,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_SHIFT_V,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_LAMBDA,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ATTN_SOFTMAX_SCALER,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_GEODESIC_MIXER_SCALE,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_GEODESIC_MIXER_BIAS,        {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_GEODESIC_MLP_SCALE,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_GEODESIC_MLP_BIAS,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
 };
 
 LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
@@ -945,6 +991,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_DRAGON:
             return true;
         default:
             return false;
@@ -1000,6 +1047,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_MINIMAX_M2:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_DRAGON:
             return false;
         default:
             return true;

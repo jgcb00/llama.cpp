@@ -2423,6 +2423,126 @@ class TensorNameMap:
                 "model.layers.{bid}.post_attention_layernorm",
             ),
         },
+        # Dragon: all per-block tensors live under model.layers.{bid}.
+        # M and V layers share the mixer namespace (model.layers.{bid}.mixer.*)
+        # but the mixer field names differ. Mixers are dispatched by layer type
+        # in the converter; this map is the union of both flavors' tensors.
+        MODEL_ARCH.DRAGON: {
+            # Block-level: mixer_proj (the post-mixer down-projection to hidden).
+            MODEL_TENSOR.ATTN_OUT: (
+                "model.layers.{bid}.mixer_proj",
+            ),
+            # V-layer block-level gate (silu(gate_proj(x) + 1.15)).
+            MODEL_TENSOR.ATTN_GATE: (
+                "model.layers.{bid}.gate_proj",
+            ),
+            # Geodesic-residual: two pairs of learned scalars per block.
+            MODEL_TENSOR.GEODESIC_MIXER_SCALE: (
+                "model.layers.{bid}.geodesic_mixer.scale",
+            ),
+            MODEL_TENSOR.GEODESIC_MIXER_BIAS: (
+                "model.layers.{bid}.geodesic_mixer.bias",
+            ),
+            MODEL_TENSOR.GEODESIC_MLP_SCALE: (
+                "model.layers.{bid}.geodesic_mlp.scale",
+            ),
+            MODEL_TENSOR.GEODESIC_MLP_BIAS: (
+                "model.layers.{bid}.geodesic_mlp.bias",
+            ),
+            # M layer: Mamba3-MIMO.
+            MODEL_TENSOR.SSM_IN: (
+                "model.layers.{bid}.mixer.in_proj",         # split heads: [z, x, dt, A, trap]
+            ),
+            MODEL_TENSOR.SSM_IN_DYN: (
+                "model.layers.{bid}.mixer.in_proj_dyn",     # split: [B, C, angles]
+            ),
+            MODEL_TENSOR.SSM_B_NORM: (
+                "model.layers.{bid}.mixer.B_norm.norm",
+            ),
+            MODEL_TENSOR.SSM_C_NORM: (
+                "model.layers.{bid}.mixer.C_norm.norm",
+            ),
+            MODEL_TENSOR.SSM_B_BIAS: (
+                "model.layers.{bid}.mixer.B_bias",
+            ),
+            MODEL_TENSOR.SSM_C_BIAS: (
+                "model.layers.{bid}.mixer.C_bias",
+            ),
+            MODEL_TENSOR.SSM_DT_BIAS: (
+                "model.layers.{bid}.mixer.dt_bias",
+            ),
+            MODEL_TENSOR.SSM_D: (
+                "model.layers.{bid}.mixer.D",
+            ),
+            MODEL_TENSOR.SSM_MIMO_X: (
+                "model.layers.{bid}.mixer.in_proj_mimo_x",
+            ),
+            MODEL_TENSOR.SSM_MIMO_Z: (
+                "model.layers.{bid}.mixer.in_proj_mimo_z",
+            ),
+            MODEL_TENSOR.SSM_MIMO_O: (
+                "model.layers.{bid}.mixer.out_proj_mimo",
+            ),
+            # V layer: Differential-TPA-V2 attention.
+            MODEL_TENSOR.ATTN_Q: (
+                "model.layers.{bid}.mixer.c_q",
+            ),
+            MODEL_TENSOR.ATTN_WA_K: (
+                "model.layers.{bid}.mixer.W_A_k",
+            ),
+            MODEL_TENSOR.ATTN_WA_V: (
+                "model.layers.{bid}.mixer.W_A_v",
+            ),
+            MODEL_TENSOR.ATTN_WB_K: (
+                "model.layers.{bid}.mixer.W_B_k",
+            ),
+            MODEL_TENSOR.ATTN_WB_V: (
+                "model.layers.{bid}.mixer.W_B_v",
+            ),
+            MODEL_TENSOR.ATTN_Q_NORM: (
+                "model.layers.{bid}.mixer.q_norm.norm",
+            ),
+            MODEL_TENSOR.ATTN_K_NORM: (
+                "model.layers.{bid}.mixer.k_norm.norm",
+            ),
+            MODEL_TENSOR.ATTN_SHIFT_K: (
+                "model.layers.{bid}.mixer.shift_proj_k",
+            ),
+            MODEL_TENSOR.ATTN_SHIFT_V: (
+                "model.layers.{bid}.mixer.shift_proj_v",
+            ),
+            MODEL_TENSOR.ATTN_LAMBDA: (
+                "model.layers.{bid}.mixer.lambda_proj",
+            ),
+            MODEL_TENSOR.ATTN_SOFTMAX_SCALER: (
+                "model.layers.{bid}.mixer.softmax_scaler",
+            ),
+            # MoE: sigmoid router + bias, 1536→384 bottleneck, ScatterMoE-stacked experts.
+            MODEL_TENSOR.FFN_GATE_INP: (
+                "model.layers.{bid}.mlp.moe_gate",
+            ),
+            MODEL_TENSOR.FFN_EXP_PROBS_B: (
+                "model.layers.{bid}.mlp.expert_bias",
+            ),
+            MODEL_TENSOR.MOE_LATENT_DOWN: (
+                "model.layers.{bid}.mlp.down_proj",
+            ),
+            MODEL_TENSOR.MOE_LATENT_UP: (
+                "model.layers.{bid}.mlp.up_proj",
+            ),
+            MODEL_TENSOR.FFN_UP_EXP: (
+                "model.layers.{bid}.mlp.experts.experts",        # (n_exp, intermediate, in_dim)
+            ),
+            MODEL_TENSOR.FFN_DOWN_EXP: (
+                "model.layers.{bid}.mlp.experts.output_experts", # (n_exp, in_dim, intermediate)
+            ),
+            MODEL_TENSOR.FFN_UP_SHEXP: (
+                "model.layers.{bid}.mlp.shared_experts.fc_1",
+            ),
+            MODEL_TENSOR.FFN_DOWN_SHEXP: (
+                "model.layers.{bid}.mlp.shared_experts.fc_2",
+            ),
+        },
     }
 
     mapping: dict[str, tuple[MODEL_TENSOR, str]]

@@ -145,6 +145,7 @@ enum llm_arch {
     LLM_ARCH_MELLUM,
     LLM_ARCH_EAGLE3,
     LLM_ARCH_DFLASH,
+    LLM_ARCH_DRAGON,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -429,6 +430,20 @@ enum llm_tensor {
     LLM_TENSOR_FFN_LATENT_UP,
     LLM_TENSOR_ATTN_Q_NORM,
     LLM_TENSOR_ATTN_K_NORM,
+    // Dragon DifferentialTensorProductAttentionV2
+    LLM_TENSOR_ATTN_WA_K,           // dragon: TPA factor A for K       (hidden -> n_kv * rank)
+    LLM_TENSOR_ATTN_WA_V,           // dragon: TPA factor A for V       (hidden -> n_kv * rank)
+    LLM_TENSOR_ATTN_WB_K,           // dragon: TPA factor B for K       (hidden -> rank * head_dim)
+    LLM_TENSOR_ATTN_WB_V,           // dragon: TPA factor B for V       (hidden -> rank * head_dim)
+    LLM_TENSOR_ATTN_SHIFT_K,        // dragon: token-shift α projection for K  (hidden -> n_kv)
+    LLM_TENSOR_ATTN_SHIFT_V,        // dragon: token-shift α projection for V  (hidden -> n_kv)
+    LLM_TENSOR_ATTN_LAMBDA,         // dragon: diff-V2 λ projection            (hidden -> n_noise)
+    LLM_TENSOR_ATTN_SOFTMAX_SCALER, // dragon: scalable-softmax per-head scaler (n_head,)
+    // Dragon geodesic residual (one pair per residual update; two per block)
+    LLM_TENSOR_GEODESIC_MIXER_SCALE,
+    LLM_TENSOR_GEODESIC_MIXER_BIAS,
+    LLM_TENSOR_GEODESIC_MLP_SCALE,
+    LLM_TENSOR_GEODESIC_MLP_BIAS,
     LLM_TENSOR_LAYER_OUT_NORM,
     LLM_TENSOR_LAYER_OUT_SCALE,
     LLM_TENSOR_POST_ATTN_NORM,
@@ -463,6 +478,15 @@ enum llm_tensor {
     LLM_TENSOR_SSM_OUT,
     LLM_TENSOR_SSM_BETA_ALPHA,      // qwen3next
     LLM_TENSOR_SSM_ALPHA,           // qwen3.5
+    // Dragon Mamba3-MIMO: in_proj is split into a "static" part (z,x,dt,A,trap)
+    // and a "dynamic" part (B,C,angles); per-head biases and MIMO projections.
+    LLM_TENSOR_SSM_IN_DYN,          // dragon: in_proj_dyn (B,C,angles)
+    LLM_TENSOR_SSM_B_BIAS,          // dragon: per-head bias on B before SSM
+    LLM_TENSOR_SSM_C_BIAS,          // dragon: per-head bias on C before SSM
+    LLM_TENSOR_SSM_DT_BIAS,         // dragon: per-head dt bias (additive before softplus)
+    LLM_TENSOR_SSM_MIMO_X,          // dragon: MIMO up-proj for x  (nheads, R, headdim)
+    LLM_TENSOR_SSM_MIMO_Z,          // dragon: MIMO up-proj for z  (nheads, R, headdim)
+    LLM_TENSOR_SSM_MIMO_O,          // dragon: MIMO down-proj for output (nheads, R, headdim)
     // Kimi Linear KDA (using SSM_ prefix for consistency)
     LLM_TENSOR_SSM_CONV1D_Q,        // kimi: Q conv1d weight
     LLM_TENSOR_SSM_CONV1D_K,        // kimi: K conv1d weight

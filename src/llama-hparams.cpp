@@ -198,6 +198,15 @@ uint32_t llama_hparams::n_embd_r() const {
         return 3 * (ssm_d_conv > 0 ? ssm_d_conv - 1 : 3) * d_inner;
     }
 
+    if (dragon_mamba_mimo_dim != 0) {
+        // Dragon V-layer token-shift carry: K_prev and V_prev per layer.
+        // K, V are shape (head_dim, n_kv) per timestep; we cache the last position.
+        // Layout in n_embd_r: first head_dim·n_kv floats = K_prev, then V_prev.
+        // (Slots are allocated for all Dragon layers via the custom filter; M-layers
+        // simply do not read or write to this region.)
+        return 2u * n_embd_head_k_full * dragon_n_noise_heads;
+    }
+
     // TODO: maybe support other convolution strides than 1
     // NOTE: since the first column of the conv_state is shifted out each time, it's not actually needed
     // Corresponds to Mamba's conv_states size
@@ -215,6 +224,25 @@ uint32_t llama_hparams::n_embd_s() const {
         // Full recurrent state: head_dim * head_dim * n_head
         // h tensor shape for delta attention: [head_dim, head_dim, n_head]
         return n_embd_head_kda * n_embd_head_kda * n_head();  // 128 * 128 * 32 = 524288
+    }
+
+    if (dragon_mamba_mimo_dim != 0) {
+        // Dragon M-layer carries four state components per head per layer:
+        //   ssm_state[H, D_v, D_qk]     (the main running state)
+        //   K_state[H, R, D_qk]         (last step's k_rot, for prev_kv term)
+        //   V_state[H, R, D_v]          (last step's v, for prev_kv term)
+        //   angle_state[H, num_angles]  (cumulative rotary angle; num_angles = D_qk/4)
+        // with D_qk = ssm_d_state, D_v = ssm_dt_rank, H = ssm_d_inner/ssm_dt_rank,
+        //      R   = dragon_mamba_mimo_dim, num_angles = ssm_d_state / 4.
+        const uint32_t H     = ssm_d_inner / ssm_dt_rank;
+        const uint32_t D_v   = ssm_dt_rank;
+        const uint32_t D_qk  = ssm_d_state;
+        const uint32_t R     = dragon_mamba_mimo_dim;
+        const uint32_t n_ang = ssm_d_state / 4;
+        return H * D_v * D_qk       // ssm_state
+             + H * R   * D_qk       // K_state
+             + H * R   * D_v        // V_state
+             + H * n_ang;           // angle_state
     }
 
     // corresponds to Mamba's ssm_states size

@@ -302,6 +302,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_kimi_linear(params);
         case LLM_ARCH_STEP35:
             return new llama_model_step35(params);
+        case LLM_ARCH_DRAGON:
+            return new llama_model_dragon(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -2097,6 +2099,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_recr = [&](uint32_t il) {
                             return il < hparams.n_layer() && hparams.is_recr(il);
                         };
+                    } else if (arch == LLM_ARCH_DRAGON) {
+                        // V-layers (= !is_recurrent) need both attention K/V AND a
+                        // recurrent slot for token-shift K_prev/V_prev. M-layers
+                        // need only a recurrent slot.
+                        filter_attn = [&](int32_t il) { return !hparams.is_recr(il); };
+                        filter_recr = [&](int32_t   ) { return true; };
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
@@ -2422,6 +2430,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_DRAGON:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values

@@ -539,6 +539,7 @@ class MODEL_ARCH(IntEnum):
     KIMI_LINEAR      = auto()
     TALKIE           = auto()
     MELLUM           = auto()
+    DRAGON           = auto()
 
 
 class VISION_PROJECTOR_TYPE(IntEnum):
@@ -613,6 +614,20 @@ class MODEL_TENSOR(IntEnum):
     MOE_LATENT_UP        = auto() # nemotron 3 super
     ATTN_Q_NORM          = auto()
     ATTN_K_NORM          = auto()
+    # Dragon Differential-TPA-V2 attention
+    ATTN_WA_K            = auto() # Dragon: TPA factor A for K
+    ATTN_WA_V            = auto() # Dragon: TPA factor A for V
+    ATTN_WB_K            = auto() # Dragon: TPA factor B for K
+    ATTN_WB_V            = auto() # Dragon: TPA factor B for V
+    ATTN_SHIFT_K         = auto() # Dragon: token-shift α projection for K
+    ATTN_SHIFT_V         = auto() # Dragon: token-shift α projection for V
+    ATTN_LAMBDA          = auto() # Dragon: diff-V2 λ projection
+    ATTN_SOFTMAX_SCALER  = auto() # Dragon: per-head scaler for scalable softmax
+    # Dragon geodesic-residual update (one pair per residual; two per block)
+    GEODESIC_MIXER_SCALE = auto() # Dragon
+    GEODESIC_MIXER_BIAS  = auto() # Dragon
+    GEODESIC_MLP_SCALE   = auto() # Dragon
+    GEODESIC_MLP_BIAS    = auto() # Dragon
     LAYER_OUT_NORM       = auto()
     LAYER_OUT_SCALE      = auto()
     PER_LAYER_TOKEN_EMBD = auto() # gemma3n
@@ -652,6 +667,14 @@ class MODEL_TENSOR(IntEnum):
     SSM_BETA             = auto() # Kimi Linear qwen3.5
     SSM_G_A              = auto() # Kimi Linear
     SSM_G_B              = auto() # Kimi Linear
+    # Dragon Mamba3-MIMO
+    SSM_IN_DYN           = auto() # Dragon
+    SSM_B_BIAS           = auto() # Dragon
+    SSM_C_BIAS           = auto() # Dragon
+    SSM_DT_BIAS          = auto() # Dragon
+    SSM_MIMO_X           = auto() # Dragon
+    SSM_MIMO_Z           = auto() # Dragon
+    SSM_MIMO_O           = auto() # Dragon
     TIME_MIX_W0          = auto()
     TIME_MIX_W1          = auto()
     TIME_MIX_W2          = auto()
@@ -1120,6 +1143,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.KIMI_LINEAR:      "kimi-linear",
     MODEL_ARCH.TALKIE:           "talkie",
     MODEL_ARCH.MELLUM:           "mellum",
+    MODEL_ARCH.DRAGON:           "dragon",
 }
 
 VISION_PROJECTOR_TYPE_NAMES: dict[VISION_PROJECTOR_TYPE, str] = {
@@ -1231,6 +1255,25 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.SSM_BETA:                  "blk.{bid}.ssm_beta",             # Kimi Linear qwen3.5
     MODEL_TENSOR.SSM_G_A:                   "blk.{bid}.ssm_g_a",              # Kimi Linear
     MODEL_TENSOR.SSM_G_B:                   "blk.{bid}.ssm_g_b",              # Kimi Linear
+    MODEL_TENSOR.SSM_IN_DYN:                "blk.{bid}.ssm_in_dyn",           # Dragon
+    MODEL_TENSOR.SSM_B_BIAS:                "blk.{bid}.ssm_b_bias",           # Dragon
+    MODEL_TENSOR.SSM_C_BIAS:                "blk.{bid}.ssm_c_bias",           # Dragon
+    MODEL_TENSOR.SSM_DT_BIAS:               "blk.{bid}.ssm_dt_bias",          # Dragon
+    MODEL_TENSOR.SSM_MIMO_X:                "blk.{bid}.ssm_mimo_x",           # Dragon
+    MODEL_TENSOR.SSM_MIMO_Z:                "blk.{bid}.ssm_mimo_z",           # Dragon
+    MODEL_TENSOR.SSM_MIMO_O:                "blk.{bid}.ssm_mimo_o",           # Dragon
+    MODEL_TENSOR.ATTN_WA_K:                 "blk.{bid}.attn_wa_k",            # Dragon
+    MODEL_TENSOR.ATTN_WA_V:                 "blk.{bid}.attn_wa_v",            # Dragon
+    MODEL_TENSOR.ATTN_WB_K:                 "blk.{bid}.attn_wb_k",            # Dragon
+    MODEL_TENSOR.ATTN_WB_V:                 "blk.{bid}.attn_wb_v",            # Dragon
+    MODEL_TENSOR.ATTN_SHIFT_K:              "blk.{bid}.attn_shift_k",         # Dragon
+    MODEL_TENSOR.ATTN_SHIFT_V:              "blk.{bid}.attn_shift_v",         # Dragon
+    MODEL_TENSOR.ATTN_LAMBDA:               "blk.{bid}.attn_lambda",          # Dragon
+    MODEL_TENSOR.ATTN_SOFTMAX_SCALER:       "blk.{bid}.attn_softmax_scaler",  # Dragon
+    MODEL_TENSOR.GEODESIC_MIXER_SCALE:      "blk.{bid}.geo_mixer_scale",      # Dragon
+    MODEL_TENSOR.GEODESIC_MIXER_BIAS:       "blk.{bid}.geo_mixer_bias",       # Dragon
+    MODEL_TENSOR.GEODESIC_MLP_SCALE:        "blk.{bid}.geo_mlp_scale",        # Dragon
+    MODEL_TENSOR.GEODESIC_MLP_BIAS:         "blk.{bid}.geo_mlp_bias",         # Dragon
     MODEL_TENSOR.TIME_MIX_W0:               "blk.{bid}.time_mix_w0",
     MODEL_TENSOR.TIME_MIX_W1:               "blk.{bid}.time_mix_w1",
     MODEL_TENSOR.TIME_MIX_W2:               "blk.{bid}.time_mix_w2",
@@ -4399,6 +4442,53 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE_EXP,
         MODEL_TENSOR.FFN_DOWN_EXP,
         MODEL_TENSOR.FFN_UP_EXP,
+    ],
+    MODEL_ARCH.DRAGON: [
+        # Embedding / output. No final RMSNorm (config.final_norm == false).
+        # No block-level input/postmixer norms either — geodesic_update=true makes
+        # those nn.Identity. Only the in-mixer norms (q_norm, k_norm, B_norm, C_norm) survive.
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_OUT,        # mixer_proj
+        # Geodesic-residual (two pairs per block).
+        MODEL_TENSOR.GEODESIC_MIXER_SCALE,
+        MODEL_TENSOR.GEODESIC_MIXER_BIAS,
+        MODEL_TENSOR.GEODESIC_MLP_SCALE,
+        MODEL_TENSOR.GEODESIC_MLP_BIAS,
+        # M layer (Mamba3-MIMO).
+        MODEL_TENSOR.SSM_IN,          # in_proj (z, x, dt, A, trap split per head)
+        MODEL_TENSOR.SSM_IN_DYN,      # in_proj_dyn (B, C, angles)
+        MODEL_TENSOR.SSM_B_NORM,      # B_norm
+        MODEL_TENSOR.SSM_C_NORM,      # C_norm
+        MODEL_TENSOR.SSM_B_BIAS,
+        MODEL_TENSOR.SSM_C_BIAS,
+        MODEL_TENSOR.SSM_DT_BIAS,
+        MODEL_TENSOR.SSM_D,           # D skip
+        MODEL_TENSOR.SSM_MIMO_X,
+        MODEL_TENSOR.SSM_MIMO_Z,
+        MODEL_TENSOR.SSM_MIMO_O,
+        # V layer (Differential-TPA-V2 attention).
+        MODEL_TENSOR.ATTN_Q,          # c_q (Q projection, full)
+        MODEL_TENSOR.ATTN_WA_K,
+        MODEL_TENSOR.ATTN_WA_V,
+        MODEL_TENSOR.ATTN_WB_K,
+        MODEL_TENSOR.ATTN_WB_V,
+        MODEL_TENSOR.ATTN_Q_NORM,
+        MODEL_TENSOR.ATTN_K_NORM,
+        MODEL_TENSOR.ATTN_SHIFT_K,
+        MODEL_TENSOR.ATTN_SHIFT_V,
+        MODEL_TENSOR.ATTN_LAMBDA,
+        MODEL_TENSOR.ATTN_SOFTMAX_SCALER,
+        MODEL_TENSOR.ATTN_GATE,       # block-level gate_proj (V layers only, but tensor list is union)
+        # MoE (sigmoid router + bias, 1536→384 bottleneck, ReLU² experts, plus dense shared expert).
+        MODEL_TENSOR.FFN_GATE_INP,    # moe_gate
+        MODEL_TENSOR.FFN_EXP_PROBS_B, # expert_bias
+        MODEL_TENSOR.MOE_LATENT_DOWN, # down_proj (1536 → 384)
+        MODEL_TENSOR.MOE_LATENT_UP,   # up_proj (384 → 1536)
+        MODEL_TENSOR.FFN_UP_EXP,      # experts.weight (routed, no gate)
+        MODEL_TENSOR.FFN_DOWN_EXP,    # experts.output_experts.weight
+        MODEL_TENSOR.FFN_UP_SHEXP,    # shared_experts.fc_1
+        MODEL_TENSOR.FFN_DOWN_SHEXP,  # shared_experts.fc_2
     ],
     # TODO
 }

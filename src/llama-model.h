@@ -518,6 +518,32 @@ struct llama_layer {
     // gemma4 layer output scale, reused for talkie embedding skip scale
     struct ggml_tensor * out_scale = nullptr;
 
+    // Dragon Mamba3-MIMO (M layer)
+    struct ggml_tensor * ssm_in_dyn  = nullptr; // in_proj_dyn (hidden, 2·R·d_state + num_rope_angles)
+    struct ggml_tensor * ssm_b_bias  = nullptr; // per-head bias on B  (n_head, R, d_state)
+    struct ggml_tensor * ssm_c_bias  = nullptr; // per-head bias on C  (n_head, R, d_state)
+    struct ggml_tensor * ssm_dt_bias = nullptr; // per-head dt bias    (n_head)
+    struct ggml_tensor * ssm_mimo_x  = nullptr; // (n_head, R, headdim)
+    struct ggml_tensor * ssm_mimo_z  = nullptr; // (n_head, R, headdim)
+    struct ggml_tensor * ssm_mimo_o  = nullptr; // (n_head, R, headdim)
+
+    // Dragon Diff-TPA-V2 (V layer)
+    struct ggml_tensor * attn_wa_k           = nullptr; // (hidden, n_kv · rank)
+    struct ggml_tensor * attn_wa_v           = nullptr; // (hidden, n_kv · rank)
+    struct ggml_tensor * attn_wb_k           = nullptr; // (hidden, rank · head_dim)
+    struct ggml_tensor * attn_wb_v           = nullptr; // (hidden, rank · head_dim)
+    struct ggml_tensor * attn_shift_k        = nullptr; // (hidden, n_kv)
+    struct ggml_tensor * attn_shift_v        = nullptr; // (hidden, n_kv)
+    struct ggml_tensor * attn_lambda         = nullptr; // (hidden, n_noise)
+    struct ggml_tensor * attn_softmax_scaler = nullptr; // (n_head,)
+    struct ggml_tensor * attn_gate           = nullptr; // (hidden, n_signal · head_dim)  block-level gate, V-only
+
+    // Dragon geodesic-residual (two pairs per block, each is a scalar tensor of size 1)
+    struct ggml_tensor * geo_mixer_scale = nullptr;
+    struct ggml_tensor * geo_mixer_bias  = nullptr;
+    struct ggml_tensor * geo_mlp_scale   = nullptr;
+    struct ggml_tensor * geo_mlp_bias    = nullptr;
+
     struct llama_layer_posnet posnet;
 
     struct llama_layer_convnext convnext;

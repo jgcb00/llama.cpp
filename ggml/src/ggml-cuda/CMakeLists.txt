@@ -201,7 +201,7 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_DEBUG)
     endif()
 
-    if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+    if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8" AND NOT GGML_CUDA_COMPRESSION_MODE STREQUAL "")
         # Options are:
         # - none (not recommended)
         # - speed (nvcc's default)
