@@ -8886,6 +8886,8 @@ static void ggml_flash_attn_ext_reduce_partials(
     const int64_t DV        = v->ne[0];
     const int64_t nek1      = k->ne[1];
     const int64_t n_q_heads = q->ne[2];
+    const int64_t n_streams = q->ne[3];
+    const int64_t n_rows    = n_q_heads*n_streams;   // flattened (iq3, iq2), neq1 == 1
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -8902,8 +8904,10 @@ static void ggml_flash_attn_ext_reduce_partials(
     const int64_t ne2 = dst->ne[2];
     const size_t  nb1 = dst->nb[1];
 
-    // Each thread reduces a subset of query heads
-    for (int64_t q_head = ith; q_head < n_q_heads; q_head += nth) {
+    // Each thread reduces a subset of (stream, head) rows
+    for (int64_t row = ith; row < n_rows; row += nth) {
+        const int64_t iq3    = row / n_q_heads;
+        const int64_t q_head = row % n_q_heads;
         float   M_final   = -INFINITY;
         float   S_final   = 0.0f;
         float * VKQ_final = thread_wdata;
@@ -8914,7 +8918,7 @@ static void ggml_flash_attn_ext_reduce_partials(
             const int64_t ic_start = chunk_idx * chunk_size;
             if (ic_start >= nek1) continue;
 
-            const float * partial   = partials_base + (q_head * n_chunks + chunk_idx) * partial_size;
+            const float * partial   = partials_base + (row * n_chunks + chunk_idx) * partial_size;
             const float   M_chunk   = partial[0];
             const float   S_chunk   = partial[1];
             const float * VKQ_chunk = partial + 2;
@@ -8937,8 +8941,8 @@ static void ggml_flash_attn_ext_reduce_partials(
             const float S_inv = 1.0f / S_final;
             ggml_vec_scale_f32(DV, VKQ_final, S_inv);
         }
-        // iq1=0, iq3=0 for decode
-        memcpy((char *) dst->data + (0*ne2*ne1 + q_head + 0*ne1)*nb1, VKQ_final, nb1);
+        // iq1=0 for decode; same row layout as one_chunk's direct write
+        memcpy((char *) dst->data + (iq3*ne2*ne1 + q_head + 0*ne1)*nb1, VKQ_final, nb1);
     }
 }
 
@@ -8991,12 +8995,20 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    // neq1 == 1 (single token per stream) with any number of streams (neq3):
+    // multi-sequence decode with a split KV cache produces neq3 > 1, and with
+    // few q heads the row-parallel fallback below leaves most threads idle
+    // while each busy thread scans a full KV stream alone. Rows here are the
+    // flattened (iq3, iq2) pairs; one_chunk already decodes ir -> (iq3, iq2,
+    // iq1) and offsets K/V/mask by stream, so the split-KV path generalizes
+    // without kernel changes.
+    const bool use_split_kv_path = !use_ref && (neq1 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
+        const int64_t n_rows     = neq2*neq3;   // (stream, head) pairs, neq1 == 1
 
-        // Partials buffer layout: [q_head][kv_chunk][M, S, VKQ]
+        // Partials buffer layout: [row = iq3*neq2 + iq2][kv_chunk][M, S, VKQ]
         const int64_t partial_size  = 2 + DV;
         float *       partials_base = (float *) params->wdata + nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
 
@@ -9007,14 +9019,14 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         float *       chunk_partials = partials_base + ith * partial_size;
 
         if (ic_start < nek1) {
-            for (int64_t q_head = 0; q_head < neq2; q_head++) {
+            for (int64_t row = 0; row < n_rows; row++) {
                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(
-                    params, dst, q_head, q_head + 1, ic_start, ic_end,
+                    params, dst, row, row + 1, ic_start, ic_end,
                     chunk_partials, partial_stride);
             }
         } else {
-            for (int64_t q_head = 0; q_head < neq2; q_head++) {
-                float * q_partials = chunk_partials + q_head * partial_stride;
+            for (int64_t row = 0; row < n_rows; row++) {
+                float * q_partials = chunk_partials + row * partial_stride;
                 q_partials[0] = -INFINITY;  // M
                 q_partials[1] = 0.0f;       // S
             }
