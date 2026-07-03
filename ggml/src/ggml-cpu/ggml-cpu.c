@@ -2980,6 +2980,104 @@ struct ggml_cplan ggml_graph_plan(
 }
 
 
+// ---- lightweight per-op profiler, enabled with GGML_OP_PROFILE=1 ----
+// Times each node on thread 0 (including the closing barrier, so per-node
+// thread-sync cost is attributed to the node). Results printed at exit.
+
+#define GGML_PROF_MAX_NAMES 512
+
+struct ggml_prof_entry {
+    char   name[GGML_MAX_NAME];
+    double us;
+    int64_t n;
+};
+
+static struct {
+    int    enabled; // -1 = unknown, 0 = off, 1 = on
+    double op_us[GGML_OP_COUNT];
+    int64_t op_n[GGML_OP_COUNT];
+    struct ggml_prof_entry names[GGML_PROF_MAX_NAMES];
+    int    n_names;
+    double total_us;
+    int64_t total_nodes;
+    int64_t n_graphs;
+} g_ggml_prof = { -1, {0}, {0}, {{{0}, 0, 0}}, 0, 0.0, 0, 0 };
+
+static void ggml_prof_print(void) {
+    if (g_ggml_prof.enabled != 1 || g_ggml_prof.total_nodes == 0) {
+        return;
+    }
+    fprintf(stderr, "\n== ggml CPU op profile: %lld graphs, %lld nodes, %.1f ms total ==\n",
+            (long long) g_ggml_prof.n_graphs, (long long) g_ggml_prof.total_nodes, g_ggml_prof.total_us / 1000.0);
+    fprintf(stderr, "%-24s %12s %10s %8s\n", "op", "time(ms)", "count", "%");
+    for (;;) {
+        int best = -1;
+        double best_us = 0.0;
+        for (int i = 0; i < GGML_OP_COUNT; i++) {
+            if (g_ggml_prof.op_us[i] > best_us) { best_us = g_ggml_prof.op_us[i]; best = i; }
+        }
+        if (best < 0 || best_us < g_ggml_prof.total_us * 0.002) break;
+        fprintf(stderr, "%-24s %12.1f %10lld %7.1f%%\n", ggml_op_name((enum ggml_op) best),
+                best_us / 1000.0, (long long) g_ggml_prof.op_n[best], 100.0 * best_us / g_ggml_prof.total_us);
+        g_ggml_prof.op_us[best] = -g_ggml_prof.op_us[best]; // mark printed
+    }
+    for (int i = 0; i < GGML_OP_COUNT; i++) {
+        if (g_ggml_prof.op_us[i] < 0) g_ggml_prof.op_us[i] = -g_ggml_prof.op_us[i];
+    }
+    fprintf(stderr, "-- by tensor name (top 40) --\n");
+    for (int k = 0; k < 40; k++) {
+        int best = -1;
+        double best_us = 0.0;
+        for (int i = 0; i < g_ggml_prof.n_names; i++) {
+            if (g_ggml_prof.names[i].us > best_us) { best_us = g_ggml_prof.names[i].us; best = i; }
+        }
+        if (best < 0 || best_us < g_ggml_prof.total_us * 0.002) break;
+        fprintf(stderr, "%-40s %12.1f %10lld %7.1f%%\n", g_ggml_prof.names[best].name,
+                g_ggml_prof.names[best].us / 1000.0, (long long) g_ggml_prof.names[best].n,
+                100.0 * best_us / g_ggml_prof.total_us);
+        g_ggml_prof.names[best].us = -g_ggml_prof.names[best].us;
+    }
+    for (int i = 0; i < g_ggml_prof.n_names; i++) {
+        if (g_ggml_prof.names[i].us < 0) g_ggml_prof.names[i].us = -g_ggml_prof.names[i].us;
+    }
+}
+
+static void ggml_prof_node(const struct ggml_tensor * node, int n_nodes, double us) {
+    g_ggml_prof.op_us[node->op] += us;
+    g_ggml_prof.op_n[node->op]  += 1;
+    g_ggml_prof.total_us        += us;
+    g_ggml_prof.total_nodes     += n_nodes;
+
+    // normalize name: strip trailing "-<digits>" / "_<digits>" so per-layer
+    // tensors aggregate ("ffn_moe_out-31" -> "ffn_moe_out")
+    char key[GGML_MAX_NAME];
+    snprintf(key, sizeof(key), "%s(%s)", ggml_op_name(node->op), node->name);
+    size_t len = strlen(key);
+    // (length-1 guard: never strip the leading char)
+    {
+        size_t e = len - 1; // last char is ')'
+        size_t i = e;
+        while (i > 1 && key[i-1] >= '0' && key[i-1] <= '9') i--;
+        if (i < e && i > 1 && (key[i-1] == '-' || key[i-1] == '_')) {
+            key[i-1] = ')';
+            key[i]   = '\0';
+        }
+    }
+    for (int i = 0; i < g_ggml_prof.n_names; i++) {
+        if (strcmp(g_ggml_prof.names[i].name, key) == 0) {
+            g_ggml_prof.names[i].us += us;
+            g_ggml_prof.names[i].n  += 1;
+            return;
+        }
+    }
+    if (g_ggml_prof.n_names < GGML_PROF_MAX_NAMES) {
+        struct ggml_prof_entry * e = &g_ggml_prof.names[g_ggml_prof.n_names++];
+        snprintf(e->name, sizeof(e->name), "%s", key);
+        e->us = us;
+        e->n  = 1;
+    }
+}
+
 // Try to fuse the current node with subsequent nodes for better performance.
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
@@ -3046,6 +3144,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    const bool prof = g_ggml_prof.enabled == 1 && state->ith == 0;
+    if (prof) {
+        g_ggml_prof.n_graphs++;
+    }
+
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3057,6 +3160,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+
+        const int64_t t_prof_0 = prof ? ggml_time_us() : 0;
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
@@ -3075,6 +3180,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
+        }
+
+        if (prof) {
+            // includes the barrier, so per-node sync cost lands on the node
+            ggml_prof_node(node, n_fused + 1, (double) (ggml_time_us() - t_prof_0));
         }
     }
 
@@ -3839,6 +3949,12 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+
+            const char * prof_env = getenv("GGML_OP_PROFILE");
+            g_ggml_prof.enabled = (prof_env != NULL && atoi(prof_env) == 1) ? 1 : 0;
+            if (g_ggml_prof.enabled == 1) {
+                atexit(ggml_prof_print);
+            }
         }
 
         is_first_call = false;
