@@ -1698,10 +1698,6 @@ static void ggml_compute_forward_repeat_f32(
 
     const ggml_tensor * src0 = dst->src[0];
 
-    if (params->ith != 0) {
-        return;
-    }
-
     GGML_ASSERT(ggml_can_repeat(src0, dst));
 
     GGML_TENSOR_UNARY_OP_LOCALS
@@ -1716,22 +1712,24 @@ static void ggml_compute_forward_repeat_f32(
     GGML_ASSERT(nb0  == sizeof(float));
     GGML_ASSERT(nb00 == sizeof(float));
 
-    // TODO: maybe this is not optimal?
-    for                         (int i3 = 0; i3 < nr3;  i3++) {
-        for                     (int k3 = 0; k3 < ne03; k3++) {
-            for                 (int i2 = 0; i2 < nr2;  i2++) {
-                for             (int k2 = 0; k2 < ne02; k2++) {
-                    for         (int i1 = 0; i1 < nr1;  i1++) {
-                        for     (int k1 = 0; k1 < ne01; k1++) {
-                            for (int i0 = 0; i0 < nr0;  i0++) {
-                                ggml_vec_cpy_f32(ne00,
-                                        (float *) ((char *)  dst->data + (i3*ne03 + k3)*nb3  + (i2*ne02 + k2)*nb2  + (i1*ne01 + k1)*nb1  + (i0*ne00)*nb0),
-                                        (float *) ((char *) src0->data + (          k3)*nb03 + (          k2)*nb02 + (          k1)*nb01));
-                            }
-                        }
-                    }
-                }
-            }
+    // parallelize over dst rows: flatten (i3,k3,i2,k2,i1,k1) into one index
+    const int64_t nrows = (int64_t) nr3*ne03*nr2*ne02*nr1*ne01;
+    const int64_t dr = (nrows + params->nth - 1)/params->nth;
+    const int64_t r0 = dr*params->ith;
+    const int64_t r1 = MIN(r0 + dr, nrows);
+
+    for (int64_t r = r0; r < r1; ++r) {
+        int64_t tmp = r;
+        const int64_t k1 = tmp % ne01; tmp /= ne01;
+        const int64_t i1 = tmp % nr1;  tmp /= nr1;
+        const int64_t k2 = tmp % ne02; tmp /= ne02;
+        const int64_t i2 = tmp % nr2;  tmp /= nr2;
+        const int64_t k3 = tmp % ne03; tmp /= ne03;
+        const int64_t i3 = tmp;
+        for (int i0 = 0; i0 < nr0; i0++) {
+            ggml_vec_cpy_f32(ne00,
+                    (float *) ((char *)  dst->data + (i3*ne03 + k3)*nb3  + (i2*ne02 + k2)*nb2  + (i1*ne01 + k1)*nb1  + (i0*ne00)*nb0),
+                    (float *) ((char *) src0->data + (          k3)*nb03 + (          k2)*nb02 + (          k1)*nb01));
         }
     }
 }
@@ -4912,6 +4910,36 @@ static void ggml_compute_forward_get_rows_f32(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    if (nr < nth && nc >= 4096) {
+        // fewer rows than threads and the rows are large (e.g. recurrent-state
+        // rows gathered once per token): split each row across several threads
+        // instead of leaving all but nr threads idle
+        const int tpr = (nth + nr - 1)/nr; // threads per row
+        const int64_t i = ith/tpr;         // row for this thread
+        const int sub   = ith%tpr;         // chunk of the row for this thread
+        if (i >= nr) {
+            return;
+        }
+        const int64_t dc  = (nc + tpr - 1)/tpr;
+        const int64_t ic0 = dc*sub;
+        const int64_t ic1 = MIN(ic0 + dc, nc);
+        if (ic0 >= ic1) {
+            return;
+        }
+
+        const int64_t i12 = i/(ne11*ne10);
+        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+
+        ggml_vec_cpy_f32(ic1 - ic0,
+                (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3)  + ic0,
+                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03) + ic0);
+        return;
+    }
 
     // rows per thread
     const int dr = (nr + nth - 1)/nth;
