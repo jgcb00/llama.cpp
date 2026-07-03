@@ -2913,6 +2913,7 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_FLASH_ATTN_EXT:
                     {
                         const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
+                        const int64_t neq3 = node->src[0]->ne[3]; // number of sequence streams
                         const int64_t DK = node->src[1]->ne[0];
                         const int64_t DV = node->src[2]->ne[0];
 
@@ -2921,9 +2922,9 @@ struct ggml_cplan ggml_graph_plan(
                         size_t prefill  = sizeof(float)*(GGML_FA_TILE_Q*DK + 2*GGML_FA_TILE_Q*GGML_FA_TILE_KV + GGML_FA_TILE_Q*DV + GGML_FA_TILE_KV*DV + GGML_FA_TILE_KV*DK)*n_tasks;
 
                         // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
-                        // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
+                        // Partials for every (stream, head) row + intra-thread scratch for V, Q and VKQ
                         size_t n_chunks = n_tasks;
-                        size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
+                        size_t decode   = sizeof(float)*(neq2*neq3*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
                         cur += MAX(prefill, decode);
                     } break;
