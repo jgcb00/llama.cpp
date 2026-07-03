@@ -8941,10 +8941,259 @@ static void ggml_flash_attn_ext_reduce_partials(
             const float S_inv = 1.0f / S_final;
             ggml_vec_scale_f32(DV, VKQ_final, S_inv);
         }
-        // iq1=0 for decode; same row layout as one_chunk's direct write
+        // iq1=0 for decode; same row layout as the chunk kernels' direct write
         memcpy((char *) dst->data + (iq3*ne2*ne1 + q_head + 0*ne1)*nb1, VKQ_final, nb1);
     }
 }
+
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+// Decode-oriented blocked variant of ..._one_chunk for F16 K/V. Processes the
+// KV range in blocks of 32 cells: direct SIMD q·k dots (no per-cell indirect
+// vec_dot call), one vectorized exp + a single accumulator rescale per block
+// (instead of a scalar expf + branch per cell), whole-block skip of fully
+// masked regions (cross-sequence cells of unified KV buffers, SWA holes), and
+// SIMD V accumulation. Falls back to the scalar tail for the remainder.
+static void ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        int ir0, int ir1,
+        int64_t ic_start, int64_t ic_end,
+        float * partials, int64_t partial_stride) {
+
+    const bool write_partials = (partials != nullptr);
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
+    GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
+    GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
+
+    const int64_t DK = nek0;
+    const int64_t DV = nev0;
+
+    GGML_ASSERT(k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
+    GGML_ASSERT(DK % 16 == 0 && DV % 16 == 0 && DK <= 1024);
+
+    // broadcast factors
+    const int64_t rk2 = neq2/nek2;
+    const int64_t rk3 = neq3/nek3;
+    const int64_t rv2 = neq2/nev2;
+    const int64_t rv3 = neq3/nev3;
+
+    float scale         = 1.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+    if (logit_softcap != 0) {
+        scale /= logit_softcap;
+    }
+
+    const uint32_t n_head      = neq2;
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    const int ith = params->ith;
+
+    constexpr int64_t FA_BLK = 32;
+
+    for (int ir = ir0; ir < ir1; ++ir) {
+        const int iq3 = ir/(neq2*neq1);
+        const int iq2 = (ir - iq3*neq2*neq1)/neq1;
+        const int iq1 = (ir - iq3*neq2*neq1 - iq2*neq1);
+
+        const uint32_t h = iq2;
+        const float slope = (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2*(h - n_head_log2) + 1) : 1.0f;
+
+        float S = 0.0f;
+        float M = -INFINITY;
+
+        float       * VKQ32 = (float       *) params->wdata + ith*(1*DK + 2*DV + CACHE_LINE_SIZE_F32);
+        ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV);
+
+        memset(VKQ32, 0, DV*sizeof(float));
+
+        const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+
+        const int ik3 = iq3 / rk3;
+        const int ik2 = iq2 / rk2;
+        const int iv3 = iq3 / rv3;
+        const int iv2 = iq2 / rv2;
+
+        // Q converted via f16 (same as the scalar path) then held as f32 lanes
+        const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
+        float Qf[1024];
+        for (int64_t d = 0; d < DK; ++d) {
+            Q_q[d] = GGML_CPU_FP32_TO_FP16(pq[d]);
+            Qf[d]  = GGML_CPU_FP16_TO_FP32(Q_q[d]);
+        }
+
+        const char * k_base = (const char *) k->data + ik2*nbk2 + ik3*nbk3;
+        const char * v_base = (const char *) v->data + iv2*nbv2 + iv3*nbv3;
+
+        const __m512 vinf = _mm512_set1_ps(-INFINITY);
+
+        int64_t ic = ic_start;
+        for (; ic + FA_BLK <= ic_end; ic += FA_BLK) {
+            // mask block: load 32 f16, scale by slope; skip block if all -inf
+            __m512 mblk0, mblk1;
+            if (mp) {
+                mblk0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(mp + ic)));
+                mblk1 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(mp + ic + 16)));
+                if (slope != 1.0f) {
+                    const __m512 vslope = _mm512_set1_ps(slope);
+                    mblk0 = _mm512_mul_ps(mblk0, vslope);
+                    mblk1 = _mm512_mul_ps(mblk1, vslope);
+                }
+                const __mmask16 valid0 = _mm512_cmp_ps_mask(mblk0, vinf, _CMP_NEQ_UQ);
+                const __mmask16 valid1 = _mm512_cmp_ps_mask(mblk1, vinf, _CMP_NEQ_UQ);
+                if ((valid0 | valid1) == 0) {
+                    continue; // fully masked block (other sequence / SWA hole)
+                }
+            } else {
+                mblk0 = _mm512_setzero_ps();
+                mblk1 = _mm512_setzero_ps();
+            }
+
+            // scores for the block: direct f16 dot against Qf
+            float sblk[FA_BLK];
+            for (int64_t j = 0; j < FA_BLK; ++j) {
+                const ggml_fp16_t * kr = (const ggml_fp16_t *)(k_base + (ic + j)*nbk1);
+                __m512 acc = _mm512_setzero_ps();
+                for (int64_t d = 0; d < DK; d += 16) {
+                    const __m512 kv = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(kr + d)));
+                    acc = _mm512_fmadd_ps(kv, _mm512_loadu_ps(Qf + d), acc);
+                }
+                sblk[j] = _mm512_reduce_add_ps(acc);
+            }
+
+            __m512 s0 = _mm512_loadu_ps(sblk);
+            __m512 s1 = _mm512_loadu_ps(sblk + 16);
+            const __m512 vscale = _mm512_set1_ps(scale);
+            s0 = _mm512_mul_ps(s0, vscale);
+            s1 = _mm512_mul_ps(s1, vscale);
+
+            if (logit_softcap != 0.0f) {
+                // tanh(x) = 1 - 2/(exp(2x) + 1), saturates correctly at ±inf
+                const __m512 vone = _mm512_set1_ps(1.0f);
+                const __m512 vtwo = _mm512_set1_ps(2.0f);
+                const __m512 vcap = _mm512_set1_ps(logit_softcap);
+                __m512 e0 = ggml_v_expf(_mm512_mul_ps(s0, vtwo));
+                __m512 e1 = ggml_v_expf(_mm512_mul_ps(s1, vtwo));
+                s0 = _mm512_sub_ps(vone, _mm512_div_ps(vtwo, _mm512_add_ps(e0, vone)));
+                s1 = _mm512_sub_ps(vone, _mm512_div_ps(vtwo, _mm512_add_ps(e1, vone)));
+                s0 = _mm512_mul_ps(s0, vcap);
+                s1 = _mm512_mul_ps(s1, vcap);
+            }
+
+            s0 = _mm512_add_ps(s0, mblk0);
+            s1 = _mm512_add_ps(s1, mblk1);
+
+            const float bm = MAX(_mm512_reduce_max_ps(s0), _mm512_reduce_max_ps(s1));
+            if (bm == -INFINITY) {
+                continue;
+            }
+            if (bm > M) {
+                const float ms = expf(M - bm);
+                ggml_vec_scale_f32(DV, VKQ32, ms);
+                S *= ms;
+                M = bm;
+            }
+            const __m512 vM = _mm512_set1_ps(M);
+            const __m512 p0 = ggml_v_expf(_mm512_sub_ps(s0, vM)); // masked lanes: exp(-inf) = 0
+            const __m512 p1 = ggml_v_expf(_mm512_sub_ps(s1, vM));
+            S += _mm512_reduce_add_ps(p0) + _mm512_reduce_add_ps(p1);
+
+            float pbuf[FA_BLK];
+            _mm512_storeu_ps(pbuf,      p0);
+            _mm512_storeu_ps(pbuf + 16, p1);
+
+            for (int64_t j = 0; j < FA_BLK; ++j) {
+                const float pj = pbuf[j];
+                if (pj == 0.0f) {
+                    continue;
+                }
+                const ggml_fp16_t * vr = (const ggml_fp16_t *)(v_base + (ic + j)*nbv1);
+                const __m512 vp = _mm512_set1_ps(pj);
+                for (int64_t d = 0; d < DV; d += 16) {
+                    const __m512 vv = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(vr + d)));
+                    _mm512_storeu_ps(VKQ32 + d, _mm512_fmadd_ps(vv, vp, _mm512_loadu_ps(VKQ32 + d)));
+                }
+            }
+        }
+
+        // scalar tail (same math as the reference per-cell loop)
+        for (; ic < ic_end; ++ic) {
+            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            if (mv == -INFINITY) {
+                continue;
+            }
+            const ggml_fp16_t * kr = (const ggml_fp16_t *)(k_base + ic*nbk1);
+            float s = 0.0f;
+            for (int64_t d = 0; d < DK; ++d) {
+                s += GGML_CPU_FP16_TO_FP32(kr[d]) * Qf[d];
+            }
+            s = s*scale;
+            if (logit_softcap != 0.0f) {
+                s = logit_softcap*tanhf(s);
+            }
+            s += mv;
+
+            const float Mold = M;
+            float ms = 1.0f;
+            float vs = 1.0f;
+            if (s > M) {
+                M = s;
+                ms = expf(Mold - M);
+                ggml_vec_scale_f32(DV, VKQ32, ms);
+            } else {
+                vs = expf(s - M);
+            }
+            const ggml_fp16_t * vr = (const ggml_fp16_t *)(v_base + ic*nbv1);
+            for (int64_t d = 0; d < DV; ++d) {
+                VKQ32[d] += GGML_CPU_FP16_TO_FP32(vr[d]) * vs;
+            }
+            S = S*ms + vs;
+        }
+
+        // sinks - apply only on the first kv-chunk
+        if (sinks && ic_start == 0) {
+            const float s = ((float *)((char *) sinks->data))[h];
+            float ms = 1.0f;
+            float vs = 1.0f;
+            if (s > M) {
+                ms = expf(M - s);
+                M = s;
+                ggml_vec_scale_f32(DV, VKQ32, ms);
+            } else {
+                vs = expf(s - M);
+            }
+            S = S*ms + vs;
+        }
+
+        if (write_partials) {
+            float * partial = partials + ir * partial_stride;
+            partial[0] = M;
+            partial[1] = S;
+            memcpy(partial + 2, VKQ32, DV * sizeof(float));
+        } else {
+            const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
+            ggml_vec_scale_f32(DV, VKQ32, S_inv);
+            memcpy((char *) dst->data + (iq3*ne2*ne1 + iq2 + iq1*ne1)*nb1, VKQ32, nb1);
+        }
+    }
+}
+#endif // __AVX512F__ && __AVX512DQ__
 
 static void ggml_compute_forward_flash_attn_ext_f16(
         const ggml_compute_params * params,
@@ -8997,11 +9246,11 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
     // neq1 == 1 (single token per stream) with any number of streams (neq3):
     // multi-sequence decode with a split KV cache produces neq3 > 1, and with
-    // few q heads the row-parallel fallback below leaves most threads idle
-    // while each busy thread scans a full KV stream alone. Rows here are the
-    // flattened (iq3, iq2) pairs; one_chunk already decodes ir -> (iq3, iq2,
-    // iq1) and offsets K/V/mask by stream, so the split-KV path generalizes
-    // without kernel changes.
+    // few q heads the row-parallel fallback leaves most threads idle while
+    // each busy thread scans a full KV stream (5.9x per-step FA cost at 2x24k
+    // users). Rows below are the flattened (iq3, iq2) pairs; both chunk
+    // kernels already decode ir -> (iq3, iq2, iq1) and offset K/V/mask by
+    // stream, so the split-KV path generalizes without kernel changes.
     const bool use_split_kv_path = !use_ref && (neq1 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
@@ -9018,8 +9267,24 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t partial_stride = nth * partial_size;
         float *       chunk_partials = partials_base + ith * partial_size;
 
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+        const bool use_blocked = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+                                 DK % 16 == 0 && DV % 16 == 0 && DK <= 1024;
+#else
+        const bool use_blocked = false;
+        GGML_UNUSED(use_blocked);
+#endif
+
         if (ic_start < nek1) {
             for (int64_t row = 0; row < n_rows; row++) {
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+                if (use_blocked) {
+                    ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked(
+                        params, dst, row, row + 1, ic_start, ic_end,
+                        chunk_partials, partial_stride);
+                    continue;
+                }
+#endif
                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                     params, dst, row, row + 1, ic_start, ic_end,
                     chunk_partials, partial_stride);
@@ -9082,7 +9347,18 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             if (use_tiled) {
                 ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
             } else {
-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+                const bool use_blocked_rows = !use_ref &&
+                        k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+                        q->type == GGML_TYPE_F32 &&
+                        DK % 16 == 0 && DV % 16 == 0 && DK <= 1024;
+                if (use_blocked_rows) {
+                    ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+                } else
+#endif
+                {
+                    ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+                }
             }
 
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
