@@ -3950,6 +3950,56 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// GGML_OP_MAMBA3_MIMO
+struct test_mamba3_mimo : public test_case {
+    const ggml_type type;
+
+    const int64_t d_qk;
+    const int64_t r; // MIMO rank
+    const int64_t d_v;
+    const int64_t head_count;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, d_qk, r, d_v, head_count, n_seq_tokens, n_seqs);
+    }
+
+    test_mamba3_mimo(ggml_type type = GGML_TYPE_F32,
+            int64_t d_qk = 64, int64_t r = 4, int64_t d_v = 64, int64_t head_count = 48,
+            int64_t n_seq_tokens = 1, int64_t n_seqs = 1)
+        : type(type), d_qk(d_qk), r(r), d_v(d_v), head_count(head_count),
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // q/k/v are graph-prepared (rotated + normed) upstream; the op sees plain tensors
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, type, d_qk, r, head_count, n_seq_tokens * n_seqs);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, type, d_qk, r, head_count, n_seq_tokens * n_seqs);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, type, d_v,  r, head_count, n_seq_tokens * n_seqs);
+        ggml_tensor * coefs = ggml_new_tensor_4d(ctx, type, 3, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_2d(ctx, type, d_qk * d_v * head_count, n_seqs);
+        ggml_set_name(q,     "q");
+        ggml_set_name(k,     "k");
+        ggml_set_name(v,     "v");
+        ggml_set_name(coefs, "coefs");
+        ggml_set_name(state, "state");
+        ggml_tensor * out = ggml_mamba3_mimo(ctx, q, k, v, coefs, state);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "coefs") == 0) {
+                // [alpha | beta | gamma] rows; keep them in [0, 1) so the
+                // recurrence stays contractive over long T
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -9268,6 +9318,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+
+    // (type, d_qk, r, d_v, head_count, n_seq_tokens, n_seqs); Dragon 7A1B dims: D_qk=64, R=4, D_v=64, H=48
+    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48,  1, 1)); // decode
+    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48,  1, 4)); // batched decode
+    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48, 64, 1)); // prefill
+    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48, 17, 3)); // odd sizes
+    // small odd-ish dims (ctor requires d_qk % r == 0)
+    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 24, 3, 20,  5, 17, 3));
+    // large head dims: D_qk*D_v*4 > 48 KB exercises the global-memory state fallback
+    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 128, 4, 128, 2, 5, 2));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
