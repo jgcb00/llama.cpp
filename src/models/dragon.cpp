@@ -1788,37 +1788,54 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
         int64_t D_qk, int64_t D_v, int64_t R, int64_t H, int64_t L,
         int64_t num_angles,
         int il,
-        // Optional state in/out. If state_in_packed is non-NULL, it's a flat
-        // (n_embd_s, 1) tensor containing prior batch's ssm_state/K_state/V_state/
-        // angle_state; state_out_packed is filled with the new packed state
-        // (state[L-1], k_rot[L-1], v[L-1], cum_angle[L-1]). Pass NULL to disable.
+        // Optional state in/out. If state_in_packed is non-NULL, it's a
+        // (n_embd_s, n_seqs) tensor containing prior batch's ssm_state/K_state/
+        // V_state/angle_state per sequence; state_out_packed is filled with the
+        // new packed state (state[T-1], k_rot[T-1], v[T-1], cum_angle[T-1] per
+        // seq), shape (n_embd_s, n_seqs). Pass NULL to disable.
         ggml_tensor * state_in_packed = nullptr,
-        ggml_tensor ** state_out_packed = nullptr) {
+        ggml_tensor ** state_out_packed = nullptr,
+        // L = n_seqs * T with tokens laid out seq-major (all T tokens of seq 0,
+        // then seq 1, ...) — the layout produced by equal-split ubatches.
+        // n_seqs > 1 is only supported on the DRAGON_GGML_OP path; the
+        // closed-form decay-matrix branch is single-sequence.
+        int64_t n_seqs = 1) {
     (void) il;  // currently unused (reserved for future per-layer dump hooks)
     const int64_t quarter = D_qk / 4;
     GGML_ASSERT(num_angles == quarter && "halved rotary expects num_angles = D_qk/4");
+    GGML_ASSERT(n_seqs >= 1);
+    const int64_t T = L / n_seqs;  // tokens per sequence (equal-split ubatch)
+    GGML_ASSERT(T * n_seqs == L && "L must be divisible by n_seqs (equal-split ubatch)");
+    GGML_ASSERT((n_seqs == 1 || dragon_use_ggml_op()) &&
+                "n_seqs > 1 requires DRAGON_GGML_OP=1 (closed-form primitive is single-seq)");
 
     // Packed-state offsets (must match llama_hparams::n_embd_s() for Dragon).
     const int64_t off_K_glob   = H * D_v * D_qk;
     const int64_t off_V_glob   = off_K_glob + H * R * D_qk;
     const int64_t off_ang_glob = off_V_glob + H * R * D_v;
 
-    // Unpack state_in into the four components if provided.
-    ggml_tensor * state_in_4d  = nullptr;  // (D_qk, D_v, H, 1)
-    ggml_tensor * K_in_4d      = nullptr;  // (D_qk, R,   H, 1)
-    ggml_tensor * V_in_4d      = nullptr;  // (D_v,  R,   H, 1)
-    ggml_tensor * angle_in_2d  = nullptr;  // (na, H)
+    // Unpack state_in into the four components if provided. state_in_packed is
+    // (n_embd_s, n_seqs) with contiguous rows (build_rs get_rows output); each
+    // component becomes a strided view with the seq axis last.
+    ggml_tensor * state_in_4d  = nullptr;  // (D_qk, D_v, H, n_seqs)
+    ggml_tensor * K_in_4d      = nullptr;  // (D_qk, R,   H, n_seqs)
+    ggml_tensor * V_in_4d      = nullptr;  // (D_v,  R,   H, n_seqs)
+    ggml_tensor * angle_in_3d  = nullptr;  // (na, H, n_seqs)
     if (state_in_packed != nullptr) {
         const size_t fs = ggml_element_size(state_in_packed);
-        ggml_tensor * sp = ggml_reshape_1d(ctx, state_in_packed,
-                                            off_ang_glob + H * num_angles);
-        auto slice = [&](int64_t off, int64_t n) {
-            return ggml_view_1d(ctx, sp, n, off * fs);
+        const int64_t n_embd_s = off_ang_glob + H * num_angles;
+        GGML_ASSERT(ggml_is_contiguous(state_in_packed));
+        GGML_ASSERT(ggml_nelements(state_in_packed) == n_embd_s * n_seqs);
+        const size_t nb_seq = (size_t) n_embd_s * fs;  // stride between seq rows
+        auto slice4 = [&](int64_t off, int64_t ne0, int64_t ne1, int64_t ne2) {
+            return ggml_view_4d(ctx, state_in_packed, ne0, ne1, ne2, n_seqs,
+                                ne0 * fs, ne0 * ne1 * fs, nb_seq, off * fs);
         };
-        state_in_4d = ggml_reshape_4d(ctx, slice(0,                H*D_v*D_qk),    D_qk, D_v, H, 1);
-        K_in_4d     = ggml_reshape_4d(ctx, slice(off_K_glob,       H*R  *D_qk),    D_qk, R,   H, 1);
-        V_in_4d     = ggml_reshape_4d(ctx, slice(off_V_glob,       H*R  *D_v ),    D_v,  R,   H, 1);
-        angle_in_2d = ggml_reshape_2d(ctx, slice(off_ang_glob,     H*num_angles),  num_angles, H);
+        state_in_4d = slice4(0,          D_qk, D_v, H);
+        K_in_4d     = slice4(off_K_glob, D_qk, R,   H);
+        V_in_4d     = slice4(off_V_glob, D_v,  R,   H);
+        angle_in_3d = ggml_view_3d(ctx, state_in_packed, num_angles, H, n_seqs,
+                                   num_angles * fs, nb_seq, off_ang_glob * fs);
     }
 
     // 1) Cumulative rotary angle per (i, h, t).
@@ -1837,15 +1854,21 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
     // (unlike numpy.transpose). For non-self-inverse permutations the two
     // conventions give opposite results.
     ggml_tensor * contrib_lt = ggml_cont(ctx, ggml_permute(ctx, contrib, 1, 2, 0, 3));      // (L, na, H)
-    ggml_tensor * cum_lt     = ggml_cumsum(ctx, contrib_lt);                                // (L, na, H)
+    // Cumsum must not run across sequence boundaries: split the seq-major L
+    // axis into (T, n_seqs) so each seq accumulates independently.
+    ggml_tensor * contrib_4d = ggml_reshape_4d(ctx, contrib_lt, T, n_seqs, num_angles, H);
+    ggml_tensor * cum_4d     = ggml_cumsum(ctx, contrib_4d);                                 // (T, n_seqs, na, H)
     // If state_in is provided, the cumulative angle starts from angle_in (the
     // running angle saved at the end of the prior batch) rather than zero.
-    if (angle_in_2d != nullptr) {
-        // angle_in (na, H) → (1, na, H), broadcasts over L into cum_lt (L, na, H).
-        ggml_tensor * angle_in_1lh = ggml_reshape_3d(ctx, angle_in_2d, 1, num_angles, H);
-        ggml_tensor * angle_in_full = ggml_repeat_4d(ctx, angle_in_1lh, L, num_angles, H, 1);
-        cum_lt = ggml_add(ctx, cum_lt, angle_in_full);
+    if (angle_in_3d != nullptr) {
+        // angle_in (na, H, n_seqs) → (1, n_seqs, na, H), broadcast over T.
+        ggml_tensor * angle_in_perm = ggml_cont(ctx, ggml_permute(ctx,
+            ggml_reshape_4d(ctx, ggml_cont(ctx, angle_in_3d), num_angles, H, n_seqs, 1),
+            2, 3, 1, 0));                                                                    // (1, n_seqs, na, H)
+        ggml_tensor * angle_in_full = ggml_repeat_4d(ctx, angle_in_perm, T, n_seqs, num_angles, H);
+        cum_4d = ggml_add(ctx, cum_4d, angle_in_full);
     }
+    ggml_tensor * cum_lt = ggml_reshape_3d(ctx, cum_4d, L, num_angles, H);                   // (L, na, H)
     ggml_tensor * cos_lt = ggml_cos(ctx, cum_lt);                                            // (L, na, H)
     ggml_tensor * sin_lt = ggml_sin(ctx, cum_lt);
     // Back to (na, H, L) for the rotary application.
@@ -1886,32 +1909,37 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
     ggml_tensor * one_minus_trap = ggml_scale_bias(ctx, trap_post, -1.0f, 1.0f);              // (H, L)
     ggml_tensor * coeff_prev     = ggml_mul(ctx, one_minus_trap, dt);                         // (H, L)
     ggml_tensor * gamma_shifted;
-    if (L > 1) {
-        // Shift coeff_prev one column left along ne[1]; pad zero at the end.
-        ggml_tensor * tail = ggml_view_2d(ctx, coeff_prev, H, L - 1,
-                                          coeff_prev->nb[1], coeff_prev->nb[1]);
-        gamma_shifted = ggml_pad(ctx, ggml_cont(ctx, tail), 0, 1, 0, 0);                      // (H, L)
+    if (T > 1) {
+        // Shift coeff_prev one token left within each seq; pad zero at each
+        // seq's last position (the shift must not cross seq boundaries).
+        ggml_tensor * cp3  = ggml_reshape_3d(ctx, coeff_prev, H, T, n_seqs);
+        ggml_tensor * tail = ggml_view_3d(ctx, cp3, H, T - 1, n_seqs,
+                                          cp3->nb[1], cp3->nb[2], cp3->nb[1]);
+        gamma_shifted = ggml_reshape_2d(ctx,
+            ggml_pad(ctx, ggml_cont(ctx, tail), 0, 1, 0, 0), H, L);                            // (H, L)
     } else {
         gamma_shifted = ggml_scale(ctx, coeff_prev, 0.0f);
     }
     ggml_tensor * factor = ggml_add(ctx, gamma, gamma_shifted);                                // (H, L)
 
-    // Effective initial state: s0_eff = state_in + γ_shifted[-1]·prev_kv_in
-    // with γ_shifted[-1] = (1-trap[0])·dt[0] and prev_kv_in = K_in @ V_in.
+    // Effective initial state per seq: s0_eff = state_in + γ_shifted[-1]·prev_kv_in
+    // with γ_shifted[-1] = (1-trap[first tok of seq])·dt[first tok of seq] and
+    // prev_kv_in = K_in @ V_in.
     ggml_tensor * state_in_eff = nullptr;
     if (state_in_4d != nullptr) {
-        // prev_kv_in (D_qk, D_v, H, 1) = sum_r K_in[d,r,h] · V_in[p,r,h]
-        ggml_tensor * K_R0_in = ggml_cont(ctx, ggml_permute(ctx, K_in_4d, 1, 0, 2, 3));   // (R, D_qk, H, 1)
-        ggml_tensor * V_R0_in = ggml_cont(ctx, ggml_permute(ctx, V_in_4d, 1, 0, 2, 3));   // (R, D_v,  H, 1)
-        ggml_tensor * prev_kv_in = ggml_mul_mat(ctx, K_R0_in, V_R0_in);                   // (D_qk, D_v, H, 1)
+        // prev_kv_in (D_qk, D_v, H, n_seqs) = sum_r K_in[d,r,h,s] · V_in[p,r,h,s]
+        ggml_tensor * K_R0_in = ggml_cont(ctx, ggml_permute(ctx, K_in_4d, 1, 0, 2, 3));   // (R, D_qk, H, n_seqs)
+        ggml_tensor * V_R0_in = ggml_cont(ctx, ggml_permute(ctx, V_in_4d, 1, 0, 2, 3));   // (R, D_v,  H, n_seqs)
+        ggml_tensor * prev_kv_in = ggml_mul_mat(ctx, K_R0_in, V_R0_in);                   // (D_qk, D_v, H, n_seqs)
 
-        // γ_shifted[-1] per head = (1-trap_post[0])·dt[0]. Take from first column.
-        const size_t fs = ggml_element_size(coeff_prev);
-        ggml_tensor * gshift_neg1 = ggml_view_1d(ctx, coeff_prev, H, 0 * fs);             // (H,) at t=0 column
+        // γ_shifted[-1] per (head, seq) = (1-trap_post)·dt at each seq's first
+        // token: columns t = s·T of coeff_prev (H, L).
+        ggml_tensor * gshift_neg1 = ggml_view_2d(ctx, coeff_prev, H, n_seqs,
+                                                 T * coeff_prev->nb[1], 0);                // (H, n_seqs)
         ggml_tensor * gshift_neg1_4d = ggml_reshape_4d(ctx,
-            ggml_cont(ctx, gshift_neg1), 1, 1, H, 1);
-        ggml_tensor * pk_scaled = ggml_mul(ctx, prev_kv_in, gshift_neg1_4d);              // (D_qk, D_v, H, 1)
-        state_in_eff = ggml_add(ctx, state_in_4d, pk_scaled);                             // (D_qk, D_v, H, 1)
+            ggml_cont(ctx, gshift_neg1), 1, 1, H, n_seqs);
+        ggml_tensor * pk_scaled = ggml_mul(ctx, prev_kv_in, gshift_neg1_4d);              // (D_qk, D_v, H, n_seqs)
+        state_in_eff = ggml_add(ctx, ggml_cont(ctx, state_in_4d), pk_scaled);            // (D_qk, D_v, H, n_seqs)
     }
 
     ggml_tensor * qstate          = nullptr;   // (D_v, R, L, H) per-rank recurrence output
@@ -1923,9 +1951,11 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
         // closed-form decay-matrix construction of the else branch.
         ggml_tensor * s0 = state_in_eff != nullptr
             ? state_in_eff
-            : ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D_qk, D_v, H, 1), 0.0f);
+            : ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D_qk, D_v, H, n_seqs), 0.0f);
 
-        // coefs (3, H, L, 1): rows [α | β | γ] with β = (1 − trap)·dt·α.
+        // coefs (3, H, T, n_seqs): rows [α | β | γ] with β = (1 − trap)·dt·α.
+        // The (H, L) tensors are seq-major in L, so the (T, n_seqs) split is a
+        // plain reshape.
         ggml_tensor * beta = ggml_mul(ctx, coeff_prev, alpha);                                 // (H, L)
         auto coef_row = [&](ggml_tensor * s) {
             return ggml_reshape_3d(ctx, ggml_cont(ctx, s), 1, H, L);
@@ -1933,18 +1963,19 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
         ggml_tensor * coefs = ggml_cont(ctx, ggml_concat(ctx,
             ggml_concat(ctx, coef_row(alpha), coef_row(beta), /*dim=*/ 0),
             coef_row(gamma), /*dim=*/ 0));                                                     // (3, H, L)
-        coefs = ggml_reshape_4d(ctx, coefs, 3, H, L, 1);
+        coefs = ggml_reshape_4d(ctx, coefs, 3, H, T, n_seqs);
 
-        ggml_tensor * res = ggml_mamba3_mimo(ctx, q_rot, k_rot, v_proj, coefs, s0);            // (D_v·R·H, L + D_qk/R)
+        ggml_tensor * res = ggml_mamba3_mimo(ctx, q_rot, k_rot, v_proj, coefs, s0);            // (D_v·R·H, L + (D_qk/R)·n_seqs)
         const size_t rfs = ggml_element_size(res);
-        // y rows: (D_v, R, H) per token → (D_v, R, L, H).
+        // y rows: (D_v, R, H) per token → (D_v, R, L, H); L stays seq-major.
         ggml_tensor * y_rows = ggml_view_4d(ctx, res, D_v, R, H, L,
                                             D_v * rfs, D_v * R * rfs, D_v * R * H * rfs, 0);
         qstate = ggml_cont(ctx, ggml_permute(ctx, y_rows, 0, 1, 3, 2));                        // (D_v, R, L, H)
-        // Final state rows: appended after the L y rows, laid out (D_qk, D_v, H).
+        // Final state rows: appended after the L y rows, laid out (D_qk, D_v, H)
+        // per seq, seqs contiguous.
         state_last_flat = ggml_reshape_2d(ctx,
-            ggml_view_1d(ctx, res, H * D_v * D_qk, (size_t) (L * D_v * R * H) * rfs),
-            H * D_v * D_qk, 1);
+            ggml_view_1d(ctx, res, n_seqs * H * D_v * D_qk, (size_t) (L * D_v * R * H) * rfs),
+            H * D_v * D_qk, n_seqs);
     } else {
         // 4) Cumulative log α along the L axis. log(α) = ADT but we only have α here.
         ggml_tensor * log_a   = ggml_log(ctx, alpha);                                            // (H, L)
@@ -2038,23 +2069,26 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
     ggml_tensor * y_rsum     = ggml_sum_rows(ctx, o_rsum_in);                                   // (1, D_v, L, H)
     ggml_tensor * y_DvLH     = ggml_reshape_3d(ctx, y_rsum, D_v, L, H);                          // (D_v, L, H)
 
-    // Pack the closing state for the next batch if requested.
+    // Pack the closing state for the next batch if requested: one column per
+    // seq, each seq's last token is at seq-major index s·T + (T-1).
     if (state_out_packed != nullptr) {
-        // K_state = k_rot at L-1 (D_qk, R, H, 1)
-        ggml_tensor * k_last = ggml_view_4d(ctx, k_rot, D_qk, R, H, 1,
-                                             k_rot->nb[1], k_rot->nb[2], k_rot->nb[3],
-                                             (L - 1) * k_rot->nb[3]);
-        // V_state = v_proj at L-1
-        ggml_tensor * v_last = ggml_view_4d(ctx, v_proj, D_v, R, H, 1,
-                                             v_proj->nb[1], v_proj->nb[2], v_proj->nb[3],
-                                             (L - 1) * v_proj->nb[3]);
-        // angle = cum_lt at L-1. cum_lt is (L, na, H); take L-1 slot → (1, na, H) → (na, H).
-        ggml_tensor * ang_last = ggml_view_3d(ctx, cum_lt, 1, num_angles, H,
+        // K_state = k_rot at each seq's last token → (D_qk, R, H, n_seqs)
+        ggml_tensor * k_last = ggml_view_4d(ctx, k_rot, D_qk, R, H, n_seqs,
+                                             k_rot->nb[1], k_rot->nb[2], T * k_rot->nb[3],
+                                             (T - 1) * k_rot->nb[3]);
+        // V_state = v_proj at each seq's last token
+        ggml_tensor * v_last = ggml_view_4d(ctx, v_proj, D_v, R, H, n_seqs,
+                                             v_proj->nb[1], v_proj->nb[2], T * v_proj->nb[3],
+                                             (T - 1) * v_proj->nb[3]);
+        // angle = cum_lt at each seq's last token. cum_lt is (L, na, H);
+        // pick L-index s·T + (T-1) per seq → (1, na, H, n_seqs).
+        ggml_tensor * ang_last = ggml_view_4d(ctx, cum_lt, 1, num_angles, H, n_seqs,
                                                cum_lt->nb[1], cum_lt->nb[2],
-                                               (L - 1) * cum_lt->nb[0]);
+                                               T * cum_lt->nb[0],
+                                               (T - 1) * cum_lt->nb[0]);
 
         auto flat = [&](ggml_tensor * t, int64_t n) {
-            return ggml_reshape_2d(ctx, ggml_cont(ctx, t), n, 1);
+            return ggml_reshape_2d(ctx, ggml_cont(ctx, t), n, n_seqs);
         };
         *state_out_packed = ggml_concat(ctx,
             ggml_concat(ctx,
@@ -2799,6 +2833,8 @@ static ggml_tensor * build_dragon_m_mixer_real(
         chunk_size = atoll(ec);
     }
     if (chunk_size > 0) {
+        GGML_ASSERT(ubatch.n_seqs == 1 &&
+                    "DRAGON_M_CHUNK_SIZE path is single-sequence; use DRAGON_GGML_OP=1 for n_seqs > 1");
         ggml_tensor * trap_post = ggml_cont(ctx, ggml_sigmoid(ctx, trap_raw));
         ggml_tensor * state_out = nullptr;
         y = build_dragon_m_recurrence_prim_chunked(ctx,
@@ -2822,6 +2858,9 @@ static ggml_tensor * build_dragon_m_mixer_real(
     } else if (const char * e = std::getenv("DRAGON_M_PRIM"); (e && e[0] && e[0] != '0') || dragon_use_ggml_op()) {
         ggml_tensor * trap_post = ggml_cont(ctx, ggml_sigmoid(ctx, trap_raw));
         ggml_tensor * state_out = nullptr;
+        // Equal-split ubatches guarantee the same token count per seq, laid
+        // out seq-major (all tokens of seq 0, then seq 1, ...).
+        GGML_ASSERT((int64_t) ubatch.n_seqs * (int64_t) ubatch.n_seq_tokens == n_tokens);
         y = build_dragon_m_recurrence_prim(ctx,
                 q_f, k_f, v_f, z_f,
                 a_f_, d_f_, trap_post, ang_f,
@@ -2830,7 +2869,8 @@ static ggml_tensor * build_dragon_m_mixer_real(
                 /*num_angles=*/ angles_d,
                 il,
                 /*state_in_packed=*/  rs_view,
-                /*state_out_packed=*/ &state_out);
+                /*state_out_packed=*/ &state_out,
+                /*n_seqs=*/           (int64_t) ubatch.n_seqs);
         const auto kv_head = mctx_recr->get_head();
         const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
         ggml_build_forward_expand(gctx.gf,
