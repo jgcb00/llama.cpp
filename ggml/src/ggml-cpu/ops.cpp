@@ -5,6 +5,7 @@
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
+#include "quants.h"
 #include "unary-ops.h"
 #include "vec.h"
 
@@ -8975,12 +8976,18 @@ static void ggml_flash_attn_ext_reduce_partials(
 }
 
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
-// Decode-oriented blocked variant of ..._one_chunk for F16 K/V. Processes the
-// KV range in blocks of 32 cells: direct SIMD q·k dots (no per-cell indirect
-// vec_dot call), one vectorized exp + a single accumulator rescale per block
-// (instead of a scalar expf + branch per cell), whole-block skip of fully
-// masked regions (cross-sequence cells of unified KV buffers, SWA holes), and
-// SIMD V accumulation. Falls back to the scalar tail for the remainder.
+// Decode-oriented blocked variant of ..._one_chunk for F16 or Q8_0 K/V.
+// Processes the KV range in blocks of 32 cells: direct SIMD q·k dots (no
+// per-cell indirect vec_dot call), one vectorized exp + a single accumulator
+// rescale per block (instead of a scalar expf + branch per cell), whole-block
+// skip of fully masked regions (cross-sequence cells of unified KV buffers,
+// SWA holes), and SIMD V accumulation. Falls back to the scalar tail for the
+// remainder. For Q8_0 K/V the 32-cell KV blocks line up with the q8_0 row
+// blocks (QK8_0 == 32): each K/V row is DK/32 (DV/32) block_q8_0 blocks that
+// are dequantized on the fly and dotted/accumulated against f32 Q lanes.
+// Unlike the scalar path (which quantizes Q to q8_0 for the vec_dot), Q stays
+// f32 here - a mixed-precision dot that is strictly more accurate.
+template <ggml_type type_KV>
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -9007,8 +9014,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked(
     const int64_t DK = nek0;
     const int64_t DV = nev0;
 
-    GGML_ASSERT(k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
+    static_assert(type_KV == GGML_TYPE_F16 || type_KV == GGML_TYPE_Q8_0, "unsupported KV type");
+    GGML_ASSERT(k->type == type_KV && v->type == type_KV);
     GGML_ASSERT(DK % 16 == 0 && DV % 16 == 0 && DK <= 1024);
+    if constexpr (type_KV == GGML_TYPE_Q8_0) {
+        GGML_ASSERT(DK % QK8_0 == 0 && DV % QK8_0 == 0);
+    }
 
     // broadcast factors
     const int64_t rk2 = neq2/nek2;
@@ -9046,8 +9057,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked(
         float S = 0.0f;
         float M = -INFINITY;
 
-        float       * VKQ32 = (float       *) params->wdata + ith*(1*DK + 2*DV + CACHE_LINE_SIZE_F32);
-        ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV);
+        float * VKQ32 = (float *) params->wdata + ith*(1*DK + 2*DV + CACHE_LINE_SIZE_F32);
 
         memset(VKQ32, 0, DV*sizeof(float));
 
@@ -9058,12 +9068,18 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked(
         const int iv3 = iq3 / rv3;
         const int iv2 = iq2 / rv2;
 
-        // Q converted via f16 (same as the scalar path) then held as f32 lanes
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
         float Qf[1024];
-        for (int64_t d = 0; d < DK; ++d) {
-            Q_q[d] = GGML_CPU_FP32_TO_FP16(pq[d]);
-            Qf[d]  = GGML_CPU_FP16_TO_FP32(Q_q[d]);
+        if constexpr (type_KV == GGML_TYPE_F16) {
+            // Q converted via f16 (same as the scalar path) then held as f32 lanes
+            ggml_fp16_t * Q_q = (ggml_fp16_t *) (VKQ32 + 2*DV);
+            for (int64_t d = 0; d < DK; ++d) {
+                Q_q[d] = GGML_CPU_FP32_TO_FP16(pq[d]);
+                Qf[d]  = GGML_CPU_FP16_TO_FP32(Q_q[d]);
+            }
+        } else {
+            // Q8_0 K/V: Q stays f32 (mixed-precision dot against dequantized cells)
+            memcpy(Qf, pq, DK*sizeof(float));
         }
 
         const char * k_base = (const char *) k->data + ik2*nbk2 + ik3*nbk3;
@@ -9093,14 +9109,28 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked(
                 mblk1 = _mm512_setzero_ps();
             }
 
-            // scores for the block: direct f16 dot against Qf
+            // scores for the block: direct dot of dequantized K cells against f32 Qf
             float sblk[FA_BLK];
             for (int64_t j = 0; j < FA_BLK; ++j) {
-                const ggml_fp16_t * kr = (const ggml_fp16_t *)(k_base + (ic + j)*nbk1);
                 __m512 acc = _mm512_setzero_ps();
-                for (int64_t d = 0; d < DK; d += 16) {
-                    const __m512 kv = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(kr + d)));
-                    acc = _mm512_fmadd_ps(kv, _mm512_loadu_ps(Qf + d), acc);
+                if constexpr (type_KV == GGML_TYPE_F16) {
+                    const ggml_fp16_t * kr = (const ggml_fp16_t *)(k_base + (ic + j)*nbk1);
+                    for (int64_t d = 0; d < DK; d += 16) {
+                        const __m512 kv = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(kr + d)));
+                        acc = _mm512_fmadd_ps(kv, _mm512_loadu_ps(Qf + d), acc);
+                    }
+                } else {
+                    // q8_0 K row: DK/32 blocks of {fp16 d; int8 qs[32]}; per block
+                    // acc += d * (qs_lo·Qf_lo + qs_hi·Qf_hi)
+                    const block_q8_0 * kr = (const block_q8_0 *)(k_base + (ic + j)*nbk1);
+                    for (int64_t ib = 0; ib < DK/QK8_0; ++ib) {
+                        const __m256i qs = _mm256_loadu_si256((const __m256i *) kr[ib].qs);
+                        const __m512  f0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_castsi256_si128(qs)));
+                        const __m512  f1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_extracti128_si256(qs, 1)));
+                        __m512 bacc = _mm512_mul_ps  (f0, _mm512_loadu_ps(Qf + ib*QK8_0));
+                        bacc        = _mm512_fmadd_ps(f1, _mm512_loadu_ps(Qf + ib*QK8_0 + 16), bacc);
+                        acc = _mm512_fmadd_ps(bacc, _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(kr[ib].d)), acc);
+                    }
                 }
                 sblk[j] = _mm512_reduce_add_ps(acc);
             }
@@ -9151,11 +9181,25 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked(
                 if (pj == 0.0f) {
                     continue;
                 }
-                const ggml_fp16_t * vr = (const ggml_fp16_t *)(v_base + (ic + j)*nbv1);
-                const __m512 vp = _mm512_set1_ps(pj);
-                for (int64_t d = 0; d < DV; d += 16) {
-                    const __m512 vv = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(vr + d)));
-                    _mm512_storeu_ps(VKQ32 + d, _mm512_fmadd_ps(vv, vp, _mm512_loadu_ps(VKQ32 + d)));
+                if constexpr (type_KV == GGML_TYPE_F16) {
+                    const ggml_fp16_t * vr = (const ggml_fp16_t *)(v_base + (ic + j)*nbv1);
+                    const __m512 vp = _mm512_set1_ps(pj);
+                    for (int64_t d = 0; d < DV; d += 16) {
+                        const __m512 vv = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(vr + d)));
+                        _mm512_storeu_ps(VKQ32 + d, _mm512_fmadd_ps(vv, vp, _mm512_loadu_ps(VKQ32 + d)));
+                    }
+                } else {
+                    // q8_0 V row: VKQ32[d] += (pj * d_v) * qs_v[d], folded scale
+                    const block_q8_0 * vr = (const block_q8_0 *)(v_base + (ic + j)*nbv1);
+                    for (int64_t ib = 0; ib < DV/QK8_0; ++ib) {
+                        const __m256i qs = _mm256_loadu_si256((const __m256i *) vr[ib].qs);
+                        const __m512  f0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_castsi256_si128(qs)));
+                        const __m512  f1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_extracti128_si256(qs, 1)));
+                        const __m512  vp = _mm512_set1_ps(pj * GGML_CPU_FP16_TO_FP32(vr[ib].d));
+                        const int64_t d  = ib*QK8_0;
+                        _mm512_storeu_ps(VKQ32 + d,      _mm512_fmadd_ps(f0, vp, _mm512_loadu_ps(VKQ32 + d)));
+                        _mm512_storeu_ps(VKQ32 + d + 16, _mm512_fmadd_ps(f1, vp, _mm512_loadu_ps(VKQ32 + d + 16)));
+                    }
                 }
             }
         }
@@ -9166,10 +9210,21 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked(
             if (mv == -INFINITY) {
                 continue;
             }
-            const ggml_fp16_t * kr = (const ggml_fp16_t *)(k_base + ic*nbk1);
             float s = 0.0f;
-            for (int64_t d = 0; d < DK; ++d) {
-                s += GGML_CPU_FP16_TO_FP32(kr[d]) * Qf[d];
+            if constexpr (type_KV == GGML_TYPE_F16) {
+                const ggml_fp16_t * kr = (const ggml_fp16_t *)(k_base + ic*nbk1);
+                for (int64_t d = 0; d < DK; ++d) {
+                    s += GGML_CPU_FP16_TO_FP32(kr[d]) * Qf[d];
+                }
+            } else {
+                const block_q8_0 * kr = (const block_q8_0 *)(k_base + ic*nbk1);
+                for (int64_t ib = 0; ib < DK/QK8_0; ++ib) {
+                    float bs = 0.0f;
+                    for (int64_t d = 0; d < QK8_0; ++d) {
+                        bs += kr[ib].qs[d] * Qf[ib*QK8_0 + d];
+                    }
+                    s += GGML_CPU_FP16_TO_FP32(kr[ib].d) * bs;
+                }
             }
             s = s*scale;
             if (logit_softcap != 0.0f) {
@@ -9187,9 +9242,19 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked(
             } else {
                 vs = expf(s - M);
             }
-            const ggml_fp16_t * vr = (const ggml_fp16_t *)(v_base + ic*nbv1);
-            for (int64_t d = 0; d < DV; ++d) {
-                VKQ32[d] += GGML_CPU_FP16_TO_FP32(vr[d]) * vs;
+            if constexpr (type_KV == GGML_TYPE_F16) {
+                const ggml_fp16_t * vr = (const ggml_fp16_t *)(v_base + ic*nbv1);
+                for (int64_t d = 0; d < DV; ++d) {
+                    VKQ32[d] += GGML_CPU_FP16_TO_FP32(vr[d]) * vs;
+                }
+            } else {
+                const block_q8_0 * vr = (const block_q8_0 *)(v_base + ic*nbv1);
+                for (int64_t ib = 0; ib < DV/QK8_0; ++ib) {
+                    const float dv = GGML_CPU_FP16_TO_FP32(vr[ib].d) * vs;
+                    for (int64_t d = 0; d < QK8_0; ++d) {
+                        VKQ32[ib*QK8_0 + d] += vr[ib].qs[d] * dv;
+                    }
+                }
             }
             S = S*ms + vs;
         }
@@ -9272,6 +9337,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_ref = params->use_ref;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
+    const bool kv_is_q8_0       = (k->type == GGML_TYPE_Q8_0);
     // neq1 == 1 (single token per stream) with any number of streams (neq3):
     // multi-sequence decode with a split KV cache produces neq3 > 1, and with
     // few q heads the row-parallel fallback leaves most threads idle while
@@ -9279,7 +9345,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     // users). Rows below are the flattened (iq3, iq2) pairs; both chunk
     // kernels already decode ir -> (iq3, iq2, iq1) and offset K/V/mask by
     // stream, so the split-KV path generalizes without kernel changes.
-    const bool use_split_kv_path = !use_ref && (neq1 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool use_split_kv_path = !use_ref && (neq1 == 1) && (kv_is_f32_or_f16 || kv_is_q8_0) && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9296,7 +9362,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         float *       chunk_partials = partials_base + ith * partial_size;
 
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
-        const bool use_blocked = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+        const bool use_blocked = (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) &&
+                                 v->type == k->type &&
                                  DK % 16 == 0 && DV % 16 == 0 && DK <= 1024;
 #else
         const bool use_blocked = false;
@@ -9307,9 +9374,15 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             for (int64_t row = 0; row < n_rows; row++) {
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
                 if (use_blocked) {
-                    ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked(
-                        params, dst, row, row + 1, ic_start, ic_end,
-                        chunk_partials, partial_stride);
+                    if (k->type == GGML_TYPE_F16) {
+                        ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked<GGML_TYPE_F16>(
+                            params, dst, row, row + 1, ic_start, ic_end,
+                            chunk_partials, partial_stride);
+                    } else {
+                        ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked<GGML_TYPE_Q8_0>(
+                            params, dst, row, row + 1, ic_start, ic_end,
+                            chunk_partials, partial_stride);
+                    }
                     continue;
                 }
 #endif
@@ -9377,11 +9450,16 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             } else {
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
                 const bool use_blocked_rows = !use_ref &&
-                        k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+                        (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0) &&
+                        v->type == k->type &&
                         q->type == GGML_TYPE_F32 &&
                         DK % 16 == 0 && DV % 16 == 0 && DK <= 1024;
                 if (use_blocked_rows) {
-                    ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+                    if (k->type == GGML_TYPE_F16) {
+                        ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked<GGML_TYPE_F16>(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+                    } else {
+                        ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked<GGML_TYPE_Q8_0>(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+                    }
                 } else
 #endif
                 {
