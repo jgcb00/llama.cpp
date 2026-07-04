@@ -9338,29 +9338,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         // 4x chunks per thread
         int nth_scaled = nth * 4;
         int64_t chunk_size = (nr + nth_scaled - 1) / nth_scaled;
-
-        // Large-KV prefill with many KV heads (MHA): rows are head-major, so
-        // chunks larger than one head's rows spread the concurrently active
-        // threads across many heads and their combined K/V working set falls
-        // out of LLC — every thread then streams K/V from DRAM. Cap the chunk
-        // size so the pool advances within one or two heads (K/V streams
-        // LLC-resident) before moving on. Engage only when the default
-        // schedule's concurrent K/V span (~nek2/4 kv-heads at 4 chunks per
-        // thread) exceeds a conservative LLC estimate — smaller working sets
-        // are already cache-resident and the finer chunks would only add
-        // scheduling and tile-restart overhead.
-        if (neq1 >= (int64_t) nth && neq2 >= 8) {
-            const int64_t per_kv_head_bytes = nek1*(DK + DV)*(int64_t) ggml_type_size(k->type);
-            const int64_t default_span      = (nek2 + 3)/4;   // kv-heads touched concurrently
-            if (default_span*per_kv_head_bytes > (int64_t) 64*1024*1024) {
-                // Keep chunks whole Q-tiles: sub-tile chunks run half-empty
-                // tiles and re-convert each K/V tile for too few query rows.
-                int64_t cap = ((neq1 / nth) / GGML_FA_TILE_Q) * GGML_FA_TILE_Q;
-                cap = MAX(cap, (int64_t) GGML_FA_TILE_Q);
-                chunk_size = MIN(chunk_size, cap);
-            }
-        }
-        int64_t nchunk = (nr + chunk_size - 1) / chunk_size;
+        int64_t nchunk     = (nr + chunk_size - 1) / chunk_size;
 
         if (nth == 1 || nchunk < nth || disable_chunking) {
             nchunk = nth;
