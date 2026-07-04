@@ -482,7 +482,7 @@ void llama_model_dragon::load_arch_hparams(llama_model_loader & ml) {
         hparams.n_head_arr[i]    = hparams.dragon_n_signal_heads + hparams.dragon_n_noise_heads;
         hparams.n_head_kv_arr[i] = is_M ? 0u : hparams.dragon_n_noise_heads;
         hparams.n_ff_arr[i]      = 0u; // no dense FFN — MoE per block
-        hparams.swa_layers[i]    = false; // see SLW comment above
+        hparams.is_swa_impl[i]   = 0;     // see SLW comment above
     }
 
     type = LLM_TYPE_UNKNOWN;
