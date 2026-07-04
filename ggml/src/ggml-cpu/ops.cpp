@@ -11139,6 +11139,138 @@ void ggml_compute_forward_gated_delta_net(
     }
 }
 
+// ggml_compute_forward_mamba3_mimo
+
+static void ggml_compute_forward_mamba3_mimo_one_chunk(
+    const ggml_compute_params * params,
+    ggml_tensor * dst,
+    int64_t ir0,
+    int64_t ir1) {
+    GGML_UNUSED(params);
+
+    const ggml_tensor * src_q     = dst->src[0];
+    const ggml_tensor * src_k     = dst->src[1];
+    const ggml_tensor * src_v     = dst->src[2];
+    const ggml_tensor * src_coefs = dst->src[3];
+    const ggml_tensor * src_state = dst->src[4];
+
+    const int64_t D_qk     = src_q->ne[0];
+    const int64_t R        = src_q->ne[1];
+    const int64_t H        = src_q->ne[2];
+    const int64_t D_v      = src_v->ne[0];
+    const int64_t n_tokens = src_coefs->ne[2];
+    const int64_t n_seqs   = src_coefs->ne[3];
+
+    GGML_ASSERT(ggml_is_contiguous(src_q));
+    GGML_ASSERT(ggml_is_contiguous(src_k));
+    GGML_ASSERT(ggml_is_contiguous(src_v));
+    GGML_ASSERT(ggml_is_contiguous(src_coefs));
+    GGML_ASSERT(ggml_is_contiguous(src_state));
+
+    const float * q_base     = (const float *) src_q->data;
+    const float * k_base     = (const float *) src_k->data;
+    const float * v_base     = (const float *) src_v->data;
+    const float * coefs_base = (const float *) src_coefs->data;
+    const float * s_in_base  = (const float *) src_state->data;
+
+    // per-token strides in floats
+    const int64_t qk_tok = D_qk * R * H;
+    const int64_t v_tok  = D_v  * R * H;
+
+    // output layout: [y rows | final state rows], all rows D_v*R*H wide
+    const int64_t y_row = D_v * R * H;
+    float * y_base     = (float *) dst->data;
+    float * state_base = y_base + y_row * n_tokens * n_seqs;
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t h   = ir % H; // head index
+        const int64_t seq = ir / H; // sequence
+
+        // final-state slot for this (seq, head) doubles as the working state;
+        // layout per seq matches the input state: (D_qk, D_v, H)
+        float       * S    = state_base + (seq * H + h) * D_qk * D_v;
+        const float * s_in = s_in_base  + (seq * H + h) * D_qk * D_v;
+        memcpy(S, s_in, D_qk * D_v * sizeof(float));
+
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            const int64_t tok = seq * n_tokens + t;
+
+            const float * q_t = q_base + tok * qk_tok + h * D_qk * R;
+            const float * k_t = k_base + tok * qk_tok + h * D_qk * R;
+            const float * v_t = v_base + tok * v_tok  + h * D_v  * R;
+            // trapezoid beta term uses the previous token's kv; zero at t = 0
+            // (the cross-batch carry is folded into s0 by the caller)
+            const float * k_p = t > 0 ? k_t - qk_tok : NULL;
+            const float * v_p = t > 0 ? v_t - v_tok  : NULL;
+
+            const float * cf = coefs_base + 3 * (h + H * (t + n_tokens * seq));
+            const float alpha = cf[0];
+            const float beta  = cf[1];
+            const float gamma = cf[2];
+
+            float * y_t = y_base + tok * y_row + h * D_v * R;
+
+            for (int64_t p = 0; p < D_v; ++p) {
+                float * S_row = S + p * D_qk;
+                for (int64_t d = 0; d < D_qk; ++d) {
+                    float c_acc = 0.0f;
+                    float p_acc = 0.0f;
+                    for (int64_t r = 0; r < R; ++r) {
+                        c_acc += v_t[r * D_v + p] * k_t[r * D_qk + d];
+                    }
+                    if (k_p) {
+                        for (int64_t r = 0; r < R; ++r) {
+                            p_acc += v_p[r * D_v + p] * k_p[r * D_qk + d];
+                        }
+                    }
+                    S_row[d] = alpha * S_row[d] + beta * p_acc + gamma * c_acc;
+                }
+                for (int64_t r = 0; r < R; ++r) {
+                    float acc = 0.0f;
+                    for (int64_t d = 0; d < D_qk; ++d) {
+                        acc += S_row[d] * q_t[r * D_qk + d];
+                    }
+                    y_t[r * D_v + p] = acc;
+                }
+            }
+        }
+    }
+}
+
+static void ggml_compute_forward_mamba3_mimo_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src_coefs = dst->src[3];
+    const int64_t nr = src_coefs->ne[1] * src_coefs->ne[3]; // H * n_seqs
+
+    const int nth = params->nth;
+    const int ith = params->ith;
+
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = MIN(dr * ith, nr);
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    ggml_compute_forward_mamba3_mimo_one_chunk(params, dst, ir0, ir1);
+}
+
+void ggml_compute_forward_mamba3_mimo(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_mamba3_mimo_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

@@ -1061,6 +1061,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV7",
     "SOLVE_TRI",
     "GATED_DELTA_NET",
+    "MAMBA3_MIMO",
 
     "UNARY",
 
@@ -1172,6 +1173,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv7(r, w, k, v, a, b, s)",
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
+    "mamba3_mimo(q, k, v, coefs, s)",
 
     "unary(x)",
 
@@ -6264,6 +6266,62 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_mamba3_mimo
+
+struct ggml_tensor * ggml_mamba3_mimo(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * coefs,
+        struct ggml_tensor  * state) {
+    GGML_ASSERT(ggml_is_contiguous(q));
+    GGML_ASSERT(ggml_is_contiguous(k));
+    GGML_ASSERT(ggml_is_contiguous(v));
+    GGML_ASSERT(ggml_is_contiguous(coefs));
+    GGML_ASSERT(ggml_is_contiguous(state));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(v->type == GGML_TYPE_F32);
+    GGML_ASSERT(coefs->type == GGML_TYPE_F32);
+    GGML_ASSERT(state->type == GGML_TYPE_F32);
+
+    const int64_t D_qk     = q->ne[0];
+    const int64_t R        = q->ne[1];
+    const int64_t H        = q->ne[2];
+    const int64_t D_v      = v->ne[0];
+    const int64_t n_tokens = coefs->ne[2];
+    const int64_t n_seqs   = coefs->ne[3];
+
+    GGML_ASSERT(k->ne[0] == D_qk && k->ne[1] == R && k->ne[2] == H);
+    GGML_ASSERT(v->ne[1] == R && v->ne[2] == H);
+    GGML_ASSERT(q->ne[3] == n_tokens * n_seqs);
+    GGML_ASSERT(k->ne[3] == n_tokens * n_seqs);
+    GGML_ASSERT(v->ne[3] == n_tokens * n_seqs);
+
+    // coefs rows are [alpha | beta | gamma]
+    GGML_ASSERT(coefs->ne[0] == 3 && coefs->ne[1] == H);
+
+    // state holds the initial state s0 only: (D_qk, D_v, H) per seq
+    GGML_ASSERT(ggml_nelements(state) == D_qk * D_v * H * n_seqs);
+
+    // the final state is appended as rows of size D_v*R*H
+    GGML_ASSERT(D_qk % R == 0);
+    const int64_t state_rows = (D_qk / R) * n_seqs;
+    const int64_t ne[4] = { D_v * R * H, n_tokens * n_seqs + state_rows, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_MAMBA3_MIMO;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = coefs;
+    result->src[4] = state;
 
     return result;
 }

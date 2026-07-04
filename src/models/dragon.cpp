@@ -1751,6 +1751,14 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
     }  // end per-seq loop
 }
 
+// DRAGON_GGML_OP=1 routes the recurrence core of the primitive path through
+// the first-class GGML_OP_MAMBA3_MIMO op instead of the closed-form
+// cumsum/tri/mul_mat construction.
+static bool dragon_use_ggml_op() {
+    const char * e = std::getenv("DRAGON_GGML_OP");
+    return e && e[0] && e[0] != '0';
+}
+
 // Primitive re-expression of the Mamba3-MIMO recurrence. Uses only standard
 // ggml ops (mul, add, cumsum, exp, tri, mul_mat), so it runs on any backend
 // — gated on the DRAGON_M_PRIM env var; default uses the CPU custom op which
@@ -1870,25 +1878,10 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
     ggml_tensor * q_rot = apply_rotary(q_biased);
     ggml_tensor * k_rot = apply_rotary(k_biased);
 
-    // 3) Cumulative log α along the L axis. log(α) = ADT but we only have α here.
-    ggml_tensor * log_a   = ggml_log(ctx, alpha);                                            // (H, L)
-    ggml_tensor * log_a_T = ggml_cont(ctx, ggml_transpose(ctx, log_a));                      // (L, H)
-    ggml_tensor * cum_a   = ggml_cumsum(ctx, log_a_T);                                       // (L, H)
-
-    // Outer diff: diff[u, t, h] = cum_a[t, h] - cum_a[u, h].
-    // ggml_sub broadcasts the second operand into the first (one-way), so the
-    // (1, L, H) side must be materialised to (L, L, H) first.
-    ggml_tensor * ca_t = ggml_reshape_3d(ctx, cum_a, 1, L, H);                                // (1, L, H)
-    ggml_tensor * ca_u = ggml_reshape_3d(ctx, cum_a, L, 1, H);                                // (L, 1, H)
-    ggml_tensor * ca_t_full = ggml_repeat_4d(ctx, ca_t, L, L, H, 1);                          // (L, L, H)
-    ggml_tensor * diff = ggml_sub(ctx, ca_t_full, ca_u);                                      // (L, L, H)
-    ggml_tensor * W    = ggml_exp(ctx, diff);                                                  // (L, L, H)
-    // Keep only u ≤ t (W[u, t, h] for u > t becomes 0).
-    W = ggml_tri(ctx, W, GGML_TRI_TYPE_LOWER_DIAG);
-
-    // 4) factor[h, u] = γ[h, u] + γ_shifted[h, u]
+    // 3) Trapezoid coefficients (shared by both recurrence paths).
     //    γ[h, t]         = trap_post[h, t] · dt[h, t]
     //    γ_shifted[h, t] = (1 − trap_post[h, t+1]) · dt[h, t+1], 0 at t = L−1
+    //    factor[h, u]    = γ[h, u] + γ_shifted[h, u]
     ggml_tensor * gamma          = ggml_mul(ctx, trap_post, dt);                              // (H, L)
     ggml_tensor * one_minus_trap = ggml_scale_bias(ctx, trap_post, -1.0f, 1.0f);              // (H, L)
     ggml_tensor * coeff_prev     = ggml_mul(ctx, one_minus_trap, dt);                         // (H, L)
@@ -1903,29 +1896,9 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
     }
     ggml_tensor * factor = ggml_add(ctx, gamma, gamma_shifted);                                // (H, L)
 
-    // 5) Wf[u, t, h] = W[u, t, h] · factor[h, u].
-    //    factor (H, L) → transpose to (L, H) → reshape (L, 1, H) for broadcast over t.
-    ggml_tensor * factor_LH    = ggml_cont(ctx, ggml_transpose(ctx, factor));                  // (L, H)
-    ggml_tensor * factor_bcast = ggml_reshape_3d(ctx, factor_LH, L, 1, H);                     // (L, 1, H)
-    ggml_tensor * Wf = ggml_mul(ctx, W, factor_bcast);                                          // (L, L, H)
-
-    // 6) kv[d, p, h, u] = sum_r k_rot[d, r, h, u] · v[p, r, h, u].
-    //    Permute k, v so R is at ne[0] for the matmul reduction.
-    ggml_tensor * k_for_mm = ggml_cont(ctx, ggml_permute(ctx, k_rot,  1, 0, 2, 3));            // (R, D_qk, H, L)
-    ggml_tensor * v_for_mm = ggml_cont(ctx, ggml_permute(ctx, v_proj, 1, 0, 2, 3));            // (R, D_v,  H, L)
-    ggml_tensor * kv = ggml_mul_mat(ctx, k_for_mm, v_for_mm);                                  // (D_qk, D_v, H, L)
-
-    // 7) state[d, p, t, h] = sum_u Wf[u, t, h] · kv[d, p, h, u].
-    //    Permute kv (D_qk, D_v, H, L=u) → (L=u, D_qk, D_v, H); reshape to (L, D_qk·D_v, H).
-    ggml_tensor * kv_perm = ggml_cont(ctx, ggml_permute(ctx, kv, 1, 2, 3, 0));                 // (L, D_qk, D_v, H)
-    ggml_tensor * kv_flat = ggml_reshape_3d(ctx, kv_perm, L, D_qk * D_v, H);                   // (L, D_qk·D_v, H)
-    ggml_tensor * state_flat = ggml_mul_mat(ctx, kv_flat, Wf);                                  // (D_qk·D_v, L=t, H)
-    ggml_tensor * state = ggml_reshape_4d(ctx, state_flat, D_qk, D_v, L, H);                   // (D_qk, D_v, L, H)
-
-    // 7b) Carry from prior batch: state[t] += exp(cum_a[t,h]) · state_in_eff[d,p,h]
-    //     where state_in_eff = state_in + γ_shifted[-1]·prev_kv_in.
-    //     γ_shifted[-1] = (1-trap[0])·dt[0]; prev_kv_in = K_in @ V_in.
-    //     decay[t,h] = exp(cum_a[t,h]) is just exp(cum_a) reshaped.
+    // Effective initial state: s0_eff = state_in + γ_shifted[-1]·prev_kv_in
+    // with γ_shifted[-1] = (1-trap[0])·dt[0] and prev_kv_in = K_in @ V_in.
+    ggml_tensor * state_in_eff = nullptr;
     if (state_in_4d != nullptr) {
         // prev_kv_in (D_qk, D_v, H, 1) = sum_r K_in[d,r,h] · V_in[p,r,h]
         ggml_tensor * K_R0_in = ggml_cont(ctx, ggml_permute(ctx, K_in_4d, 1, 0, 2, 3));   // (R, D_qk, H, 1)
@@ -1938,34 +1911,114 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
         ggml_tensor * gshift_neg1_4d = ggml_reshape_4d(ctx,
             ggml_cont(ctx, gshift_neg1), 1, 1, H, 1);
         ggml_tensor * pk_scaled = ggml_mul(ctx, prev_kv_in, gshift_neg1_4d);              // (D_qk, D_v, H, 1)
-        ggml_tensor * state_in_eff = ggml_add(ctx, state_in_4d, pk_scaled);               // (D_qk, D_v, H, 1)
-
-        // decay (L, H) = exp(cum_a). Permute to (1, 1, L, H) for broadcast.
-        ggml_tensor * decay_LH = ggml_exp(ctx, cum_a);                                    // (L, H)
-        ggml_tensor * decay_4d = ggml_reshape_4d(ctx, decay_LH, 1, 1, L, H);               // (1, 1, L, H)
-
-        // state_in_eff is (D_qk, D_v, 1, H). Repeat to (D_qk, D_v, L, H) so mul broadcasts.
-        ggml_tensor * sie_perm = ggml_cont(ctx, ggml_permute(ctx, state_in_eff, 0, 1, 3, 2));  // (D_qk, D_v, 1, H)
-        ggml_tensor * sie_rep  = ggml_repeat_4d(ctx, sie_perm, D_qk, D_v, L, H);              // (D_qk, D_v, L, H)
-        ggml_tensor * carry    = ggml_mul(ctx, sie_rep, decay_4d);                            // (D_qk, D_v, L, H)
-        state = ggml_add(ctx, state, carry);
+        state_in_eff = ggml_add(ctx, state_in_4d, pk_scaled);                             // (D_qk, D_v, H, 1)
     }
 
-    // 8) qstate[p, r, t, h] = sum_d state[d, p, t, h] · q_rot[d, r, h, t].
-    //    Permute q_rot (D_qk, R, H, L) → (D_qk, R, L, H) so its batch dims line up with state.
-    ggml_tensor * q_for_mm = ggml_cont(ctx, ggml_permute(ctx, q_rot, 0, 1, 3, 2));             // (D_qk, R, L, H)
-    ggml_tensor * qstate   = ggml_mul_mat(ctx, state, q_for_mm);                                // (D_v, R, L, H)
+    ggml_tensor * qstate          = nullptr;   // (D_v, R, L, H) per-rank recurrence output
+    ggml_tensor * state_last_flat = nullptr;   // (H·D_v·D_qk, 1) closing state for packing
 
-    // 8b) Diagonal correction. For u = t the recurrence's true coefficient is γ[t],
-    //     but Wf[t, t, h] = factor[t] = γ[t] + γ_shifted[t]. So qstate over-counts
-    //     the diagonal by γ_shifted[t] · sum_d kv[d, p, h, t] · q_rot[d, r, h, t].
-    //     Subtract it. (γ_shifted[L-1] = 0 by construction, so the last position is
-    //     unaffected.)
-    ggml_tensor * qk_diag    = ggml_mul_mat(ctx, kv, q_rot);                                    // (D_v, R, H, L)
-    ggml_tensor * gshift_4d  = ggml_reshape_4d(ctx, gamma_shifted, 1, 1, H, L);
-    ggml_tensor * over_count = ggml_mul(ctx, qk_diag, gshift_4d);                                // (D_v, R, H, L)
-    ggml_tensor * over_LH    = ggml_cont(ctx, ggml_permute(ctx, over_count, 0, 1, 3, 2));        // (D_v, R, L, H)
-    qstate = ggml_sub(ctx, qstate, over_LH);
+    if (dragon_use_ggml_op()) {
+        // GGML_OP_MAMBA3_MIMO: the exact serial trapezoid recurrence as one op.
+        // No diagonal correction needed — that artifact is specific to the
+        // closed-form decay-matrix construction of the else branch.
+        ggml_tensor * s0 = state_in_eff != nullptr
+            ? state_in_eff
+            : ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D_qk, D_v, H, 1), 0.0f);
+
+        // coefs (3, H, L, 1): rows [α | β | γ] with β = (1 − trap)·dt·α.
+        ggml_tensor * beta = ggml_mul(ctx, coeff_prev, alpha);                                 // (H, L)
+        auto coef_row = [&](ggml_tensor * s) {
+            return ggml_reshape_3d(ctx, ggml_cont(ctx, s), 1, H, L);
+        };
+        ggml_tensor * coefs = ggml_cont(ctx, ggml_concat(ctx,
+            ggml_concat(ctx, coef_row(alpha), coef_row(beta), /*dim=*/ 0),
+            coef_row(gamma), /*dim=*/ 0));                                                     // (3, H, L)
+        coefs = ggml_reshape_4d(ctx, coefs, 3, H, L, 1);
+
+        ggml_tensor * res = ggml_mamba3_mimo(ctx, q_rot, k_rot, v_proj, coefs, s0);            // (D_v·R·H, L + D_qk/R)
+        const size_t rfs = ggml_element_size(res);
+        // y rows: (D_v, R, H) per token → (D_v, R, L, H).
+        ggml_tensor * y_rows = ggml_view_4d(ctx, res, D_v, R, H, L,
+                                            D_v * rfs, D_v * R * rfs, D_v * R * H * rfs, 0);
+        qstate = ggml_cont(ctx, ggml_permute(ctx, y_rows, 0, 1, 3, 2));                        // (D_v, R, L, H)
+        // Final state rows: appended after the L y rows, laid out (D_qk, D_v, H).
+        state_last_flat = ggml_reshape_2d(ctx,
+            ggml_view_1d(ctx, res, H * D_v * D_qk, (size_t) (L * D_v * R * H) * rfs),
+            H * D_v * D_qk, 1);
+    } else {
+        // 4) Cumulative log α along the L axis. log(α) = ADT but we only have α here.
+        ggml_tensor * log_a   = ggml_log(ctx, alpha);                                            // (H, L)
+        ggml_tensor * log_a_T = ggml_cont(ctx, ggml_transpose(ctx, log_a));                      // (L, H)
+        ggml_tensor * cum_a   = ggml_cumsum(ctx, log_a_T);                                       // (L, H)
+
+        // Outer diff: diff[u, t, h] = cum_a[t, h] - cum_a[u, h].
+        // ggml_sub broadcasts the second operand into the first (one-way), so the
+        // (1, L, H) side must be materialised to (L, L, H) first.
+        ggml_tensor * ca_t = ggml_reshape_3d(ctx, cum_a, 1, L, H);                                // (1, L, H)
+        ggml_tensor * ca_u = ggml_reshape_3d(ctx, cum_a, L, 1, H);                                // (L, 1, H)
+        ggml_tensor * ca_t_full = ggml_repeat_4d(ctx, ca_t, L, L, H, 1);                          // (L, L, H)
+        ggml_tensor * diff = ggml_sub(ctx, ca_t_full, ca_u);                                      // (L, L, H)
+        ggml_tensor * W    = ggml_exp(ctx, diff);                                                  // (L, L, H)
+        // Keep only u ≤ t (W[u, t, h] for u > t becomes 0).
+        W = ggml_tri(ctx, W, GGML_TRI_TYPE_LOWER_DIAG);
+
+        // 5) Wf[u, t, h] = W[u, t, h] · factor[h, u].
+        //    factor (H, L) → transpose to (L, H) → reshape (L, 1, H) for broadcast over t.
+        ggml_tensor * factor_LH    = ggml_cont(ctx, ggml_transpose(ctx, factor));                  // (L, H)
+        ggml_tensor * factor_bcast = ggml_reshape_3d(ctx, factor_LH, L, 1, H);                     // (L, 1, H)
+        ggml_tensor * Wf = ggml_mul(ctx, W, factor_bcast);                                          // (L, L, H)
+
+        // 6) kv[d, p, h, u] = sum_r k_rot[d, r, h, u] · v[p, r, h, u].
+        //    Permute k, v so R is at ne[0] for the matmul reduction.
+        ggml_tensor * k_for_mm = ggml_cont(ctx, ggml_permute(ctx, k_rot,  1, 0, 2, 3));            // (R, D_qk, H, L)
+        ggml_tensor * v_for_mm = ggml_cont(ctx, ggml_permute(ctx, v_proj, 1, 0, 2, 3));            // (R, D_v,  H, L)
+        ggml_tensor * kv = ggml_mul_mat(ctx, k_for_mm, v_for_mm);                                  // (D_qk, D_v, H, L)
+
+        // 7) state[d, p, t, h] = sum_u Wf[u, t, h] · kv[d, p, h, u].
+        //    Permute kv (D_qk, D_v, H, L=u) → (L=u, D_qk, D_v, H); reshape to (L, D_qk·D_v, H).
+        ggml_tensor * kv_perm = ggml_cont(ctx, ggml_permute(ctx, kv, 1, 2, 3, 0));                 // (L, D_qk, D_v, H)
+        ggml_tensor * kv_flat = ggml_reshape_3d(ctx, kv_perm, L, D_qk * D_v, H);                   // (L, D_qk·D_v, H)
+        ggml_tensor * state_flat = ggml_mul_mat(ctx, kv_flat, Wf);                                  // (D_qk·D_v, L=t, H)
+        ggml_tensor * state = ggml_reshape_4d(ctx, state_flat, D_qk, D_v, L, H);                   // (D_qk, D_v, L, H)
+
+        // 7b) Carry from prior batch: state[t] += exp(cum_a[t,h]) · state_in_eff[d,p,h].
+        //     decay[t,h] = exp(cum_a[t,h]) is just exp(cum_a) reshaped.
+        if (state_in_eff != nullptr) {
+            // decay (L, H) = exp(cum_a). Permute to (1, 1, L, H) for broadcast.
+            ggml_tensor * decay_LH = ggml_exp(ctx, cum_a);                                    // (L, H)
+            ggml_tensor * decay_4d = ggml_reshape_4d(ctx, decay_LH, 1, 1, L, H);               // (1, 1, L, H)
+
+            // state_in_eff is (D_qk, D_v, 1, H). Repeat to (D_qk, D_v, L, H) so mul broadcasts.
+            ggml_tensor * sie_perm = ggml_cont(ctx, ggml_permute(ctx, state_in_eff, 0, 1, 3, 2));  // (D_qk, D_v, 1, H)
+            ggml_tensor * sie_rep  = ggml_repeat_4d(ctx, sie_perm, D_qk, D_v, L, H);              // (D_qk, D_v, L, H)
+            ggml_tensor * carry    = ggml_mul(ctx, sie_rep, decay_4d);                            // (D_qk, D_v, L, H)
+            state = ggml_add(ctx, state, carry);
+        }
+
+        // 8) qstate[p, r, t, h] = sum_d state[d, p, t, h] · q_rot[d, r, h, t].
+        //    Permute q_rot (D_qk, R, H, L) → (D_qk, R, L, H) so its batch dims line up with state.
+        ggml_tensor * q_for_mm = ggml_cont(ctx, ggml_permute(ctx, q_rot, 0, 1, 3, 2));             // (D_qk, R, L, H)
+        qstate = ggml_mul_mat(ctx, state, q_for_mm);                                                // (D_v, R, L, H)
+
+        // 8b) Diagonal correction. For u = t the recurrence's true coefficient is γ[t],
+        //     but Wf[t, t, h] = factor[t] = γ[t] + γ_shifted[t]. So qstate over-counts
+        //     the diagonal by γ_shifted[t] · sum_d kv[d, p, h, t] · q_rot[d, r, h, t].
+        //     Subtract it. (γ_shifted[L-1] = 0 by construction, so the last position is
+        //     unaffected.)
+        ggml_tensor * qk_diag    = ggml_mul_mat(ctx, kv, q_rot);                                    // (D_v, R, H, L)
+        ggml_tensor * gshift_4d  = ggml_reshape_4d(ctx, gamma_shifted, 1, 1, H, L);
+        ggml_tensor * over_count = ggml_mul(ctx, qk_diag, gshift_4d);                                // (D_v, R, H, L)
+        ggml_tensor * over_LH    = ggml_cont(ctx, ggml_permute(ctx, over_count, 0, 1, 3, 2));        // (D_v, R, L, H)
+        qstate = ggml_sub(ctx, qstate, over_LH);
+
+        // Closing state for packing: state (D_qk, D_v, L, H) at the L-1 slot.
+        if (state_out_packed != nullptr) {
+            ggml_tensor * state_last = ggml_view_4d(ctx, state, D_qk, D_v, 1, H,
+                                                     state->nb[1], state->nb[2], state->nb[3],
+                                                     (L - 1) * state->nb[2]);
+            state_last_flat = ggml_reshape_2d(ctx, ggml_cont(ctx, state_last), H * D_v * D_qk, 1);
+        }
+    }
 
     // 9) o = qstate + D[h] · v_proj. Permute v to (D_v, R, L, H); broadcast D over (D_v, R, L).
     ggml_tensor * v_LH = ggml_cont(ctx, ggml_permute(ctx, v_proj, 0, 1, 3, 2));                // (D_v, R, L, H)
@@ -1987,10 +2040,6 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
 
     // Pack the closing state for the next batch if requested.
     if (state_out_packed != nullptr) {
-        // state[L-1]: view of state (D_qk, D_v, L, H) at the L-1 slot.
-        ggml_tensor * state_last = ggml_view_4d(ctx, state, D_qk, D_v, 1, H,
-                                                 state->nb[1], state->nb[2], state->nb[3],
-                                                 (L - 1) * state->nb[2]);
         // K_state = k_rot at L-1 (D_qk, R, H, 1)
         ggml_tensor * k_last = ggml_view_4d(ctx, k_rot, D_qk, R, H, 1,
                                              k_rot->nb[1], k_rot->nb[2], k_rot->nb[3],
@@ -2010,7 +2059,7 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
         *state_out_packed = ggml_concat(ctx,
             ggml_concat(ctx,
                 ggml_concat(ctx,
-                    flat(state_last, H * D_v * D_qk),
+                    state_last_flat,
                     flat(k_last,     H * R   * D_qk), /*dim=*/ 0),
                 flat(v_last,         H * R   * D_v ), /*dim=*/ 0),
             flat(ang_last,           H * num_angles), /*dim=*/ 0);
@@ -2536,6 +2585,9 @@ static ggml_tensor * build_dragon_m_mixer_real(
     if (const char * ep = std::getenv("DRAGON_M_PRIM"); ep && ep[0] && ep[0] != '0') {
         expanded_path = true;
     }
+    if (dragon_use_ggml_op()) {
+        expanded_path = true;
+    }
     // Opt-in (DRAGON_MEGA_DECODE=1): measured 2-4% SLOWER than the default
     // path — ggml's batched GEMM already amortizes projection weights across
     // concurrent sequences, and its native AVX512-BF16 dots outrun the
@@ -2714,6 +2766,8 @@ static ggml_tensor * build_dragon_m_mixer_real(
     //   * DRAGON_M_PRIM=1              — non-chunked primitive (any backend, but
     //                                    allocates (D_qk, D_v, H, L) kv and
     //                                    (L, L, H) decay tensors; fine to L≈1000).
+    //   * DRAGON_GGML_OP=1             — same as DRAGON_M_PRIM but the recurrence
+    //                                    core runs as GGML_OP_MAMBA3_MIMO.
     //   * Default                      — CPU-only custom op (fastest on CPU).
     ggml_tensor * y = nullptr;
     ggml_tensor * out_pre = nullptr;
@@ -2765,7 +2819,7 @@ static ggml_tensor * build_dragon_m_mixer_real(
                     hparams.n_embd_s(), ubatch.n_seqs,
                     ssm_states_all->nb[1],
                     kv_head * row_size)));
-    } else if (const char * e = std::getenv("DRAGON_M_PRIM"); e && e[0] && e[0] != '0') {
+    } else if (const char * e = std::getenv("DRAGON_M_PRIM"); (e && e[0] && e[0] != '0') || dragon_use_ggml_op()) {
         ggml_tensor * trap_post = ggml_cont(ctx, ggml_sigmoid(ctx, trap_raw));
         ggml_tensor * state_out = nullptr;
         y = build_dragon_m_recurrence_prim(ctx,
