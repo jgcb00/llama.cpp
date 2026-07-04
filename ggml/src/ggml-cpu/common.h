@@ -8,6 +8,8 @@
 
 #define GGML_FA_TILE_Q  64
 #define GGML_FA_TILE_KV 64
+// max q-tiles per group sharing one converted K/V tile in the tiled kernel
+#define GGML_FA_TILE_QGROUP 8
 
 #ifdef __cplusplus
 
@@ -90,6 +92,7 @@ static std::pair<int64_t, int64_t> get_thread_range(const struct ggml_compute_pa
 struct ggml_fa_tile_config {
     static constexpr size_t Q  = GGML_FA_TILE_Q;
     static constexpr size_t KV = GGML_FA_TILE_KV;
+    static constexpr size_t QG = GGML_FA_TILE_QGROUP;
 };
 
 #endif
