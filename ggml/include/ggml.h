@@ -585,6 +585,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_MAMBA3_MIMO,
 
         GGML_OP_UNARY,
 
@@ -2725,6 +2726,31 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // Dragon Mamba3-MIMO trapezoid recurrence:
+    //   kv[t]    = sum_r k[:,r,t] v[:,r,t]^T
+    //   state[t] = alpha_t * state[t-1] + beta_t * kv[t-1] + gamma_t * kv[t]
+    //   y_r[t]   = q[:,r,t]^T state[t]  (per-rank contractions; the MIMO output
+    //              combine and gating stay outside the op)
+    // kv[-1] is zero: the carry from a previous batch must be folded into the
+    // initial state by the caller (s0_eff = s0 + beta_0/alpha_0 * kv_prev).
+    //
+    // q, k:  (D_qk, R, H, n_tokens*n_seqs)  f32, rotated + normed
+    // v:     (D_v,  R, H, n_tokens*n_seqs)  f32
+    // coefs: (3, H, n_tokens, n_seqs)       f32, rows [alpha | beta | gamma]
+    // state: initial state s0, contiguous, D_qk*D_v*H*n_seqs elements,
+    //        laid out per seq as (D_qk, D_v, H)
+    // result: 2D (D_v*R*H, n_tokens*n_seqs + (D_qk/R)*n_seqs):
+    //   first n_tokens*n_seqs rows: y, laid out (D_v, R, H) per token
+    //   trailing (D_qk/R)*n_seqs rows: final state per seq (same layout as the
+    //   input state), to be scattered back to the cache by the caller
+    GGML_API struct ggml_tensor * ggml_mamba3_mimo(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * coefs,
+            struct ggml_tensor  * state);
 
     // custom operators
 
