@@ -9324,10 +9324,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48,  1, 4)); // batched decode
     test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48, 64, 1)); // prefill
     test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48, 17, 3)); // odd sizes
+    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48, 256, 1)); // chunked prefill
+    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48, 192, 2)); // chunked, multi-seq
+    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48, 150, 1)); // chunked, partial tail chunk
     // small odd-ish dims (ctor requires d_qk % r == 0)
     test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 24, 3, 20,  5, 17, 3));
     // large head dims: D_qk*D_v*4 > 48 KB exercises the global-memory state fallback
     test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 128, 4, 128, 2, 5, 2));
+    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 128, 4, 128, 2, 160, 2)); // chunked, state too big for smem
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
