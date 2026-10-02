@@ -803,6 +803,10 @@ class MODEL_TENSOR(IntEnum):
     SSM_MIMO_X           = auto() # Dragon
     SSM_MIMO_Z           = auto() # Dragon
     SSM_MIMO_O           = auto() # Dragon
+    SSM_M3_BIAS          = auto() # Dragon (packed [b_bias | c_bias])
+    SSM_M3_MXZ           = auto() # Dragon (packed [mimo_x | mimo_z])
+    SSM_M3_NORMS         = auto() # Dragon (packed [b_norm | c_norm])
+    SSM_M3_MISC          = auto() # Dragon (packed [dt_bias | D])
     TIME_MIX_W0          = auto()
     TIME_MIX_W1          = auto()
     TIME_MIX_W2          = auto()
@@ -1574,6 +1578,10 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.SSM_MIMO_X:                "blk.{bid}.ssm_mimo_x",           # Dragon
     MODEL_TENSOR.SSM_MIMO_Z:                "blk.{bid}.ssm_mimo_z",           # Dragon
     MODEL_TENSOR.SSM_MIMO_O:                "blk.{bid}.ssm_mimo_o",           # Dragon
+    MODEL_TENSOR.SSM_M3_BIAS:               "blk.{bid}.ssm_m3_bias",          # Dragon
+    MODEL_TENSOR.SSM_M3_MXZ:                "blk.{bid}.ssm_m3_mxz",           # Dragon
+    MODEL_TENSOR.SSM_M3_NORMS:              "blk.{bid}.ssm_m3_norms",         # Dragon
+    MODEL_TENSOR.SSM_M3_MISC:               "blk.{bid}.ssm_m3_misc",          # Dragon
     MODEL_TENSOR.ATTN_WA_K:                 "blk.{bid}.attn_wa_k",            # Dragon
     MODEL_TENSOR.ATTN_WA_V:                 "blk.{bid}.attn_wa_v",            # Dragon
     MODEL_TENSOR.ATTN_WB_K:                 "blk.{bid}.attn_wb_k",            # Dragon
@@ -5744,6 +5752,10 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.SSM_MIMO_X,
         MODEL_TENSOR.SSM_MIMO_Z,
         MODEL_TENSOR.SSM_MIMO_O,
+        MODEL_TENSOR.SSM_M3_BIAS,
+        MODEL_TENSOR.SSM_M3_MXZ,
+        MODEL_TENSOR.SSM_M3_NORMS,
+        MODEL_TENSOR.SSM_M3_MISC,
         # V layer (Differential-TPA-V2 attention).
         MODEL_TENSOR.ATTN_Q,          # c_q (Q projection, full)
         MODEL_TENSOR.ATTN_WA_K,

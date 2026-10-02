@@ -194,4 +194,34 @@ class DragonModel(TextModel):
         #    (Base class will pick a quant for non-norm/non-bias tensors;
         #    add an override here if quantizing the router becomes problematic.)
 
-        yield from super().modify_tensors(data_torch, name, bid)
+        for new_name, t in super().modify_tensors(data_torch, name, bid):
+            yield new_name, t
+            yield from self._pack_m3(new_name, t, bid)
+
+    # GGML_OP_MAMBA3_MIMO takes its per-layer constants packed in pairs; write
+    # the packed copies too so the GPU graphs don't concat them every ubatch.
+    _M3_PACKS = {
+        "ssm_m3_bias":  ("ssm_b_bias", "ssm_c_bias", 1),
+        "ssm_m3_mxz":   ("ssm_mimo_x", "ssm_mimo_z", 1),
+        "ssm_m3_norms": ("ssm_b_norm.weight", "ssm_c_norm.weight", None),
+        "ssm_m3_misc":  ("ssm_dt_bias", "ssm_d", None),
+    }
+
+    def _pack_m3(self, new_name: str, t: Tensor, bid: int | None):
+        if bid is None:
+            return
+        if not hasattr(self, "_m3_parts"):
+            self._m3_parts: dict[tuple[int, str], Tensor] = {}
+        short = new_name.split(f"blk.{bid}.", 1)[-1]
+        for packed, (a, b, dim) in self._M3_PACKS.items():
+            if short not in (a, b):
+                continue
+            self._m3_parts[(bid, short)] = t.to(torch.float32)
+            ta, tb = self._m3_parts.get((bid, a)), self._m3_parts.get((bid, b))
+            if ta is None or tb is None:
+                continue
+            # torch dims are the reverse of ggml's: cat on dim 1 = the R axis of
+            # (H, R, D); the 1-D pairs stack into (2, n) = ggml (n, 2)
+            pk = torch.cat([ta, tb], dim=dim) if dim is not None else torch.stack([ta.reshape(-1), tb.reshape(-1)])
+            del self._m3_parts[(bid, a)], self._m3_parts[(bid, b)]
+            yield f"blk.{bid}.{packed}", pk

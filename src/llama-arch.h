@@ -557,6 +557,10 @@ enum llm_tensor {
     LLM_TENSOR_SSM_MIMO_X,          // dragon: MIMO up-proj for x  (nheads, R, headdim)
     LLM_TENSOR_SSM_MIMO_Z,          // dragon: MIMO up-proj for z  (nheads, R, headdim)
     LLM_TENSOR_SSM_MIMO_O,          // dragon: MIMO down-proj for output (nheads, R, headdim)
+    LLM_TENSOR_SSM_M3_BIAS,         // dragon: packed GGML_OP_MAMBA3_MIMO constants (optional)
+    LLM_TENSOR_SSM_M3_MXZ,
+    LLM_TENSOR_SSM_M3_NORMS,
+    LLM_TENSOR_SSM_M3_MISC,
     // Kimi Linear KDA (using SSM_ prefix for consistency)
     LLM_TENSOR_SSM_CONV1D_Q,        // kimi: Q conv1d weight
     LLM_TENSOR_SSM_CONV1D_K,        // kimi: K conv1d weight

@@ -607,6 +607,10 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_SSM_MIMO_X,                             "blk.%d.ssm_mimo_x" },
     { LLM_TENSOR_SSM_MIMO_Z,                             "blk.%d.ssm_mimo_z" },
     { LLM_TENSOR_SSM_MIMO_O,                             "blk.%d.ssm_mimo_o" },
+    { LLM_TENSOR_SSM_M3_BIAS,                            "blk.%d.ssm_m3_bias" },
+    { LLM_TENSOR_SSM_M3_MXZ,                             "blk.%d.ssm_m3_mxz" },
+    { LLM_TENSOR_SSM_M3_NORMS,                           "blk.%d.ssm_m3_norms" },
+    { LLM_TENSOR_SSM_M3_MISC,                            "blk.%d.ssm_m3_misc" },
     // Dragon: Differential-TPA-V2 attention (TPA factorization + token shift +
     // diff combine + scalable softmax). c_q is loaded under LLM_TENSOR_ATTN_Q.
     { LLM_TENSOR_ATTN_WA_K,                              "blk.%d.attn_wa_k" },
@@ -1047,6 +1051,10 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_SSM_MIMO_X,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_SSM_MIMO_Z,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_SSM_MIMO_O,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_SSM_M3_BIAS,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_SSM_M3_MXZ,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_SSM_M3_NORMS,               {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
+    {LLM_TENSOR_SSM_M3_MISC,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
     {LLM_TENSOR_ATTN_WA_K,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_WA_V,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_ATTN_WB_K,                  {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
