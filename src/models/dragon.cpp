@@ -1361,6 +1361,21 @@ static void dragon_moe_select(const float * lt, const float * bd, int64_t n_expe
     }
 }
 
+// relu(x)^2, one node instead of relu + sqr
+static void dragon_relu_sqr_kernel(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * /*userdata*/) {
+    GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(dst));
+    const int64_t n   = ggml_nelements(a);
+    const int64_t per = (n + nth - 1) / nth;
+    const int64_t i0  = std::min<int64_t>((int64_t) ith * per, n);
+    const int64_t i1  = std::min<int64_t>(i0 + per, n);
+    const float * x = (const float *) a->data;
+    float       * y = (float       *) dst->data;
+    for (int64_t i = i0; i < i1; ++i) {
+        const float r = x[i] > 0.0f ? x[i] : 0.0f;
+        y[i] = r * r;
+    }
+}
+
 static void dragon_moe_topk_kernel(ggml_tensor * dst, int ith, int nth, void * /*userdata*/) {
     const ggml_tensor * logits = dst->src[0]; // (n_expert, L) f32
     const ggml_tensor * bias   = dst->src[1]; // (n_expert)   f32
@@ -3260,7 +3275,8 @@ post_recurrence:
     // even on paths that don't consume it (set_input asserts otherwise).
     // A 1-element view is enough — the old full-row ggml_sum_rows anchor cost
     // ~340 µs/layer/token single-threaded.
-    if (rs_view != nullptr) {
+    // (the in-place kernel and the fused op consume the cache inputs directly)
+    if (rs_view != nullptr && !state_inplace && !fused_op) {
         ggml_tensor * anchor = ggml_scale(ctx, ggml_view_1d(ctx, rs_view, 1, 0), 0.0f);
         out = ggml_add(ctx, out, anchor);
     }
@@ -3610,7 +3626,7 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
             ggml_tensor * lat3 = ggml_reshape_3d(ctx0, inp_latent, n_lat, 1, L_moe);
             ggml_tensor * up = ggml_mul_mat_id(ctx0, model.layers[il].ffn_up_exps, lat3, sel);
             ggml_set_name(up, "ffn_moe_up");
-            up = ggml_sqr(ctx0, ggml_relu(ctx0, up));
+            up = ggml_map_custom1(ctx0, up, dragon_relu_sqr_kernel, GGML_N_TASKS_MAX, nullptr);
             ggml_tensor * down = ggml_mul_mat_id(ctx0, model.layers[il].ffn_down_exps, up, sel);
             ggml_set_name(down, "ffn_moe_down");
             ggml_tensor * rargs[2] = { down, w_sel };
@@ -3626,12 +3642,19 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
         cb(routed, "moe_routed", il);
 
         // Dense shared expert: n_embd → ff_shexp → ReLU² → n_embd, no gate.
-        ggml_tensor * shared = build_ffn(cur,
+        ggml_tensor * shared = nullptr;
+        if (dragon_layer_cpu && !force_no_fused_moe) {
+            shared = ggml_mul_mat(ctx0, model.layers[il].ffn_up_shexp, cur);
+            shared = ggml_map_custom1(ctx0, shared, dragon_relu_sqr_kernel, GGML_N_TASKS_MAX, nullptr);
+            shared = ggml_mul_mat(ctx0, model.layers[il].ffn_down_shexp, shared);
+        } else {
+            shared = build_ffn(cur,
                 model.layers[il].ffn_up_shexp,   nullptr, nullptr,
                 nullptr,                          nullptr, nullptr,
                 model.layers[il].ffn_down_shexp, nullptr, nullptr,
                 nullptr,
                 LLM_FFN_RELU_SQR, LLM_FFN_PAR, il);
+        }
         cb(shared, "moe_shared", il);
 
         ggml_tensor * y_mlp = ggml_add(ctx0, routed, shared);
