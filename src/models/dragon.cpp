@@ -1009,7 +1009,16 @@ static const dragon_packed_weights * dragon_get_packed_weights(
     std::lock_guard<std::mutex> lock(mtx);
     auto it = cache.find(layer.ssm_b_bias->data);
     if (it != cache.end()) {
-        return it->second.get();
+        // the key is a data address: a model loaded later in the same process
+        // (server model swap) may reuse it, so check the contents still match
+        const dragon_packed_weights * pw = it->second.get();
+        if (pw->bias[0] == dragon_weight_f32(layer.ssm_b_bias, 0) &&
+            pw->bias[R*D_qk] == dragon_weight_f32(layer.ssm_c_bias, 0) &&
+            pw->mimo_o[0] == dragon_weight_f32(layer.ssm_mimo_o, 0) &&
+            pw->misc[H] == dragon_weight_f32(layer.ssm_d, 0)) {
+            return pw;
+        }
+        cache.erase(it);
     }
 
     auto pw = std::make_unique<dragon_packed_weights>();
@@ -1066,7 +1075,8 @@ struct dragon_m_kernel_userdata {
     int64_t n_seqs;
     float   rms_eps;
     int64_t D_qk, D_v, R, H;
-    const dragon_packed_weights * w;
+    const dragon_packed_weights * w;   // null when built without weight data (dry runs)
+    const llama_layer * layer;
     // in-place mode: src[2] is the whole recurrent cache (n_embd_s, rs_size),
     // src[4] the I32 source-row ids of the n_seqs sequences, src[3] the
     // destination rows; the state is updated directly in the destination rows
@@ -1098,6 +1108,7 @@ static void dragon_m_mega_decode_kernel(ggml_tensor * dst, int ith, int nth, voi
     ggml_tensor * state_dst      = dst->src[3]; // cache view, written in-place
 
     const auto * ud = (const dragon_m_kernel_userdata *) userdata;
+    const dragon_packed_weights * W = ud->w ? ud->w : dragon_get_packed_weights(*ud->layer, ud->D_qk, ud->D_v, ud->R, ud->H);
     const int64_t D_qk = ud->D_qk, D_v = ud->D_v, R = ud->R, H = ud->H;
     const int64_t L = cur->ne[1];           // == n_seqs (one token per seq)
     const int64_t n_embd = cur->ne[0];
@@ -1111,11 +1122,11 @@ static void dragon_m_mega_decode_kernel(ggml_tensor * dst, int ith, int nth, voi
     const int64_t cur_s1  = cur->nb[1] / sizeof(float);
     const float * pdyn_d  = (const float *) pdyn->data;
     const int64_t pdyn_s1 = pdyn->ne[0];
-    const float * bias_d  = ud->w->bias;
-    const float * mxz_d   = ud->w->mxz;
-    const float * norms_d = ud->w->norms;
-    const float * misc_d  = ud->w->misc;
-    const float * mimo_d  = ud->w->mimo_o;
+    const float * bias_d  = W->bias;
+    const float * mxz_d   = W->mxz;
+    const float * norms_d = W->norms;
+    const float * misc_d  = W->misc;
+    const float * mimo_d  = W->mimo_o;
     const float * state_in_d = (const float *) state_in->data;
     float * state_out = (float *) state_dst->data;
     const int64_t n_state_per_seq = (int64_t) (state_dst->nb[1] / sizeof(float));
@@ -1574,7 +1585,8 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
     // Per-layer constants come pre-packed (once per process) via userdata —
     // see dragon_get_packed_weights.
     const auto * ud = (const dragon_m_kernel_userdata *) userdata;
-    GGML_ASSERT(ud != nullptr && ud->w != nullptr);
+    GGML_ASSERT(ud != nullptr);
+    const dragon_packed_weights * W = ud->w ? ud->w : dragon_get_packed_weights(*ud->layer, ud->D_qk, ud->D_v, ud->R, ud->H);
     const int64_t n_seqs_kernel = ud->n_seqs;
     const float   rms_eps       = ud->rms_eps;
 
@@ -1592,11 +1604,11 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
     // Activations are fp32; weights come from the f32 packed cache.
     const float * pdyn_d  = (const float *) pdyn->data;
     const float * pstat_d = (const float *) pstat->data;
-    const float * bias_d  = ud->w->bias;
-    const float * mxz_d   = ud->w->mxz;
-    const float * norms_d = ud->w->norms;
-    const float * misc_d  = ud->w->misc;
-    const float * mimo_d  = ud->w->mimo_o;
+    const float * bias_d  = W->bias;
+    const float * mxz_d   = W->mxz;
+    const float * norms_d = W->norms;
+    const float * misc_d  = W->misc;
+    const float * mimo_d  = W->mimo_o;
     float       * y_d     = (float       *) dst->data;
     const float * state_in_d = state_in ? (const float *) state_in->data : nullptr;
 
@@ -3215,7 +3227,8 @@ static ggml_tensor * build_dragon_m_mixer_real(
         ud->n_seqs  = ubatch.n_seqs;
         ud->rms_eps = hparams.f_norm_rms_eps;
         ud->D_qk = D_qk; ud->D_v = D_v; ud->R = R; ud->H = H_ssm;
-        ud->w    = dragon_get_packed_weights(layer, D_qk, D_v, R, H_ssm);
+        ud->layer = &layer;
+        ud->w    = layer.ssm_b_bias->data ? dragon_get_packed_weights(layer, D_qk, D_v, R, H_ssm) : nullptr;
         ud->w_in = layer.ssm_in;
         ud->w_wo = layer.wo;
         const int64_t n_embd_m = cur->ne[0];
@@ -3247,7 +3260,10 @@ static ggml_tensor * build_dragon_m_mixer_real(
         ud->n_seqs  = ubatch.n_seqs;
         ud->rms_eps = hparams.f_norm_rms_eps;
         ud->D_qk = D_qk; ud->D_v = D_v; ud->R = R; ud->H = H_ssm;
-        ud->w = dragon_get_packed_weights(layer, D_qk, D_v, R, H_ssm);
+        // packing reads the weights: skipped for graphs built on an unallocated
+        // model (e.g. the -fit dry run), done lazily if such a graph ever runs
+        ud->layer = &layer;
+        ud->w = layer.ssm_b_bias->data ? dragon_get_packed_weights(layer, D_qk, D_v, R, H_ssm) : nullptr;
         ud->w_in = nullptr; ud->w_wo = nullptr;
         y = ggml_custom_4d(ctx, GGML_TYPE_F32,
                            D_v, H_ssm, n_tokens, 1,
