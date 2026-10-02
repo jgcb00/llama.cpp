@@ -81,8 +81,13 @@ there too (`--tensor-type ffn_up_exps=iq4_nl`, plus `--output-tensor-type q4_k`)
 
 KLD over 16 wikitext-2 chunks. **Recommendation: q5_k_m** (as fast as q4_k_m on this
 model — decode is dispatch-bound, not bandwidth-bound, below 6 bits — at 2.5× lower
-divergence); q6_k when quality matters most. KV cache: `-ctk q8_0 -ctv q8_0` halves
-attention KV memory at no measurable cost on CPU.
+divergence); q6_k when quality matters most.
+
+**KV cache: use `-ctk q8_0 -ctv q8_0` on CPU** — half the attention KV memory and
+faster at depth (q5_k_m decode: 52 t/s at 24k context vs 47 with f16; prefill equal).
+
+Long context / multi-user (q5_k_m, 16 threads): pp8192 405 t/s; decode 86 t/s at 1k,
+67 at 8k, 52 at 24k (q8_0 KV); 1/2/4/8 concurrent users 92/118/155/169 t/s total.
 
 ## 4. Running
 
