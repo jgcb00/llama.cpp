@@ -10,6 +10,8 @@ MoE** with a dense shared expert, and geodesic-rotation residuals. 6.8 B params,
 
 Branch: **`olala-master`** (rebased on upstream master of 2026-10-02).
 
+**Setup procedure per hardware (CPU / Mac / NVIDIA): [olala-setup.md](olala-setup.md).**
+
 ---
 
 ## 1. Building
