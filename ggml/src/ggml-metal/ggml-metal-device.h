@@ -97,6 +97,15 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
 typedef struct ggml_metal_library * ggml_metal_library_t;
 
+// the kernels of GGML_OP_MAMBA3_MIMO (see kernels/mamba3.metal)
+enum ggml_metal_mamba3_mimo_kernel {
+    GGML_METAL_MAMBA3_MIMO_SERIAL,     // short ubatches: one serial pass over the tokens
+    GGML_METAL_MAMBA3_MIMO_ANGLES,     // chunked: per-token rotary phases
+    GGML_METAL_MAMBA3_MIMO_PHASE1,     // chunked: chunk-local states + alpha products
+    GGML_METAL_MAMBA3_MIMO_CHUNK_SCAN, // chunked: scan over the chunks
+    GGML_METAL_MAMBA3_MIMO_PHASE3,     // chunked: outputs from the carry-ins
+};
+
 ggml_metal_library_t ggml_metal_library_init            (ggml_metal_device_t dev);
 ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev, const char * source, bool verbose);
 
@@ -133,6 +142,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_ssd_mma  (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv              (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mamba3_mimo       (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_metal_mamba3_mimo_kernel kernel, bool allow_fast);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_geodesic          (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);

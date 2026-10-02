@@ -64,6 +64,7 @@ set(METALLIB_KERNEL_SOURCES
     kernels/ssm.metal
     kernels/wkv.metal
     kernels/gated_delta_net.metal
+    kernels/mamba3.metal
     kernels/solve_tri.metal
     kernels/rope.metal
     kernels/conv.metal

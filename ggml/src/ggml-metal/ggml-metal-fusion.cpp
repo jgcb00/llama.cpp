@@ -269,6 +269,71 @@ static bool ggml_metal_fusion_check_gdn_cache(
     return true;
 }
 
+// MAMBA3_MIMO + CPY: the trailing cpy scatters the new packed state (the tail of the op result)
+// into the recurrent cache, so the kernels write it straight to the cache and the cpy is elided.
+// same structure as the gdn + cache cpy fusion above: the op output has other consumers (the y
+// view), so the structural checks live entirely in this callback (unsafe = true)
+static bool ggml_metal_fusion_check_mamba3_cache(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+
+    const ggml_tensor * m3  = nodes[0];
+    const ggml_tensor * cpy = nodes[1];
+
+    // the kernels skip the state tail, so the op output must not be a graph output
+    if (m3->type != GGML_TYPE_F32 || (m3->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    if (cpy->op != GGML_OP_CPY || (cpy->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    const int64_t D_v      = m3->src[4]->ne[0];
+    const int64_t H        = m3->src[4]->ne[2];
+    const int64_t n_tok    = m3->src[0]->ne[1];
+    const int64_t n_embd_s = m3->src[7]->ne[0];
+    const int64_t n_seqs   = m3->src[7]->ne[1];
+    const size_t  tail_off = ggml_row_size(GGML_TYPE_F32, D_v*H*n_tok);
+
+    const ggml_tensor * src = cpy->src[0]; // state tail view
+    const ggml_tensor * dst = cpy->src[1]; // cache view
+
+    // src must be the whole state tail of this op (contiguous, at the tail offset)
+    if (src->op != GGML_OP_VIEW || src->view_src != m3 || src->view_offs != tail_off ||
+        src->type != GGML_TYPE_F32 || !ggml_is_contiguous(src) ||
+        src->ne[0] != n_embd_s || ggml_nelements(src) != n_embd_s*n_seqs) {
+        return false;
+    }
+
+    // dst: (n_embd_s, n_seqs) f32 rows, any (non-overlapping) row stride
+    const int64_t expected_ne[GGML_MAX_DIMS] = { n_embd_s, n_seqs, 1, 1 };
+    if (dst->type != GGML_TYPE_F32 ||
+        !std::equal(expected_ne, expected_ne + GGML_MAX_DIMS, dst->ne) ||
+        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) ||
+        dst->nb[1] % sizeof(float) != 0 ||
+        dst->nb[1] < ggml_row_size(GGML_TYPE_F32, n_embd_s)) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        // the cache must be allocated so the kernel can write straight to its buffer
+        if (dst->data == nullptr) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // MUL + SIN + SQR + MUL + ADD (snake activation)
 static bool ggml_metal_fusion_check_snake(
         const ggml_metal_fusion      * fusion,
@@ -641,6 +706,8 @@ static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_O
 
 static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 
+static const std::vector<ggml_op> ops_mamba3_cache = { GGML_OP_MAMBA3_MIMO, GGML_OP_CPY };
+
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
 
 static const std::vector<ggml_op> ops_moe_reduce_2 = {
@@ -686,6 +753,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_ADD_CHAIN,      ops_add_7,                  {},     false, ggml_metal_fusion_check_add_chain },
     { GGML_METAL_FUSION_SNAKE,          ops_snake,                  {},     false, ggml_metal_fusion_check_snake },
     { GGML_METAL_FUSION_GDN_CACHE,      ops_gdn_cache,              {},     true,  ggml_metal_fusion_check_gdn_cache },
+    { GGML_METAL_FUSION_MAMBA3_CACHE,   ops_mamba3_cache,           {},     true,  ggml_metal_fusion_check_mamba3_cache },
     { GGML_METAL_FUSION_TOPK_MOE,       ops_topk_moe,               {1},    true,  ggml_metal_fusion_check_topk_moe },
     { GGML_METAL_FUSION_TOPK_MOE,       ops_topk_moe_scale,         {1},    true,  ggml_metal_fusion_check_topk_moe },
     { GGML_METAL_FUSION_TOPK_MOE,       ops_topk_moe_norm,          {1},    true,  ggml_metal_fusion_check_topk_moe },

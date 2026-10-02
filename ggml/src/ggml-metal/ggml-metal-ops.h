@@ -47,6 +47,9 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const struct ggml_tensor * op);
 size_t ggml_metal_op_flash_attn_ext_extra_idx(const struct ggml_tensor * op);
 
+// workspace of the chunked (prefill) path of MAMBA3_MIMO, 0 for short ubatches
+size_t ggml_metal_op_mamba3_mimo_extra_ws(const struct ggml_tensor * op);
+
 int ggml_metal_op_concat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_repeat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_acc               (ggml_metal_op_t ctx, int idx);
@@ -65,6 +68,8 @@ int ggml_metal_op_ssm_conv          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_scan          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_rwkv              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_gated_delta_net   (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_mamba3_mimo       (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_geodesic          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_solve_tri         (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_set               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_cpy               (ggml_metal_op_t ctx, int idx);
