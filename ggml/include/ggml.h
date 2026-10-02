@@ -586,6 +586,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_MAMBA3_MIMO,
+        GGML_OP_GEODESIC,
 
         GGML_OP_UNARY,
 
@@ -2727,30 +2728,53 @@ extern "C" {
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
 
-    // Dragon Mamba3-MIMO trapezoid recurrence:
-    //   kv[t]    = sum_r k[:,r,t] v[:,r,t]^T
-    //   state[t] = alpha_t * state[t-1] + beta_t * kv[t-1] + gamma_t * kv[t]
-    //   y_r[t]   = q[:,r,t]^T state[t]  (per-rank contractions; the MIMO output
-    //              combine and gating stay outside the op)
-    // kv[-1] is zero: the carry from a previous batch must be folded into the
-    // initial state by the caller (s0_eff = s0 + beta_0/alpha_0 * kv_prev).
+    // Dragon (Olala) Mamba3-MIMO mixer core, raw-projection form. Per head h and
+    // token t (sequence-major tokens, equal count per sequence):
+    //   k_r = rot(rmsnorm(B_r)*w_b + b_bias_r),  q_r = rot(rmsnorm(C_r)*w_c + c_bias_r)
+    //   v_r = x * mimo_x_r,                       z_r = z * mimo_z_r
+    //   dt  = softplus(dt_raw + dt_bias), a = min(-softplus(A_raw), -a_floor)
+    //   alpha = exp(a*dt), trap = sigmoid(trap_raw)
+    //   beta = (1-trap)*dt*alpha, gamma = trap*dt
+    //   ang += tanh(ang_raw)*pi*dt (kept wrapped to [-pi, pi]); rot() rotates the
+    //   pairs (i, i + D_qk/2), i < D_qk/4, by ang_i
+    //   S   = alpha*S + beta*sum_r v_prev_r k_prev_r^T + gamma*sum_r v_r k_r^T
+    //   y   = sum_r mimo_o_r * (S q_r + D*v_r) * silu(z_r)
     //
-    // q, k:  (D_qk, R, H, n_tokens*n_seqs)  f32, rotated + normed
-    // v:     (D_v,  R, H, n_tokens*n_seqs)  f32
-    // coefs: (3, H, n_tokens, n_seqs)       f32, rows [alpha | beta | gamma]
-    // state: initial state s0, contiguous, D_qk*D_v*H*n_seqs elements,
-    //        laid out per seq as (D_qk, D_v, H)
-    // result: 2D (D_v*R*H, n_tokens*n_seqs + (D_qk/R)*n_seqs):
-    //   first n_tokens*n_seqs rows: y, laid out (D_v, R, H) per token
-    //   trailing (D_qk/R)*n_seqs rows: final state per seq (same layout as the
-    //   input state), to be scattered back to the cache by the caller
+    // pdyn:   (2*R*D_qk + D_qk/4, n_tok)  rows [B (D_qk,R) | C (D_qk,R) | ang_raw]
+    // pstat:  ((2*D_v + 3)*H, n_tok)     per head [z (D_v) | x (D_v) | dt | A | trap]
+    // bias:   (D_qk, 2*R, H)             [b_bias | c_bias]
+    // mxz:    (D_v,  2*R, H)             [mimo_x | mimo_z]
+    // mimo_o: (D_v,  R,   H)
+    // norms:  (D_qk, 2)                  [w_b | w_c]
+    // misc:   (H, 2)                     [dt_bias | D]
+    // state:  (n_embd_s, n_seqs) packed per seq [S (D_qk,D_v,H) | k_prev (D_qk,R,H)
+    //          | v_prev (D_v,R,H) | ang (D_qk/4,H)]
+    // result: 1-D, y (D_v, H, n_tok) followed by the new state (n_embd_s, n_seqs)
     GGML_API struct ggml_tensor * ggml_mamba3_mimo(
             struct ggml_context * ctx,
-            struct ggml_tensor  * q,
-            struct ggml_tensor  * k,
-            struct ggml_tensor  * v,
-            struct ggml_tensor  * coefs,
-            struct ggml_tensor  * state);
+            struct ggml_tensor  * pdyn,
+            struct ggml_tensor  * pstat,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * mxz,
+            struct ggml_tensor  * mimo_o,
+            struct ggml_tensor  * norms,
+            struct ggml_tensor  * misc,
+            struct ggml_tensor  * state,
+            float                 eps,
+            float                 a_floor);
+
+    // Dragon (Olala) geodesic residual, per row of x and g (n_embd, n_rows):
+    //   g_perp = g - (x.g / |x|^2) x
+    //   theta  = min((min(|g_perp|/|x|, pi/4) * scale + bias) * inv_depth, pi/4)
+    //   out    = x cos(theta) + (g_perp/|g_perp|) |x| sin(theta)
+    // scale, bias: 1-element f32 tensors
+    GGML_API struct ggml_tensor * ggml_geodesic(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * bias,
+            float                 inv_depth);
 
     // custom operators
 

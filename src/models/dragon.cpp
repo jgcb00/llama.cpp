@@ -29,10 +29,13 @@ static inline float dragon_sigmoidf(float x) {
 
 // Storage precision of the recurrent state cache. Working precision in the
 // kernel is always f32; this only affects the cache-resident bytes.
-//   F32  — plain f32 everywhere (DRAGON_F32_STATE=1, or forced by any opt-in
-//          path that reads the cache as raw f32: prim/chunked/mega/colsplit).
-//   BF16 — default. K/V trapezoid sections packed to bf16 (low half of their
-//          f32 sections); the big ssm S-matrix and angle scalars stay f32.
+//   F32  — default: plain f32 everywhere. Long generations drift into
+//          repetition loops with a reduced-precision state, so this is what
+//          the reference stacks (training, vLLM) run.
+//   BF16 — DRAGON_BF16_STATE=1 (opt-in). K/V trapezoid sections packed to bf16
+//          (low half of their f32 sections); the ssm S-matrix and angle scalars
+//          stay f32. Ignored by the paths that read the cache as raw f32
+//          (prim/chunked/mega/colsplit).
 //   Q8   — DRAGON_STATE_Q8=1 (experiment). ssm S-matrix AND K/V trapezoids
 //          stored as per-32-block int8 with an f32 scale ([scale][32xint8]
 //          in each 32-float slot); angles stay f32. Recurrent feedback of the
@@ -47,11 +50,25 @@ static dragon_state_prec dragon_state_mode() {
         if (std::getenv("DRAGON_MEGA_DECODE"))   return DRAGON_STATE_F32;
         if (std::getenv("DRAGON_M_COLSPLIT"))    return DRAGON_STATE_F32; // q8/bf16 slots assume unsplit 32-aligned runs
         if (std::getenv("DRAGON_STATE_Q8"))      return DRAGON_STATE_Q8;
-        return DRAGON_STATE_BF16;
+        if (std::getenv("DRAGON_BF16_STATE"))    return DRAGON_STATE_BF16;
+        return DRAGON_STATE_F32;
     }();
     return v;
 }
 static bool dragon_state_bf16() { return dragon_state_mode() != DRAGON_STATE_F32; }
+
+// Backend selection, decided per layer while the graph is built. Layers whose
+// weights live on the CPU use the fused CPU custom ops (fastest there, CPU-only);
+// layers on a GPU (CUDA, Metal, ...) use standard ggml ops + GGML_OP_MAMBA3_MIMO
+// so the whole layer stays on that device. The DRAGON_GGML_OP / DRAGON_NO_FUSED_*
+// env vars still force parts of the portable path on CPU; DRAGON_PORTABLE=1
+// forces all of it (validates the GPU graph against the CPU one).
+static thread_local bool dragon_layer_cpu = true;
+
+static bool dragon_env_on(const char * name) {
+    const char * e = std::getenv(name);
+    return e && e[0] && e[0] != '0';
+}
 
 static inline void dragon_simd_fma_inplace_dual(
         float * __restrict__ out1, const float * __restrict__ in1, float a1,
@@ -723,9 +740,12 @@ static ggml_tensor * build_dragon_geodesic(
         int            il) {
     // DRAGON_NO_FUSED_GEO=1 selects the pure-ggml reference path (also the
     // path for non-CPU backends if this graph is ever offloaded).
-    static const bool use_ref = std::getenv("DRAGON_NO_FUSED_GEO") != nullptr;
-    if (use_ref) {
+    static const bool force_ref = std::getenv("DRAGON_NO_FUSED_GEO") != nullptr;
+    if (force_ref) {
         return build_dragon_geodesic_ref(ctx, x, g, scale_scalar, bias_scalar, il);
+    }
+    if (!dragon_layer_cpu) {
+        return ggml_geodesic(ctx, x, g, scale_scalar, bias_scalar, 1.0f / (float) (il + 1));
     }
     return build_dragon_geodesic_fused(ctx, x, g, scale_scalar, bias_scalar, il);
 }
@@ -1622,9 +1642,13 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
 
                 // --- Rotary update ---
                 // angle_state[h, i] += (precomputed tanh(ang_t[i]) · π) · dt_h
+                // Kept wrapped to [-pi, pi]: the phase grows without bound over a
+                // generation and an unwrapped f32 angle loses ~ulp(|angle|) per
+                // step (vLLM/mamba wrap mod 2*pi for the same reason).
                 const float * tan_tt = tanh_ang_pi.data() + tt * num_angles;
                 for (int64_t i = 0; i < num_angles; ++i) {
-                    ang_st[i] += tan_tt[i] * dt_h;
+                    const float a = ang_st[i] + tan_tt[i] * dt_h;
+                    ang_st[i] = a - (float) (2.0 * M_PI) * rintf(a * (float) (0.5 / M_PI));
                 }
 
                 // Materialize raw q, k for this (h, t) into the group scratch:
@@ -1755,8 +1779,8 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
 // the first-class GGML_OP_MAMBA3_MIMO op instead of the closed-form
 // cumsum/tri/mul_mat construction.
 static bool dragon_use_ggml_op() {
-    const char * e = std::getenv("DRAGON_GGML_OP");
-    return e && e[0] && e[0] != '0';
+    static const bool forced = dragon_env_on("DRAGON_GGML_OP");
+    return forced || !dragon_layer_cpu;
 }
 
 // Primitive re-expression of the Mamba3-MIMO recurrence. Uses only standard
@@ -1806,8 +1830,7 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
     GGML_ASSERT(n_seqs >= 1);
     const int64_t T = L / n_seqs;  // tokens per sequence (equal-split ubatch)
     GGML_ASSERT(T * n_seqs == L && "L must be divisible by n_seqs (equal-split ubatch)");
-    GGML_ASSERT((n_seqs == 1 || dragon_use_ggml_op()) &&
-                "n_seqs > 1 requires DRAGON_GGML_OP=1 (closed-form primitive is single-seq)");
+    GGML_ASSERT(n_seqs == 1 && "the closed-form primitive is single-sequence");
 
     // Packed-state offsets (must match llama_hparams::n_embd_s() for Dragon).
     const int64_t off_K_glob   = H * D_v * D_qk;
@@ -1945,38 +1968,7 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
     ggml_tensor * qstate          = nullptr;   // (D_v, R, L, H) per-rank recurrence output
     ggml_tensor * state_last_flat = nullptr;   // (H·D_v·D_qk, 1) closing state for packing
 
-    if (dragon_use_ggml_op()) {
-        // GGML_OP_MAMBA3_MIMO: the exact serial trapezoid recurrence as one op.
-        // No diagonal correction needed — that artifact is specific to the
-        // closed-form decay-matrix construction of the else branch.
-        ggml_tensor * s0 = state_in_eff != nullptr
-            ? state_in_eff
-            : ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D_qk, D_v, H, n_seqs), 0.0f);
-
-        // coefs (3, H, T, n_seqs): rows [α | β | γ] with β = (1 − trap)·dt·α.
-        // The (H, L) tensors are seq-major in L, so the (T, n_seqs) split is a
-        // plain reshape.
-        ggml_tensor * beta = ggml_mul(ctx, coeff_prev, alpha);                                 // (H, L)
-        auto coef_row = [&](ggml_tensor * s) {
-            return ggml_reshape_3d(ctx, ggml_cont(ctx, s), 1, H, L);
-        };
-        ggml_tensor * coefs = ggml_cont(ctx, ggml_concat(ctx,
-            ggml_concat(ctx, coef_row(alpha), coef_row(beta), /*dim=*/ 0),
-            coef_row(gamma), /*dim=*/ 0));                                                     // (3, H, L)
-        coefs = ggml_reshape_4d(ctx, coefs, 3, H, T, n_seqs);
-
-        ggml_tensor * res = ggml_mamba3_mimo(ctx, q_rot, k_rot, v_proj, coefs, s0);            // (D_v·R·H, L + (D_qk/R)·n_seqs)
-        const size_t rfs = ggml_element_size(res);
-        // y rows: (D_v, R, H) per token → (D_v, R, L, H); L stays seq-major.
-        ggml_tensor * y_rows = ggml_view_4d(ctx, res, D_v, R, H, L,
-                                            D_v * rfs, D_v * R * rfs, D_v * R * H * rfs, 0);
-        qstate = ggml_cont(ctx, ggml_permute(ctx, y_rows, 0, 1, 3, 2));                        // (D_v, R, L, H)
-        // Final state rows: appended after the L y rows, laid out (D_qk, D_v, H)
-        // per seq, seqs contiguous.
-        state_last_flat = ggml_reshape_2d(ctx,
-            ggml_view_1d(ctx, res, n_seqs * H * D_v * D_qk, (size_t) (L * D_v * R * H) * rfs),
-            H * D_v * D_qk, n_seqs);
-    } else {
+    {
         // 4) Cumulative log α along the L axis. log(α) = ADT but we only have α here.
         ggml_tensor * log_a   = ggml_log(ctx, alpha);                                            // (H, L)
         ggml_tensor * log_a_T = ggml_cont(ctx, ggml_transpose(ctx, log_a));                      // (L, H)
@@ -2619,9 +2611,7 @@ static ggml_tensor * build_dragon_m_mixer_real(
     if (const char * ep = std::getenv("DRAGON_M_PRIM"); ep && ep[0] && ep[0] != '0') {
         expanded_path = true;
     }
-    if (dragon_use_ggml_op()) {
-        expanded_path = true;
-    }
+    const bool fused_op = dragon_use_ggml_op() && !expanded_path;
     // Opt-in (DRAGON_MEGA_DECODE=1): measured 2-4% SLOWER than the default
     // path — ggml's batched GEMM already amortizes projection weights across
     // concurrent sequences, and its native AVX512-BF16 dots outrun the
@@ -2631,7 +2621,7 @@ static ggml_tensor * build_dragon_m_mixer_real(
         const char * e = std::getenv("DRAGON_MEGA_DECODE");
         return e && e[0] && e[0] != '0';
     }();
-    const bool mega_decode = !expanded_path && want_mega && R == 4 &&
+    const bool mega_decode = !expanded_path && !fused_op && want_mega && R == 4 &&
                              n_tokens == (int64_t) gctx.ubatch.n_seqs &&
                              layer.ssm_in->type == GGML_TYPE_BF16 &&
                              layer.wo->type == GGML_TYPE_BF16;
@@ -2805,6 +2795,40 @@ static ggml_tensor * build_dragon_m_mixer_real(
     //   * Default                      — CPU-only custom op (fastest on CPU).
     ggml_tensor * y = nullptr;
     ggml_tensor * out_pre = nullptr;
+    if (fused_op) {
+        // Portable path (GPU layers): GGML_OP_MAMBA3_MIMO consumes the raw
+        // projections and the gathered state, returns [y | new state]; the
+        // state is scattered back into the recurrent cache by a cpy.
+        GGML_ASSERT((int64_t) ubatch.n_seqs * (int64_t) ubatch.n_seq_tokens == n_tokens);
+        ggml_tensor * bias   = ggml_concat(ctx, layer.ssm_b_bias, layer.ssm_c_bias, 1);       // (D_qk, 2R, H)
+        ggml_tensor * mxz    = ggml_concat(ctx, layer.ssm_mimo_x, layer.ssm_mimo_z, 1);       // (D_v, 2R, H)
+        ggml_tensor * norms  = ggml_concat(ctx,
+                ggml_reshape_2d(ctx, layer.ssm_b_norm, D_qk, 1),
+                ggml_reshape_2d(ctx, layer.ssm_c_norm, D_qk, 1), 1);                           // (D_qk, 2)
+        ggml_tensor * misc   = ggml_concat(ctx,
+                ggml_reshape_2d(ctx, layer.ssm_dt_bias, H_ssm, 1),
+                ggml_reshape_2d(ctx, layer.ssm_d,       H_ssm, 1), 1);                         // (H, 2)
+        auto f32c = [&](ggml_tensor * t) {
+            return t->type == GGML_TYPE_F32 ? t : ggml_cast(ctx, t, GGML_TYPE_F32);
+        };
+        ggml_tensor * res = ggml_mamba3_mimo(ctx, proj_dyn, proj_static,
+                f32c(bias), f32c(mxz), f32c(layer.ssm_mimo_o), f32c(norms), f32c(misc),
+                rs_view, hparams.f_norm_rms_eps, 1e-4f);
+        ggml_set_name(res, "m_kernel");
+        const size_t es = ggml_element_size(res);
+        y = ggml_view_3d(ctx, res, D_v, H_ssm, n_tokens, D_v * es, D_v * H_ssm * es, 0);
+        const auto kv_head = mctx_recr->get_head();
+        const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+        ggml_tensor * state_new = ggml_view_2d(ctx, res, hparams.n_embd_s(), ubatch.n_seqs,
+                hparams.n_embd_s() * es, (size_t) (D_v * H_ssm * n_tokens) * es);
+        ggml_build_forward_expand(gctx.gf,
+            ggml_cpy(ctx, state_new,
+                ggml_view_2d(ctx, ssm_states_all,
+                    hparams.n_embd_s(), ubatch.n_seqs,
+                    ssm_states_all->nb[1],
+                    kv_head * row_size)));
+        goto post_recurrence;
+    }
     if (n_tokens == 1 && std::getenv("DRAGON_M_DECODE_PRIM")) {
         // (Debug) route decode through the pure-ggml-ops decode-step primitive.
         ggml_tensor * trap_post = ggml_cont(ctx, ggml_sigmoid(ctx, trap_raw));
@@ -2855,7 +2879,7 @@ static ggml_tensor * build_dragon_m_mixer_real(
                     hparams.n_embd_s(), ubatch.n_seqs,
                     ssm_states_all->nb[1],
                     kv_head * row_size)));
-    } else if (const char * e = std::getenv("DRAGON_M_PRIM"); (e && e[0] && e[0] != '0') || dragon_use_ggml_op()) {
+    } else if (const char * e = std::getenv("DRAGON_M_PRIM"); e && e[0] && e[0] != '0') {
         ggml_tensor * trap_post = ggml_cont(ctx, ggml_sigmoid(ctx, trap_raw));
         ggml_tensor * state_out = nullptr;
         // Equal-split ubatches guarantee the same token count per seq, laid
@@ -3028,8 +3052,8 @@ static ggml_tensor * build_dragon_v_mixer(
                                                                                  // (n_embd_r, n_seqs)
         const int64_t n_kp     = head_dim * n_kv;                                // K-side floats
 
-        static const bool no_fused_shift = std::getenv("DRAGON_NO_FUSED_SHIFT") != nullptr;
-        if (!no_fused_shift) {
+        static const bool force_no_fused_shift = std::getenv("DRAGON_NO_FUSED_SHIFT") != nullptr;
+        if (!force_no_fused_shift && dragon_layer_cpu) {
             // Fused token shift: one custom op computes K̃/Ṽ for both tensors
             // and writes the pre-shift last K/V of each seq into the cache.
             ggml_tensor * ak = ggml_mul_mat(ctx, layer.attn_shift_k, cur);       // (n_kv, L)
@@ -3212,6 +3236,13 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
     const int64_t n_tokens_g = (int64_t) inpL->ne[1];
 
     for (int il = 0; il < n_layer; ++il) {
+        {
+            ggml_backend_dev_t dev = model.dev_layer(il);
+            static const bool force_portable = dragon_env_on("DRAGON_PORTABLE");
+            dragon_layer_cpu = !force_portable &&
+                (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
+        }
+
         // Optional per-block dump for HF↔llama.cpp comparison, gated on DRAGON_DUMP_DIR.
         inpL = dragon_maybe_dump(ctx0, inpL, "block_%02d_in.bin", il);
 
@@ -3260,9 +3291,9 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
             cur = ggml_add(ctx0, cur, ggml_scale(ctx0, ggml_sum_rows(ctx0, topk_f32), 0.0f));
         }
 
-        static const bool no_fused_moe = std::getenv("DRAGON_NO_FUSED_MOE") != nullptr;
+        static const bool force_no_fused_moe = std::getenv("DRAGON_NO_FUSED_MOE") != nullptr;
         ggml_tensor * routed = nullptr;
-        if (no_fused_moe) {
+        if (force_no_fused_moe || !dragon_layer_cpu) {
             routed = build_moe_ffn(
                     inp_latent,
                     model.layers[il].ffn_gate_inp,

@@ -12202,129 +12202,244 @@ void ggml_compute_forward_dsv4_hc_post(
 }
 
 // ggml_compute_forward_mamba3_mimo
+//
+// reference forward of the fused Dragon Mamba3-MIMO mixer core (see ggml.h);
+// one work unit per (seq, head), serial over the tokens of the sequence
 
-static void ggml_compute_forward_mamba3_mimo_one_chunk(
-    const ggml_compute_params * params,
-    ggml_tensor * dst,
-    int64_t ir0,
-    int64_t ir1) {
-    GGML_UNUSED(params);
-
-    const ggml_tensor * src_q     = dst->src[0];
-    const ggml_tensor * src_k     = dst->src[1];
-    const ggml_tensor * src_v     = dst->src[2];
-    const ggml_tensor * src_coefs = dst->src[3];
-    const ggml_tensor * src_state = dst->src[4];
-
-    const int64_t D_qk     = src_q->ne[0];
-    const int64_t R        = src_q->ne[1];
-    const int64_t H        = src_q->ne[2];
-    const int64_t D_v      = src_v->ne[0];
-    const int64_t n_tokens = src_coefs->ne[2];
-    const int64_t n_seqs   = src_coefs->ne[3];
-
-    GGML_ASSERT(ggml_is_contiguous(src_q));
-    GGML_ASSERT(ggml_is_contiguous(src_k));
-    GGML_ASSERT(ggml_is_contiguous(src_v));
-    GGML_ASSERT(ggml_is_contiguous(src_coefs));
-    GGML_ASSERT(ggml_is_contiguous(src_state));
-
-    const float * q_base     = (const float *) src_q->data;
-    const float * k_base     = (const float *) src_k->data;
-    const float * v_base     = (const float *) src_v->data;
-    const float * coefs_base = (const float *) src_coefs->data;
-    const float * s_in_base  = (const float *) src_state->data;
-
-    // per-token strides in floats
-    const int64_t qk_tok = D_qk * R * H;
-    const int64_t v_tok  = D_v  * R * H;
-
-    // output layout: [y rows | final state rows], all rows D_v*R*H wide
-    const int64_t y_row = D_v * R * H;
-    float * y_base     = (float *) dst->data;
-    float * state_base = y_base + y_row * n_tokens * n_seqs;
-
-    for (int64_t ir = ir0; ir < ir1; ++ir) {
-        const int64_t h   = ir % H; // head index
-        const int64_t seq = ir / H; // sequence
-
-        // final-state slot for this (seq, head) doubles as the working state;
-        // layout per seq matches the input state: (D_qk, D_v, H)
-        float       * S    = state_base + (seq * H + h) * D_qk * D_v;
-        const float * s_in = s_in_base  + (seq * H + h) * D_qk * D_v;
-        memcpy(S, s_in, D_qk * D_v * sizeof(float));
-
-        for (int64_t t = 0; t < n_tokens; ++t) {
-            const int64_t tok = seq * n_tokens + t;
-
-            const float * q_t = q_base + tok * qk_tok + h * D_qk * R;
-            const float * k_t = k_base + tok * qk_tok + h * D_qk * R;
-            const float * v_t = v_base + tok * v_tok  + h * D_v  * R;
-            // trapezoid beta term uses the previous token's kv; zero at t = 0
-            // (the cross-batch carry is folded into s0 by the caller)
-            const float * k_p = t > 0 ? k_t - qk_tok : NULL;
-            const float * v_p = t > 0 ? v_t - v_tok  : NULL;
-
-            const float * cf = coefs_base + 3 * (h + H * (t + n_tokens * seq));
-            const float alpha = cf[0];
-            const float beta  = cf[1];
-            const float gamma = cf[2];
-
-            float * y_t = y_base + tok * y_row + h * D_v * R;
-
-            for (int64_t p = 0; p < D_v; ++p) {
-                float * S_row = S + p * D_qk;
-                for (int64_t d = 0; d < D_qk; ++d) {
-                    float c_acc = 0.0f;
-                    float p_acc = 0.0f;
-                    for (int64_t r = 0; r < R; ++r) {
-                        c_acc += v_t[r * D_v + p] * k_t[r * D_qk + d];
-                    }
-                    if (k_p) {
-                        for (int64_t r = 0; r < R; ++r) {
-                            p_acc += v_p[r * D_v + p] * k_p[r * D_qk + d];
-                        }
-                    }
-                    S_row[d] = alpha * S_row[d] + beta * p_acc + gamma * c_acc;
-                }
-                for (int64_t r = 0; r < R; ++r) {
-                    float acc = 0.0f;
-                    for (int64_t d = 0; d < D_qk; ++d) {
-                        acc += S_row[d] * q_t[r * D_qk + d];
-                    }
-                    y_t[r * D_v + p] = acc;
-                }
-            }
-        }
-    }
+static inline float ggml_m3_softplus(float x) {
+    return (x > 0.0f ? x : 0.0f) + logf(expf(-fabsf(x)) + 1.0f);
 }
 
 static void ggml_compute_forward_mamba3_mimo_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    const ggml_tensor * pdyn   = dst->src[0];
+    const ggml_tensor * pstat  = dst->src[1];
+    const ggml_tensor * bias   = dst->src[2];
+    const ggml_tensor * mxz    = dst->src[3];
+    const ggml_tensor * mimo_o = dst->src[4];
+    const ggml_tensor * norms  = dst->src[5];
+    const ggml_tensor * misc   = dst->src[6];
+    const ggml_tensor * state  = dst->src[7];
 
-    const ggml_tensor * src_coefs = dst->src[3];
-    const int64_t nr = src_coefs->ne[1] * src_coefs->ne[3]; // H * n_seqs
+    const float eps     = ggml_get_op_params_f32(dst, 0);
+    const float a_floor = ggml_get_op_params_f32(dst, 1);
 
-    const int nth = params->nth;
+    const int64_t D_qk   = bias->ne[0];
+    const int64_t R      = mimo_o->ne[1];
+    const int64_t H      = mimo_o->ne[2];
+    const int64_t D_v    = mimo_o->ne[0];
+    const int64_t n_ang  = D_qk / 4;
+    const int64_t n_tok  = pdyn->ne[1];
+    const int64_t n_seqs = state->ne[1];
+    const int64_t T      = n_tok / n_seqs;
+
+    const int64_t off_K    = H*D_v*D_qk;
+    const int64_t off_V    = off_K + H*R*D_qk;
+    const int64_t off_A    = off_V + H*R*D_v;
+    const int64_t n_embd_s = off_A + H*n_ang;
+
+    const float * bias_d  = (const float *) bias->data;
+    const float * mxz_d   = (const float *) mxz->data;
+    const float * mo_d    = (const float *) mimo_o->data;
+    const float * norms_d = (const float *) norms->data;
+    const float * misc_d  = (const float *) misc->data;
+
+    float * y_d  = (float *) dst->data;
+    float * st_d = y_d + D_v*H*n_tok;
+
     const int ith = params->ith;
+    const int nth = params->nth;
 
-    const int64_t dr  = (nr + nth - 1) / nth;
-    const int64_t ir0 = MIN(dr * ith, nr);
-    const int64_t ir1 = MIN(ir0 + dr, nr);
+    // per-unit scratch: S (D_v, D_qk) | k, q (D_qk, R) | k_prev (D_qk, R) | v, z, v_prev (D_v, R) | ang
+    std::vector<float> buf(D_v*D_qk + 3*D_qk*R + 3*D_v*R + n_ang);
+    float * S   = buf.data();
+    float * k   = S + D_v*D_qk;
+    float * q   = k + D_qk*R;
+    float * kp  = q + D_qk*R;
+    float * v   = kp + D_qk*R;
+    float * z   = v + D_v*R;
+    float * vp  = z + D_v*R;
+    float * ang = vp + D_v*R;
 
-    ggml_compute_forward_mamba3_mimo_one_chunk(params, dst, ir0, ir1);
+    const int64_t n_units = n_seqs*H;
+    for (int64_t u = ith; u < n_units; u += nth) {
+        const int64_t seq = u / H;
+        const int64_t h   = u % H;
+
+        const float * s_in  = (const float *) ((const char *) state->data + seq*state->nb[1]);
+        float       * s_out = st_d + seq*n_embd_s;
+
+        memcpy(S,   s_in + h*D_v*D_qk,      D_v*D_qk*sizeof(float));
+        memcpy(kp,  s_in + off_K + h*R*D_qk, R*D_qk*sizeof(float));
+        memcpy(vp,  s_in + off_V + h*R*D_v,  R*D_v*sizeof(float));
+        memcpy(ang, s_in + off_A + h*n_ang,  n_ang*sizeof(float));
+
+        const float * bias_h = bias_d + h*2*R*D_qk;
+        const float * mx_h   = mxz_d  + h*2*R*D_v;
+        const float * mz_h   = mx_h + R*D_v;
+        const float * mo_h   = mo_d   + h*R*D_v;
+        const float   D_h    = misc_d[H + h];
+
+        for (int64_t t = 0; t < T; ++t) {
+            const int64_t tok = seq*T + t;
+            const float * pd = (const float *) ((const char *) pdyn->data  + tok*pdyn->nb[1]);
+            const float * ps = (const float *) ((const char *) pstat->data + tok*pstat->nb[1]) + h*(2*D_v + 3);
+
+            const float dt    = ggml_m3_softplus(ps[2*D_v + 0] + misc_d[h]);
+            const float a     = fminf(-ggml_m3_softplus(ps[2*D_v + 1]), -a_floor);
+            const float alpha = expf(a*dt);
+            const float trap  = 1.0f/(1.0f + expf(-ps[2*D_v + 2]));
+            const float beta  = (1.0f - trap)*dt*alpha;
+            const float gamma = trap*dt;
+
+            for (int64_t i = 0; i < n_ang; ++i) {
+                const float x = ang[i] + tanhf(pd[2*R*D_qk + i])*(float) M_PI*dt;
+                ang[i] = x - (float) (2.0*M_PI)*rintf(x*(float) (0.5/M_PI));
+            }
+
+            // k = B, q = C: rms-norm * weight + per-head bias
+            for (int64_t g = 0; g < 2*R; ++g) {
+                const float * src = pd + g*D_qk;
+                const float * w   = norms_d + (g < R ? 0 : D_qk);
+                double sum = 0.0;
+                for (int64_t d = 0; d < D_qk; ++d) {
+                    sum += (double) src[d]*(double) src[d];
+                }
+                const float sc = 1.0f/sqrtf((float) (sum/D_qk) + eps);
+                float * out = g < R ? k + g*D_qk : q + (g - R)*D_qk;
+                for (int64_t d = 0; d < D_qk; ++d) {
+                    out[d] = (src[d]*sc)*w[d] + bias_h[g*D_qk + d];
+                }
+            }
+            // rotary on the pairs (i, i + D_qk/2), i < D_qk/4
+            for (int64_t i = 0; i < n_ang; ++i) {
+                const float c = cosf(ang[i]);
+                const float s = sinf(ang[i]);
+                for (int64_t r = 0; r < R; ++r) {
+                    float * kr = k + r*D_qk;
+                    float * qr = q + r*D_qk;
+                    const float k0 = kr[i], k2 = kr[i + D_qk/2];
+                    kr[i] = k0*c - k2*s; kr[i + D_qk/2] = k0*s + k2*c;
+                    const float q0 = qr[i], q2 = qr[i + D_qk/2];
+                    qr[i] = q0*c - q2*s; qr[i + D_qk/2] = q0*s + q2*c;
+                }
+            }
+            for (int64_t r = 0; r < R; ++r) {
+                for (int64_t p = 0; p < D_v; ++p) {
+                    v[r*D_v + p] = ps[D_v + p]*mx_h[r*D_v + p];
+                    z[r*D_v + p] = ps[p]*mz_h[r*D_v + p];
+                }
+            }
+
+            float * y_t = y_d + (tok*H + h)*D_v;
+            for (int64_t p = 0; p < D_v; ++p) {
+                float * Sp = S + p*D_qk;
+                for (int64_t d = 0; d < D_qk; ++d) {
+                    float c_acc = 0.0f, p_acc = 0.0f;
+                    for (int64_t r = 0; r < R; ++r) {
+                        c_acc += v[r*D_v + p]*k[r*D_qk + d];
+                        p_acc += vp[r*D_v + p]*kp[r*D_qk + d];
+                    }
+                    Sp[d] = alpha*Sp[d] + beta*p_acc + gamma*c_acc;
+                }
+                float yp = 0.0f;
+                for (int64_t r = 0; r < R; ++r) {
+                    float acc = 0.0f;
+                    for (int64_t d = 0; d < D_qk; ++d) {
+                        acc += Sp[d]*q[r*D_qk + d];
+                    }
+                    acc += D_h*v[r*D_v + p];
+                    const float zv = z[r*D_v + p];
+                    yp += acc*(zv/(1.0f + expf(-zv)))*mo_h[r*D_v + p];
+                }
+                y_t[p] = yp;
+            }
+            memcpy(kp, k, R*D_qk*sizeof(float));
+            memcpy(vp, v, R*D_v*sizeof(float));
+        }
+
+        memcpy(s_out + h*D_v*D_qk,       S,   D_v*D_qk*sizeof(float));
+        memcpy(s_out + off_K + h*R*D_qk, kp,  R*D_qk*sizeof(float));
+        memcpy(s_out + off_V + h*R*D_v,  vp,  R*D_v*sizeof(float));
+        memcpy(s_out + off_A + h*n_ang,  ang, n_ang*sizeof(float));
+    }
 }
 
 void ggml_compute_forward_mamba3_mimo(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0];
-
-    switch (src0->type) {
+    switch (dst->src[0]->type) {
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_mamba3_mimo_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_geodesic
+
+static void ggml_compute_forward_geodesic_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * g = dst->src[1];
+
+    const float scale     = *(const float *) dst->src[2]->data;
+    const float bias      = *(const float *) dst->src[3]->data;
+    const float inv_depth = ggml_get_op_params_f32(dst, 0);
+    const float pi4       = 0.785398163f;
+
+    const int64_t n  = x->ne[0];
+    const int64_t nr = ggml_nrows(x);
+
+    for (int64_t ir = params->ith; ir < nr; ir += params->nth) {
+        const int64_t i1 = ir % x->ne[1];
+        const int64_t i2 = (ir / x->ne[1]) % x->ne[2];
+        const int64_t i3 = ir / (x->ne[1]*x->ne[2]);
+        const float * xr = (const float *) ((const char *) x->data   + i1*x->nb[1]   + i2*x->nb[2]   + i3*x->nb[3]);
+        const float * gr = (const float *) ((const char *) g->data   + i1*g->nb[1]   + i2*g->nb[2]   + i3*g->nb[3]);
+        float       * yr = (float       *) ((char       *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        ggml_float xx = 0.0, xg = 0.0, gg = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            xx += (ggml_float) xr[i]*xr[i];
+            xg += (ggml_float) xr[i]*gr[i];
+            gg += (ggml_float) gr[i]*gr[i];
+        }
+        const float x_norm_sq = fmaxf((float) xx, 1e-12f);
+        const float coef      = (float) xg/x_norm_sq;
+        // |g - coef*x|^2 = |g|^2 - 2 coef x.g + coef^2 |x|^2, cancellation-prone, so
+        // accumulate it directly
+        ggml_float pp = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            const float gp = gr[i] - coef*xr[i];
+            pp += (ggml_float) gp*gp;
+        }
+        GGML_UNUSED(gg);
+        const float tan_norm = fmaxf(sqrtf((float) pp), 1e-8f);
+        const float xn       = sqrtf(x_norm_sq);
+        float theta = fminf(tan_norm/fmaxf(xn, 1e-6f), pi4);
+        theta = fminf((theta*scale + bias)*inv_depth, pi4);
+        const float c  = cosf(theta);
+        const float s  = sinf(theta)*xn/tan_norm;
+        for (int64_t i = 0; i < n; ++i) {
+            yr[i] = xr[i]*c + (gr[i] - coef*xr[i])*s;
+        }
+    }
+}
+
+void ggml_compute_forward_geodesic(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_geodesic_f32(params, dst);
             } break;
         default:
             {

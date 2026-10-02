@@ -4879,10 +4879,8 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
-// GGML_OP_MAMBA3_MIMO
+// GGML_OP_MAMBA3_MIMO (fused Dragon mixer core, raw projections in)
 struct test_mamba3_mimo : public test_case {
-    const ggml_type type;
-
     const int64_t d_qk;
     const int64_t r; // MIMO rank
     const int64_t d_v;
@@ -4891,41 +4889,63 @@ struct test_mamba3_mimo : public test_case {
     const int64_t n_seqs;
 
     std::string vars() override {
-        return VARS_TO_STR7(type, d_qk, r, d_v, head_count, n_seq_tokens, n_seqs);
+        return VARS_TO_STR6(d_qk, r, d_v, head_count, n_seq_tokens, n_seqs);
     }
 
-    test_mamba3_mimo(ggml_type type = GGML_TYPE_F32,
-            int64_t d_qk = 64, int64_t r = 4, int64_t d_v = 64, int64_t head_count = 48,
+    double max_nmse_err() override {
+        return 1e-6; // long recurrences through exp/tanh/sin/cos of different libms
+    }
+
+    test_mamba3_mimo(int64_t d_qk = 128, int64_t r = 4, int64_t d_v = 64, int64_t head_count = 48,
             int64_t n_seq_tokens = 1, int64_t n_seqs = 1)
-        : type(type), d_qk(d_qk), r(r), d_v(d_v), head_count(head_count),
+        : d_qk(d_qk), r(r), d_v(d_v), head_count(head_count),
           n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        // q/k/v are graph-prepared (rotated + normed) upstream; the op sees plain tensors
-        ggml_tensor * q     = ggml_new_tensor_4d(ctx, type, d_qk, r, head_count, n_seq_tokens * n_seqs);
-        ggml_tensor * k     = ggml_new_tensor_4d(ctx, type, d_qk, r, head_count, n_seq_tokens * n_seqs);
-        ggml_tensor * v     = ggml_new_tensor_4d(ctx, type, d_v,  r, head_count, n_seq_tokens * n_seqs);
-        ggml_tensor * coefs = ggml_new_tensor_4d(ctx, type, 3, head_count, n_seq_tokens, n_seqs);
-        ggml_tensor * state = ggml_new_tensor_2d(ctx, type, d_qk * d_v * head_count, n_seqs);
-        ggml_set_name(q,     "q");
-        ggml_set_name(k,     "k");
-        ggml_set_name(v,     "v");
-        ggml_set_name(coefs, "coefs");
+        const int64_t H = head_count, n_tok = n_seq_tokens * n_seqs, n_ang = d_qk / 4;
+        const int64_t n_embd_s = H*d_v*d_qk + H*r*d_qk + H*r*d_v + H*n_ang;
+        ggml_tensor * pdyn   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*r*d_qk + n_ang, n_tok);
+        ggml_tensor * pstat  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2*d_v + 3)*H, n_tok);
+        ggml_tensor * bias   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_qk, 2*r, H);
+        ggml_tensor * mxz    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_v, 2*r, H);
+        ggml_tensor * mimo_o = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_v, r, H);
+        ggml_tensor * norms  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_qk, 2);
+        ggml_tensor * misc   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 2);
+        ggml_tensor * state  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_s, n_seqs);
         ggml_set_name(state, "state");
-        ggml_tensor * out = ggml_mamba3_mimo(ctx, q, k, v, coefs, state);
-        return out;
+        return ggml_mamba3_mimo(ctx, pdyn, pstat, bias, mxz, mimo_o, norms, misc, state, 1e-6f, 1e-4f);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "coefs") == 0) {
-                // [alpha | beta | gamma] rows; keep them in [0, 1) so the
-                // recurrence stays contractive over long T
-                init_tensor_uniform(t, 0.0f, 1.0f);
+            if (strcmp(t->name, "state") == 0) {
+                init_tensor_uniform(t, -0.5f, 0.5f);
             } else {
                 init_tensor_uniform(t);
             }
         }
+    }
+};
+
+// GGML_OP_GEODESIC
+struct test_geodesic : public test_case {
+    const int64_t n_embd;
+    const int64_t n_rows;
+    const float   inv_depth;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_rows, inv_depth);
+    }
+
+    test_geodesic(int64_t n_embd = 1536, int64_t n_rows = 7, float inv_depth = 0.25f)
+        : n_embd(n_embd), n_rows(n_rows), inv_depth(inv_depth) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_rows);
+        ggml_tensor * g     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_rows);
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        ggml_tensor * bias  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+        return ggml_geodesic(ctx, x, g, scale, bias, inv_depth);
     }
 };
 
@@ -11418,18 +11438,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
 
     // (type, d_qk, r, d_v, head_count, n_seq_tokens, n_seqs); Dragon 7A1B dims: D_qk=64, R=4, D_v=64, H=48
-    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48,  1, 1)); // decode
-    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48,  1, 4)); // batched decode
-    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48, 64, 1)); // prefill
-    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48, 17, 3)); // odd sizes
-    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48, 256, 1)); // chunked prefill
-    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48, 192, 2)); // chunked, multi-seq
-    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 64, 4, 64, 48, 150, 1)); // chunked, partial tail chunk
-    // small odd-ish dims (ctor requires d_qk % r == 0)
-    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 24, 3, 20,  5, 17, 3));
-    // large head dims: D_qk*D_v*4 > 48 KB exercises the global-memory state fallback
-    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 128, 4, 128, 2, 5, 2));
-    test_cases.emplace_back(new test_mamba3_mimo(GGML_TYPE_F32, 128, 4, 128, 2, 160, 2)); // chunked, state too big for smem
+    // (d_qk, r, d_v, head_count, n_seq_tokens, n_seqs); Dragon 7A1B: 128, 4, 64, 48
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,   1, 1)); // decode
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,   1, 4)); // batched decode
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,   7, 1)); // short prefill / spec-decode verify
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,  64, 1)); // prefill
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,  17, 3)); // odd sizes
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48, 256, 1)); // chunked prefill
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48, 192, 2)); // chunked, multi-seq
+    test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48, 150, 1)); // chunked, partial tail chunk
+    test_cases.emplace_back(new test_mamba3_mimo( 16, 2,  8,  3,  33, 2)); // small dims
+    test_cases.emplace_back(new test_mamba3_mimo( 64, 4, 64,  4, 100, 1));
+    test_cases.emplace_back(new test_geodesic(1536, 1, 1.0f));
+    test_cases.emplace_back(new test_geodesic(1536, 7, 0.25f));
+    test_cases.emplace_back(new test_geodesic(1536, 512, 1.0f/36));
+    test_cases.emplace_back(new test_geodesic(100, 3, 0.5f));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
