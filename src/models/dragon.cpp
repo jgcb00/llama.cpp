@@ -363,6 +363,201 @@ static inline void dragon_simd_fused_step_group(
     }
 }
 
+// ---- vector math for the M-kernel prep (AVX-512, scalar elsewhere) ----
+#if defined(__AVX512F__)
+// same polynomial as ggml_v_expf (ggml-cpu/vec.h)
+static inline __m512 dragon_v_expf(__m512 x) {
+    const __m512 r = _mm512_set1_ps(0x1.8p23f);
+    const __m512 z = _mm512_fmadd_ps(x, _mm512_set1_ps(0x1.715476p+0f), r);
+    const __m512 n = _mm512_sub_ps(z, r);
+    const __m512 b = _mm512_fnmadd_ps(n, _mm512_set1_ps(0x1.7f7d1cp-20f),
+                     _mm512_fnmadd_ps(n, _mm512_set1_ps(0x1.62e4p-1f), x));
+    const __mmask16 d = _mm512_cmp_ps_mask(_mm512_abs_ps(n), _mm512_set1_ps(192), _CMP_GT_OQ);
+    const __m512 u = _mm512_mul_ps(b, b);
+    const __m512 j = _mm512_fmadd_ps(
+        _mm512_fmadd_ps(_mm512_fmadd_ps(_mm512_set1_ps(0x1.0e4020p-7f), b, _mm512_set1_ps(0x1.573e2ep-5f)), u,
+                        _mm512_fmadd_ps(_mm512_set1_ps(0x1.555e66p-3f), b, _mm512_set1_ps(0x1.fffdb6p-2f))),
+        u, _mm512_fmadd_ps(_mm512_set1_ps(0x1.ffffecp-1f), b, _mm512_set1_ps(1.0f)));
+    const __m512 res = _mm512_scalef_ps(j, n);
+    if (_mm512_kortestz(d, d)) {
+        return res;
+    }
+    const __m512 alt = _mm512_mask_blend_ps(_mm512_cmp_ps_mask(n, _mm512_setzero_ps(), _CMP_LE_OQ),
+                                            _mm512_set1_ps(INFINITY), _mm512_setzero_ps());
+    return _mm512_mask_blend_ps(d, res, alt);
+}
+
+// sin/cos for |x| <= ~pi (Cephes minimax on [-pi/4, pi/4] + quadrant fix-up)
+static inline void dragon_v_sincos(__m512 x, __m512 * s_out, __m512 * c_out) {
+    const __m512 j  = _mm512_roundscale_ps(_mm512_mul_ps(x, _mm512_set1_ps(0.63661977236758134f)),
+                                           _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m512 r = _mm512_fnmadd_ps(j, _mm512_set1_ps(1.5703125f), x);
+    r = _mm512_fnmadd_ps(j, _mm512_set1_ps(4.837512969970703125e-4f), r);
+    r = _mm512_fnmadd_ps(j, _mm512_set1_ps(7.54978995489188216e-8f), r);
+    const __m512 r2 = _mm512_mul_ps(r, r);
+    __m512 sp = _mm512_fmadd_ps(_mm512_set1_ps(-1.9515295891e-4f), r2, _mm512_set1_ps(8.3321608736e-3f));
+    sp = _mm512_fmadd_ps(sp, r2, _mm512_set1_ps(-1.6666654611e-1f));
+    sp = _mm512_fmadd_ps(_mm512_mul_ps(sp, r2), r, r);
+    __m512 cp = _mm512_fmadd_ps(_mm512_set1_ps(2.443315711809948e-5f), r2, _mm512_set1_ps(-1.388731625493765e-3f));
+    cp = _mm512_fmadd_ps(cp, r2, _mm512_set1_ps(4.166664568298827e-2f));
+    cp = _mm512_fmadd_ps(_mm512_mul_ps(cp, r2), r2, _mm512_fnmadd_ps(_mm512_set1_ps(0.5f), r2, _mm512_set1_ps(1.0f)));
+    const __m512i q = _mm512_and_si512(_mm512_cvtps_epi32(j), _mm512_set1_epi32(3));
+    const __mmask16 swap = _mm512_test_epi32_mask(q, _mm512_set1_epi32(1));            // q = 1, 3
+    const __mmask16 sneg = _mm512_test_epi32_mask(q, _mm512_set1_epi32(2));            // q = 2, 3
+    const __mmask16 cneg = _mm512_cmp_epi32_mask(_mm512_add_epi32(q, _mm512_set1_epi32(1)),
+                                                 _mm512_set1_epi32(1), _MM_CMPINT_NLE) &
+                           _mm512_cmp_epi32_mask(q, _mm512_set1_epi32(3), _MM_CMPINT_LT); // q = 1, 2
+    __m512 s = _mm512_mask_blend_ps(swap, sp, cp);
+    __m512 c = _mm512_mask_blend_ps(swap, cp, sp);
+    const __m512 sign = _mm512_set1_ps(-0.0f);
+    s = _mm512_mask_xor_ps(s, sneg, s, sign);
+    c = _mm512_mask_xor_ps(c, cneg, c, sign);
+    *s_out = s;
+    *c_out = c;
+}
+#endif
+
+static inline void dragon_sincos_n(const float * x, float * s, float * c, int64_t n) {
+    int64_t i = 0;
+#if defined(__AVX512F__)
+    for (; i + 16 <= n; i += 16) {
+        __m512 vs, vc;
+        dragon_v_sincos(_mm512_loadu_ps(x + i), &vs, &vc);
+        _mm512_storeu_ps(s + i, vs);
+        _mm512_storeu_ps(c + i, vc);
+    }
+#endif
+    for (; i < n; ++i) {
+        s[i] = sinf(x[i]);
+        c[i] = cosf(x[i]);
+    }
+}
+
+// out[i] = silu(a[i]*b[i]) * m[i]
+static inline void dragon_silu_mul_n(const float * a, const float * b, const float * m, float * out, int64_t n) {
+    int64_t i = 0;
+#if defined(__AVX512F__)
+    for (; i + 16 <= n; i += 16) {
+        const __m512 z = _mm512_mul_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i));
+        const __m512 e = dragon_v_expf(_mm512_sub_ps(_mm512_setzero_ps(), z));
+        const __m512 g = _mm512_div_ps(z, _mm512_add_ps(_mm512_set1_ps(1.0f), e));
+        _mm512_storeu_ps(out + i, _mm512_mul_ps(g, _mm512_loadu_ps(m + i)));
+    }
+#endif
+    for (; i < n; ++i) {
+        const float z = a[i] * b[i];
+        out[i] = z / (1.0f + expf(-z)) * m[i];
+    }
+}
+
+// ---- state step, gate-folded form (main M-kernel) ----
+// w_loc[r*Dv_sl + p] = silu(z_r[p]) * mimo_o[r, p] and y_rows pre-seeded with
+// sum_r w*D*v, so the output is y[p] += sum_d S[p, d] * (sum_r w[r, p] q_r[d]):
+// one horizontal reduction per row instead of one per rank, and no gate math
+// in the sweep. Within a token group, token tt's kv is token tt+1's kv_prev.
+template <int RC, int TB>
+static inline void dragon_step_v2(
+        float * __restrict__ st,
+        const float * K_st, const float * V_st,
+        const float * const * k_rot, const float * const * q_rot,
+        const float * const * v_loc, const float * const * w_loc,
+        float * const * y_rows,
+        const float * alpha, const float * beta, const float * gamma,
+        int64_t D_qk, int64_t Dv_sl) {
+#if defined(__AVX512F__)
+    if ((D_qk % 16) == 0) {
+        for (int64_t p = 0; p < Dv_sl; ++p) {
+            float * st_row = st + p * D_qk;
+            __m512 acc[TB];
+            for (int tt = 0; tt < TB; ++tt) {
+                acc[tt] = _mm512_setzero_ps();
+            }
+            for (int64_t d = 0; d < D_qk; d += 16) {
+                __m512 s = _mm512_loadu_ps(st_row + d);
+                __m512 kv_prev = _mm512_setzero_ps();
+                for (int r = 0; r < RC; ++r) {
+                    kv_prev = _mm512_fmadd_ps(_mm512_set1_ps(V_st[r * Dv_sl + p]), _mm512_loadu_ps(K_st + r * D_qk + d), kv_prev);
+                }
+                for (int tt = 0; tt < TB; ++tt) {
+                    __m512 kv = _mm512_setzero_ps();
+                    __m512 qw = _mm512_setzero_ps();
+                    for (int r = 0; r < RC; ++r) {
+                        kv = _mm512_fmadd_ps(_mm512_set1_ps(v_loc[tt][r * Dv_sl + p]), _mm512_loadu_ps(k_rot[tt] + r * D_qk + d), kv);
+                        qw = _mm512_fmadd_ps(_mm512_set1_ps(w_loc[tt][r * Dv_sl + p]), _mm512_loadu_ps(q_rot[tt] + r * D_qk + d), qw);
+                    }
+                    s = _mm512_mul_ps(_mm512_set1_ps(alpha[tt]), s);
+                    s = _mm512_fmadd_ps(_mm512_set1_ps(beta[tt]),  kv_prev, s);
+                    s = _mm512_fmadd_ps(_mm512_set1_ps(gamma[tt]), kv, s);
+                    acc[tt] = _mm512_fmadd_ps(s, qw, acc[tt]);
+                    kv_prev = kv;
+                }
+                _mm512_storeu_ps(st_row + d, s);
+            }
+            for (int tt = 0; tt < TB; ++tt) {
+                y_rows[tt][p] += _mm512_reduce_add_ps(acc[tt]);
+            }
+        }
+        return;
+    }
+#endif
+    for (int64_t p = 0; p < Dv_sl; ++p) {
+        float * st_row = st + p * D_qk;
+        float acc[TB] = {};
+        for (int64_t d = 0; d < D_qk; ++d) {
+            float s = st_row[d];
+            float kv_prev = 0.0f;
+            for (int r = 0; r < RC; ++r) {
+                kv_prev += V_st[r * Dv_sl + p] * K_st[r * D_qk + d];
+            }
+            for (int tt = 0; tt < TB; ++tt) {
+                float kv = 0.0f, qw = 0.0f;
+                for (int r = 0; r < RC; ++r) {
+                    kv += v_loc[tt][r * Dv_sl + p] * k_rot[tt][r * D_qk + d];
+                    qw += w_loc[tt][r * Dv_sl + p] * q_rot[tt][r * D_qk + d];
+                }
+                s = alpha[tt] * s + beta[tt] * kv_prev + gamma[tt] * kv;
+                acc[tt] += s * qw;
+                kv_prev = kv;
+            }
+            st_row[d] = s;
+        }
+        for (int tt = 0; tt < TB; ++tt) {
+            y_rows[tt][p] += acc[tt];
+        }
+    }
+}
+
+template <int RC>
+static inline void dragon_step_v2_group(
+        float * st, const float * K_st, const float * V_st,
+        const float * const * k_rot, const float * const * q_rot,
+        const float * const * v_loc, const float * const * w_loc,
+        float * const * y_rows, const float * alpha, const float * beta, const float * gamma,
+        int64_t TB, int64_t D_qk, int64_t Dv_sl) {
+    switch (TB) {
+        case 4: dragon_step_v2<RC, 4>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, D_qk, Dv_sl); break;
+        case 3: dragon_step_v2<RC, 3>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, D_qk, Dv_sl); break;
+        case 2: dragon_step_v2<RC, 2>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, D_qk, Dv_sl); break;
+        case 1: dragon_step_v2<RC, 1>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, D_qk, Dv_sl); break;
+        default: GGML_ABORT("dragon: unsupported token group %d", (int) TB);
+    }
+}
+
+static inline void dragon_step_v2_dispatch(
+        float * st, const float * K_st, const float * V_st,
+        const float * const * k_rot, const float * const * q_rot,
+        const float * const * v_loc, const float * const * w_loc,
+        float * const * y_rows, const float * alpha, const float * beta, const float * gamma,
+        int64_t R, int64_t TB, int64_t D_qk, int64_t Dv_sl) {
+    switch (R) {
+        case 4: dragon_step_v2_group<4>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, TB, D_qk, Dv_sl); break;
+        case 2: dragon_step_v2_group<2>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, TB, D_qk, Dv_sl); break;
+        case 1: dragon_step_v2_group<1>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, TB, D_qk, Dv_sl); break;
+        case 8: dragon_step_v2_group<8>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, TB, D_qk, Dv_sl); break;
+        default: GGML_ABORT("dragon: unsupported MIMO rank %d", (int) R);
+    }
+}
+
 // dot product
 static inline float dragon_simd_dot(const float * __restrict__ a,
                                     const float * __restrict__ b,
@@ -1738,23 +1933,29 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
                 {
                     const float * xs = x_t + p0;                          // length Dv_sl
                     const float * zs = z_t + p0;
+                    // zlt holds the folded output weight w = silu(z*mimo_z) * mimo_o
                     for (int64_t r = 0; r < R; ++r) {
                         float * vr = vlt + r * Dv_sl;
-                        float * zr = zlt + r * Dv_sl;
                         const float * mxr = mx_h + r * D_v;
-                        const float * mzr = mz_h + r * D_v;
                         for (int64_t p = 0; p < Dv_sl; ++p) {
                             vr[p] = xs[p] * mxr[p];
-                            zr[p] = zs[p] * mzr[p];
+                        }
+                        dragon_silu_mul_n(zs, mz_h + r * D_v, mimo_d + h * m_s2 + p0 + r * m_s1,
+                                          zlt + r * Dv_sl, Dv_sl);
+                    }
+                    // D skip: y = sum_r w * D * v, seeded before the state sweep adds S.q
+                    float * yrow = y_d + h * y_s1 + p0 + t * y_s2;
+                    for (int64_t r = 0; r < R; ++r) {
+                        const float * vr = vlt + r * Dv_sl;
+                        const float * wr = zlt + r * Dv_sl;
+                        for (int64_t p = 0; p < Dv_sl; ++p) {
+                            yrow[p] += D_h * wr[p] * vr[p];
                         }
                     }
                 }
                 if (do_rotary) {
                     // cos / sin per angle once for this (h, t); reused across R.
-                    for (int64_t i = 0; i < num_angles; ++i) {
-                        cs_buf[i] = cosf(ang_st[i]);
-                        ss_buf[i] = sinf(ang_st[i]);
-                    }
+                    dragon_sincos_n(ang_st, ss_buf.data(), cs_buf.data(), num_angles);
                     const int64_t i2_off = 2 * quarter;
                     for (int64_t r = 0; r < R; ++r) {
                         float * qr = qrt + r * D_qk;
@@ -1800,10 +2001,9 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
             float * K_st = inplace ? row_seq + off_K_glob + h * R * D_qk : K_state.data() + ul * R * D_qk;
             float * V_st = inplace ? row_seq + off_V_glob + h * R * D_v  : V_state.data() + ul * R * Dv_sl;
             float * st   = inplace ? row_seq + h * D_v * D_qk            : ssm_state.data() + ul * Dv_sl * D_qk;
-            const float * mo = mimo_d + h * m_s2 + p0;
-            dragon_simd_fused_step_group(st, K_st, V_st, kpv, qpv, vpv, zpv,
-                                         mo, m_s1, ypv, alpha_g, beta_g, gamma_g, D_h,
-                                         R, TB, D_qk, Dv_sl);
+            dragon_step_v2_dispatch(st, K_st, V_st, kpv, qpv, vpv, zpv,
+                                    ypv, alpha_g, beta_g, gamma_g,
+                                    R, TB, D_qk, Dv_sl);
 
             // Save K_state / V_state = last token of the group.
             std::memcpy(K_st, kpv[TB - 1], (size_t) R * D_qk * sizeof(float));
