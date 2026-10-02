@@ -1,199 +1,122 @@
-# Dragon 7A1B in llama.cpp — conversion, quantization & usage guide
+# Olala / Dragon 7A1B in llama.cpp — conversion, quantization & usage
 
-Dragon 7A1B is a hybrid LLM: 36 blocks in an `MMMMV` pattern — 29 **Mamba3-MIMO**
-recurrent mixers (rank-4 MIMO, trapezoid state update, halved rotary with cumulative
-angles), 7 **Differential-TPA-V2** attention mixers (GQA-4, 48 q-heads, head_dim 128,
-logit softcap, token shift, scalable softmax), a **256-expert / 6-active MoE** with a
-dense shared expert, and geodesic-rotation residuals. 6.8 B params, ~1 B active,
-vocab 151936, 64k train context.
+Olala (architecture name `dragon` in GGUF; HF classes `OlalaForCausalLM` /
+`DragonForCausalLM`) is a hybrid LLM: 36 blocks in an `MMMMV` pattern — 29
+**Mamba3-MIMO** recurrent mixers (rank-4 MIMO, trapezoid state update, rotary phase
+state), 7 **Differential-TPA** attention mixers (48 q-heads / 12 kv-heads, head_dim
+128, logit softcap 150, token shift, scalable softmax), a **256-expert / 6-active
+MoE** with a dense shared expert, and geodesic-rotation residuals. 6.8 B params,
+~1 B active, vocab 151936.
 
-Branch to use: **`dragon-gpu-master`** (tracks upstream master; carries the arch, the
-`GGML_OP_MAMBA3_MIMO` op with CPU + CUDA backends, and all CPU/GPU performance work).
+Branch: **`olala-master`** (rebased on upstream master of 2026-10-02).
 
 ---
 
 ## 1. Building
 
-CPU (AVX-512 machine recommended — the fast kernels are AVX-512F/DQ):
+| target | command | notes |
+|---|---|---|
+| CPU (x86 / ARM) | `cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j` | fast kernels are ggml-cpu ops: AVX-512, AVX2 and NEON paths, runtime ISA dispatch in multi-variant builds |
+| Apple (Metal) | `cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j` | see [dragon-metal-testing.md](dragon-metal-testing.md) — Metal kernels not yet validated on hardware |
+| NVIDIA (CUDA) | `cmake -B build-cuda -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build-cuda -j` | on boxes with several CUDA toolkits pin `-DCMAKE_CUDA_COMPILER=… -DCMAKE_CUDA_HOST_COMPILER=…` |
+
+No environment variables are needed: layers whose weights sit on a GPU automatically
+use the portable graph (`GGML_OP_MAMBA3_MIMO` + `GGML_OP_GEODESIC` + standard MoE),
+CPU layers use the CPU fast path.
+
+## 2. Converting a checkpoint
 
 ```sh
-cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON
-cmake --build build -j
+python3 convert_hf_to_gguf.py /path/to/checkpoint --outtype bf16 --outfile olala-bf16.gguf
 ```
 
-CUDA (tested on H100 / CUDA 13.2 — pin the compiler explicitly, mixed system
-toolchains break the arch detection):
+The directory needs `config.json` (with `layers_config`), `model.safetensors`,
+`tokenizer.json`, `tokenizer_config.json` and `chat_template.jinja` (embedded in the
+GGUF). The converter also writes packed copies of the M-layer constants
+(`blk.N.ssm_m3_*`, ~10 MB) used by the GPU kernels; GGUFs without them still work.
 
-```sh
-cmake -B build-cuda -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.2/bin/nvcc \
-      -DCMAKE_CUDA_ARCHITECTURES=90 -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-11 \
-      -DGGML_CUDA_COMPRESSION_MODE=""
-cmake --build build-cuda -j
-```
+Always convert to **bf16**. Biases, MIMO projections, norms, geodesic scalars and
+the MoE router stay F32 and are never quantized.
 
----
+## 3. Quantization — read before running llama-quantize
 
-## 2. Converting the HF checkpoint to GGUF
+Dragon has **massive outlier activations** (up to ~1e14 at two M-mixer outputs,
+~1e9 after the MoE ReLU²). Quantized matmuls quantize activations on the fly:
 
-The converter (`conversion/dragon.py`) registers `DragonForCausalLM` with the
-standard converter, so conversion is the stock command:
-
-```sh
-python3 convert_hf_to_gguf.py /path/to/dragon_checkpoint \
-        --outfile dragon-7a1b-bf16.gguf --outtype bf16
-```
-
-The HF directory must contain `config.json` (with `layers_config` — the per-block
-M/V letter string), `model.safetensors`, `tokenizer.json`, `tokenizer_config.json`,
-and `chat_template.jinja` (embedded into the GGUF automatically).
-
-Notes:
-- **Always convert to `bf16`** as the base. The checkpoint is bf16; f16 would clip
-  nothing today but bf16 keeps the exponent range that this model actually uses
-  (see the outlier discussion below).
-- Small mixers' tensors (MIMO projections, biases, geodesic scalars, MoE router
-  `ffn_gate_inp`, norms) are stored **F32** and are never quantized by any later
-  step — this is intentional and required.
-- Sanity check after conversion:
-  `./build/bin/dragon-generate -m dragon-7a1b-bf16.gguf -t 16 -n 32 --incremental -p "Once upon a time"`
-  should produce fluent English.
-
----
-
-## 3. Quantization — read this before running llama-quantize
-
-### 3.1 The one thing you must know
-
-Dragon has **massive outlier activations** (up to ~1e14 at the M-mixer output of two
-layers; ~1e9 after the MoE ReLU²). Quantized matmuls quantize *activations* on the
-fly, and the storage format of those activation scales decides everything:
-
-| weight type | activation format | scale type | outcome on Dragon |
+| weight type | activation format | scale type | on Dragon |
 |---|---|---|---|
-| K-quants (q3_K…q6_K) | q8_K | **fp32** | ✅ safe |
-| type-0 (q4_0/q5_0/q8_0) | q8_0 | fp16 (max 65504) | ❌ overflows → NaN |
-| any quant on **CUDA** | q8_1 | fp16 | ❌ NaN (see §5) |
+| K-quants (q3_K…q6_K), iq4_xs | q8_K | fp32 | safe |
+| type-0 (q4_0/q5_0/q8_0, iq4_nl) | q8_0 | fp16 | overflows → NaN where the input has outliers |
+| any quant on CUDA / Metal (large batches) | fp16-scaled | fp16 | risky — use bf16 on GPUs |
 
-Two of Dragon's tensor classes (`ffn_up_exps`, `ffn_latent_up`) have **384 columns**,
-which K-quants cannot encode (they need multiples of 256). `llama-quantize` then
-**silently falls back to type-0** — which poisons every default recipe. All standard
-mixes (plain `q4_k_m`, `q6_k`, `q8_0`, …) produce a model that generates plausibly on
-short prompts and then collapses to NaN/garbage on real prompts.
-
-### 3.2 The safe recipe
-
-Always pass these overrides:
+`ffn_up_exps` and `ffn_latent_up` have 384 columns, which K-quants cannot encode, and
+llama-quantize **silently falls back to type-0** for them — so plain recipes are
+poisoned. Always pass:
 
 ```sh
 SAFE="--tensor-type ffn_latent_up=bf16 --tensor-type ffn_up_exps=q8_0"
-
-# recommended: importance matrix from ~64 chunks of general text
-./build/bin/llama-imatrix -m dragon-7a1b-bf16.gguf -f wiki.train.raw -o dragon.imatrix --chunks 64
-
-# the ladder
-./build/bin/llama-quantize --imatrix dragon.imatrix $SAFE dragon-7a1b-bf16.gguf dragon-q4km-safe.gguf q4_k_m
-./build/bin/llama-quantize --imatrix dragon.imatrix $SAFE dragon-7a1b-bf16.gguf dragon-q5km-safe.gguf q5_k_m
-./build/bin/llama-quantize                          $SAFE dragon-7a1b-bf16.gguf dragon-q6k-safe.gguf  q6_k
-# 8-bit tier ("fp8-like"): q8_0 base needs three extra protections
+./build/bin/llama-imatrix -m olala-bf16.gguf -f wiki.test.raw -o olala.imatrix --chunks 120
+./build/bin/llama-quantize --imatrix olala.imatrix $SAFE olala-bf16.gguf olala-q5_k_m.gguf q5_k_m
+./build/bin/llama-quantize --imatrix olala.imatrix $SAFE olala-bf16.gguf olala-q4_k_m.gguf q4_k_m
+./build/bin/llama-quantize --imatrix olala.imatrix $SAFE olala-bf16.gguf olala-q6_k.gguf   q6_k
+# 8-bit tier: the q8_0 base needs three more protections
 ./build/bin/llama-quantize --tensor-type attn_output=bf16 --tensor-type ffn_down_exps=q6_k \
-        --tensor-type ffn_down_shexp=bf16 $SAFE dragon-7a1b-bf16.gguf dragon-q8-safe2.gguf q8_0
+    --tensor-type ffn_down_shexp=bf16 $SAFE olala-bf16.gguf olala-q8_0-safe2.gguf q8_0
 ```
 
-Why each override: `ffn_latent_up` (384-col, its *input* carries the 1e8+ MoE
-outliers — bf16, it is tiny: 21 M params) · `ffn_up_exps` (384-col; its input is
-bounded, so q8_0 weights are fine *on CPU*) · in the q8_0 base additionally
-`attn_output` (input ~1e14), `ffn_down_exps`/`ffn_down_shexp` (inputs are ReLU²-squared,
-~5e8) must not be type-0.
+`ffn_up_exps`'s input is the bounded MoE latent, so a 4-bit 32-block type is safe
+there too (`--tensor-type ffn_up_exps=iq4_nl`, plus `--output-tensor-type q4_k`):
+-25% file size, same speed — useful for 8 GB machines.
 
-### 3.3 Measured quality & speed (EPYC 9334, 32 threads)
+### Measured (DPO-99k checkpoint; EPYC 9334, **16 threads**, `-fa 1`)
 
-| variant | size | wiki PPL (32 chk) | gsm8k | MMLU-gen | humaneval+ | decode t/s | RAM @32k ctx |
-|---|---|---|---|---|---|---|---|
-| bf16 | 13.6 GB | 8.211 | 64.0 | 45.1 | 39.6 | 49 | 14.7 GB |
-| **q8-safe2** | 7.3 GB | **8.212 (lossless)** | **65.2** | 45.3 | 39.0 | 62 | 8.9 GB |
-| q6k-safe | 6.3 GB | 8.252 (+0.5%) | — | — | — | 74 | 7.9 GB |
-| q5km-safe | 6.0 GB | 8.295 (+1.0%) | — | — | — | 77 | 7.6 GB |
-| **q4km-safe** | 5.7 GB | 8.403 (+2.3%) | 61.2 | 44.8 | 39.0 | **79** | 8.3 GB* |
-| q3km-safe | 5.2 GB | 9.146 (+11%) | — | — | — | 79 | — |
+| variant | size | KLD vs bf16 | same top-1 | pp512 t/s | tg128 t/s |
+|---|---|---|---|---|---|
+| bf16 | 12.7 GiB | — | — | 475 | 55.6 |
+| q8_0-safe2 | 6.4 GiB | 0.0040 | 96.9% | 453 | 75.1 |
+| q6_k | 5.9 GiB | 0.0106 | 94.6% | 515 | 90.6 |
+| **q5_k_m** | 5.6 GiB | 0.0194 | 92.8% | **533** | **94.6** |
+| q4_k_m | 5.3 GiB | 0.0487 | 88.5% | 485 | 94.4 |
+| q4_k_m + up iq4_nl + out q4_k | 4.0 GiB | 0.0610 | 87.2% | 502 | 94.7 |
 
-\* includes the 1.1 GB repack buffer; `--no-repack` trades ~20% prefill for −1.1 GB.
+KLD over 16 wikitext-2 chunks. **Recommendation: q5_k_m** (as fast as q4_k_m on this
+model — decode is dispatch-bound, not bandwidth-bound, below 6 bits — at 2.5× lower
+divergence); q6_k when quality matters most. KV cache: `-ctk q8_0 -ctv q8_0` halves
+attention KV memory at no measurable cost on CPU.
 
-**Recommendations**: `q4km-safe` is the sweet spot (max speed, ~3 gsm8k points inside
-the error bar); `q8-safe2` when you want provably-lossless; below q4 the quality cliff
-is steep. Per-tensor sensitivity if you build custom mixes (ΔPPL when demoted to
-q3_K): shared expert +0.39 ≫ attn_output +0.17 > ssm_in +0.13 > routed experts +0.08
-> lm_head +0.03 ≈ embeddings 0 — i.e. keep the *shared* expert high, squeeze the
-routed experts and embeddings freely. The MoE router is F32 and untouchable.
-
-### 3.4 KV cache quantization (free on CPU)
-
-`-ctk q8_0 -ctv q8_0` halves the attention KV cache (42 → ~22 KB/token) with **no
-measurable quality loss** and, with the blocked FA kernel on this branch, **no speed
-loss** (decode at depth 8k: 57.4 vs 57.4–58.9 t/s f16). Use it whenever RAM matters.
-
----
-
-## 4. Running on CPU
+## 4. Running
 
 ```sh
-./build/bin/llama-completion -m dragon-q4km-safe.gguf -t <physical cores> -fa 1 -fit off -p "..."
+./build/bin/llama-server -m olala-q5_k_m.gguf -t <threads> -fa 1 -c 32768 -np 4
 ```
 
-- **`-fa 1` always** — the blocked/tiled FA kernels are a large win (up to +84%
-  multi-user long-context). `-fit off` is currently required (memory-fitting probe
-  segfaults on hybrid models — known issue).
-- Do not exceed physical core count for `-t` (SMT collapses throughput).
-- **llama-server**: run with `-np 1` (one slot). An upstream bug corrupts recurrent
-  state with concurrent slots (affects all recurrent/hybrid models, not just Dragon).
-  For parallel batch throughput use `llama-parallel` / `llama-batched-bench`, which
-  are safe.
-- Reference numbers (32 threads, q4km-safe): decode 79 t/s short-ctx / 37.6 t/s at
-  24k depth; prefill ~540 t/s short, 369 t/s at 24k (bf16). Memory: ~6 GB @4k,
-  ~8.3 GB @32k, ~12 GB @128k (see the KV-q8 and no-repack levers above).
-- Recurrent-state note: the M-layer state cache is stored bf16-packed by default
-  (validated bit-equivalent generation). `DRAGON_F32_STATE=1` reverts.
+- Chat: the embedded template and a dedicated Olala parser give OpenAI-style
+  `reasoning_content` / `content` / `tool_calls` (streaming included).
+  `reasoning_effort` (`none` … `high`) is passed through to the template.
+- `-fa 1` always on CPU. Memory fitting (`-fit`, default) works.
+- Several slots (`-np N`) are fine. Concurrent requests can differ slightly from
+  single-request output (batch-shape rounding in the CPU GEMMs), never corrupted.
+- Recurrent state: kept in **f32** (a reduced-precision state degrades long
+  generations into repetition loops); the rotary phase is kept wrapped to [-π, π].
+  `DRAGON_BF16_STATE=1` stores the K/V sections bf16 (not recommended).
+- GPU: `-ngl 99`, **bf16 weights** (see §3). H100 PCIe bf16: pp8192 5313 t/s,
+  tg128 163 t/s.
 
-## 5. Running on GPU (CUDA)
-
-**Use bf16 on GPU. Do not use quantized GGUFs with CUDA visible.** CUDA quantized
-matmuls use fp16 activation scales (q8_1) with no fp32-scale option, so Dragon's
-outliers NaN the recurrent state — q4 fails at the first token, q8 within ~30 tokens.
-This *also* applies at `-ngl 0` (large-batch matmuls auto-offload): for CPU runs of
-quantized models on a GPU machine, hide the devices (`CUDA_VISIBLE_DEVICES=`).
-
-Full-offload environment (enables the GGML op for the M-recurrence and the
-GPU-capable primitive forms of the fused CPU ops):
-
-```sh
-export DRAGON_GGML_OP=1 DRAGON_NO_FUSED_MOE=1 DRAGON_NO_FUSED_SHIFT=1 DRAGON_NO_FUSED_GEO=1
-./build-cuda/bin/llama-completion -m dragon-7a1b-bf16.gguf -ngl 99 -fa 1 -fit off -p "..."
-```
-
-Measured (H100 PCIe, bf16, 12.5 GB VRAM + ~41 MB/seq context): prefill 8k **937 t/s**,
-decode 60 t/s single-stream, **262 t/s total at 8 concurrent users** (multi-sequence
-is fully supported and token-exact vs single-stream). Generation is token-identical
-to the CPU path. The M-op uses a chunk-parallel prefill kernel (exact decomposition,
-chunk 32) and a shared-memory serial kernel for decode.
-
-## 6. Environment-variable reference
+## 5. Environment variables (debug / A-B only)
 
 | variable | effect |
 |---|---|
-| `DRAGON_GGML_OP=1` | M-recurrence via `GGML_OP_MAMBA3_MIMO` (required for GPU; CPU: same results, slightly slower than the fused custom op) |
-| `DRAGON_NO_FUSED_MOE/SHIFT/GEO=1` | replace fused CPU custom ops with ggml primitives (required for GPU offload) |
-| `DRAGON_F32_STATE=1` | store recurrent state f32 instead of bf16-packed |
-| `DRAGON_STATE_Q8=1` | experimental int8 state (quality OK, ~7% slower — not recommended) |
-| `DRAGON_M_PRIM=1` / `DRAGON_M_CHUNK_SIZE=N` / `DRAGON_M_DECODE_PRIM=1` | debug/reference primitive paths (single-sequence only) |
-| `GGML_OP_PROFILE=1` | per-op CPU wall-time tables at exit |
-| `GGML_FA_PROFILE=1` | rdtsc section profile of the FA prefill kernel |
+| `DRAGON_PORTABLE=1` | force the GPU graph on CPU (reference for backend checks) |
+| `DRAGON_CPU_CUSTOM_M=1`, `DRAGON_CPU_CUSTOM_GEO=1` | legacy libllama custom-op CPU kernels |
+| `DRAGON_NO_INPLACE_STATE=1` | gather + copy the recurrent state instead of updating it in place |
+| `DRAGON_NO_FUSED_MOE/SHIFT/GEO=1` | ggml-primitive MoE / token shift / geodesic on CPU |
+| `DRAGON_BF16_STATE=1` | bf16 K/V state sections |
+| `DRAGON_M_PRIM=1` / `DRAGON_M_CHUNK_SIZE=N` / `DRAGON_M_DECODE_PRIM=1` | closed-form primitive reference paths (single sequence) |
+| `GGML_OP_PROFILE=1` (`GGML_OP_PROFILE_TOP=N`) | per-op CPU time tables at exit |
 
-## 7. Known issues
+## 6. Known limitations
 
-- `-fit on` (default memory fitting) segfaults → always `-fit off`.
-- llama-server concurrent slots corrupt recurrent state (upstream bug) → `-np 1`.
-- Quantized weights + CUDA = NaN (fp16 activation scales; see §5).
-- Recurrent models cannot context-shift; requests beyond the context fail rather
-  than slide. Prompt-prefix reuse across requests is not available for the M-state.
-- lm-eval via llama-server: use generative tasks (`mmlu_generative`, `gsm8k`,
-  `humaneval_plus`); the completions API does not expose loglikelihood logprobs.
+- Quantized weights on GPUs: fp16 activation scales overflow on Dragon's outliers.
+- Recurrent models cannot context-shift; prompts beyond the context fail.
+- Truncated tool calls at `max_tokens` are returned partially (shared llama.cpp
+  behaviour; vLLM drops them).
