@@ -6678,6 +6678,52 @@ struct ggml_tensor * ggml_mamba3_mimo(
     return result;
 }
 
+struct ggml_tensor * ggml_mamba3_mimo_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * pdyn,
+        struct ggml_tensor  * pstat,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * mxz,
+        struct ggml_tensor  * mimo_o,
+        struct ggml_tensor  * norms,
+        struct ggml_tensor  * misc,
+        struct ggml_tensor  * states,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * state_dst,
+        float                 eps,
+        float                 a_floor) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ggml_nelements(ids) == state_dst->ne[1]);
+    GGML_ASSERT(states->type == GGML_TYPE_F32 && state_dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(states->ne[0] == state_dst->ne[0]);
+    GGML_ASSERT(states->nb[0] == sizeof(float) && state_dst->nb[0] == sizeof(float));
+
+    struct ggml_tensor * srcs[7] = { pdyn, pstat, bias, mxz, mimo_o, norms, misc };
+    for (int i = 0; i < 7; ++i) {
+        GGML_ASSERT(srcs[i]->type == GGML_TYPE_F32);
+    }
+    const int64_t D_qk = bias->ne[0], R = mimo_o->ne[1], H = mimo_o->ne[2], D_v = mimo_o->ne[0];
+    const int64_t n_tok = pdyn->ne[1];
+    GGML_ASSERT(pdyn->ne[0] == 2*R*D_qk + D_qk/4 && pstat->ne[0] == (2*D_v + 3)*H && pstat->ne[1] == n_tok);
+    GGML_ASSERT(state_dst->ne[0] == H*D_v*D_qk + H*R*D_qk + H*R*D_v + H*(D_qk/4));
+    GGML_ASSERT(n_tok % state_dst->ne[1] == 0);
+
+    const int64_t ne[1] = { D_v*H*n_tok };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 1, ne);
+
+    float params[2] = { eps, a_floor };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op = GGML_OP_MAMBA3_MIMO;
+    for (int i = 0; i < 7; ++i) {
+        result->src[i] = srcs[i];
+    }
+    result->src[7] = states;
+    result->src[8] = ids;
+    result->src[9] = state_dst;
+
+    return result;
+}
+
 // ggml_geodesic
 
 struct ggml_tensor * ggml_geodesic(

@@ -12203,11 +12203,204 @@ void ggml_compute_forward_dsv4_hc_post(
 
 // ggml_compute_forward_mamba3_mimo
 //
-// reference forward of the fused Dragon Mamba3-MIMO mixer core (see ggml.h);
-// one work unit per (seq, head), serial over the tokens of the sequence
+// fused Dragon Mamba3-MIMO mixer core (see ggml.h). Work unit = one head; a
+// thread owns a fixed set of heads for ALL sequences of the batch, serial over
+// tokens, so the per-head state is updated in place in its destination row:
+//   - result mode:   the state comes from src[7] (gathered rows) and the new
+//                    state is written after y in dst (all backends);
+//   - in-place mode: src[7] is the whole recurrent cache, src[8] the I32
+//                    source-row ids and src[9] the destination rows (CPU only).
+//                    A sequence whose source row differs from its destination
+//                    (new sequence -> shared zero row, moved cell) is
+//                    snapshotted before the first write: all slices of a head
+//                    belong to one thread, so the update is race-free.
+// Tokens are processed in groups of up to M3_TB so the state sweep (the
+// dominant traffic) runs once per group.
 
-static inline float ggml_m3_softplus(float x) {
+#define M3_TB 4
+
+#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v_intrinsic)
+#define M3_SIMD 1
+static inline float m3_hsum(GGML_F32_VEC v) {
+#if defined(__AVX512F__)
+    return _mm512_reduce_add_ps(v);
+#else
+    float tmp[GGML_F32_EPR];
+    GGML_F32_VEC_STORE(tmp, v);
+    float s = 0.0f;
+    for (int i = 0; i < GGML_F32_EPR; ++i) {
+        s += tmp[i];
+    }
+    return s;
+#endif
+}
+#endif
+
+static inline float m3_softplus(float x) {
     return (x > 0.0f ? x : 0.0f) + logf(expf(-fabsf(x)) + 1.0f);
+}
+
+// sin/cos for |x| <= ~pi: Cephes minimax on [-pi/4, pi/4] + quadrant fix-up
+static void m3_sincos_n(const float * x, float * s, float * c, int64_t n) {
+    int64_t i = 0;
+#if defined(__AVX512F__)
+    for (; i + 16 <= n; i += 16) {
+        const __m512 xv = _mm512_loadu_ps(x + i);
+        const __m512 j  = _mm512_roundscale_ps(_mm512_mul_ps(xv, _mm512_set1_ps(0.63661977236758134f)),
+                                               _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        __m512 r = _mm512_fnmadd_ps(j, _mm512_set1_ps(1.5703125f), xv);
+        r = _mm512_fnmadd_ps(j, _mm512_set1_ps(4.837512969970703125e-4f), r);
+        r = _mm512_fnmadd_ps(j, _mm512_set1_ps(7.54978995489188216e-8f), r);
+        const __m512 r2 = _mm512_mul_ps(r, r);
+        __m512 sp = _mm512_fmadd_ps(_mm512_set1_ps(-1.9515295891e-4f), r2, _mm512_set1_ps(8.3321608736e-3f));
+        sp = _mm512_fmadd_ps(sp, r2, _mm512_set1_ps(-1.6666654611e-1f));
+        sp = _mm512_fmadd_ps(_mm512_mul_ps(sp, r2), r, r);
+        __m512 cp = _mm512_fmadd_ps(_mm512_set1_ps(2.443315711809948e-5f), r2, _mm512_set1_ps(-1.388731625493765e-3f));
+        cp = _mm512_fmadd_ps(cp, r2, _mm512_set1_ps(4.166664568298827e-2f));
+        cp = _mm512_fmadd_ps(_mm512_mul_ps(cp, r2), r2, _mm512_fnmadd_ps(_mm512_set1_ps(0.5f), r2, _mm512_set1_ps(1.0f)));
+        const __m512i q = _mm512_and_si512(_mm512_cvtps_epi32(j), _mm512_set1_epi32(3));
+        const __mmask16 swap = _mm512_test_epi32_mask(q, _mm512_set1_epi32(1));
+        const __mmask16 sneg = _mm512_test_epi32_mask(q, _mm512_set1_epi32(2));
+        const __mmask16 cneg = _mm512_cmp_epi32_mask(_mm512_add_epi32(q, _mm512_set1_epi32(1)), _mm512_set1_epi32(1), _MM_CMPINT_NLE) &
+                               _mm512_cmp_epi32_mask(q, _mm512_set1_epi32(3), _MM_CMPINT_LT);
+        __m512 sv = _mm512_mask_blend_ps(swap, sp, cp);
+        __m512 cv = _mm512_mask_blend_ps(swap, cp, sp);
+        sv = _mm512_mask_xor_ps(sv, sneg, sv, _mm512_set1_ps(-0.0f));
+        cv = _mm512_mask_xor_ps(cv, cneg, cv, _mm512_set1_ps(-0.0f));
+        _mm512_storeu_ps(s + i, sv);
+        _mm512_storeu_ps(c + i, cv);
+    }
+#endif
+    for (; i < n; ++i) {
+        const float j  = nearbyintf(x[i]*0.63661977236758134f);
+        float r = x[i] - j*1.5703125f;
+        r -= j*4.837512969970703125e-4f;
+        r -= j*7.54978995489188216e-8f;
+        const float r2 = r*r;
+        const float sp = r + r*r2*(-1.6666654611e-1f + r2*(8.3321608736e-3f + r2*(-1.9515295891e-4f)));
+        const float cp = 1.0f - 0.5f*r2 + r2*r2*(4.166664568298827e-2f + r2*(-1.388731625493765e-3f + r2*2.443315711809948e-5f));
+        const int q = (int) j & 3;
+        float ss = (q & 1) ? cp : sp;
+        float cc = (q & 1) ? sp : cp;
+        if (q & 2)           ss = -ss;
+        if (q == 1 || q == 2) cc = -cc;
+        s[i] = ss;
+        c[i] = cc;
+    }
+}
+
+// state sweep for TB tokens, gate-folded: w = silu(z)*mimo_o, y pre-seeded with
+// the D skip, so y[p] += sum_d S[p,d] * sum_r w[r,p] q_r[d] (one reduction per
+// row); token tt's kv is token tt+1's kv_prev
+template <int RC, int TB>
+static void m3_step(
+        float * GGML_RESTRICT st, const float * K_st, const float * V_st,
+        const float * const * k, const float * const * q, const float * const * v, const float * const * w,
+        float * const * y, const float * alpha, const float * beta, const float * gamma,
+        int64_t D_qk, int64_t D_v) {
+#if defined(M3_SIMD)
+    if (D_qk % GGML_F32_EPR == 0) {
+        for (int64_t p = 0; p < D_v; ++p) {
+            float * st_row = st + p*D_qk;
+            GGML_F32_VEC acc[TB];
+            for (int tt = 0; tt < TB; ++tt) {
+                acc[tt] = GGML_F32_VEC_ZERO;
+            }
+            for (int64_t d = 0; d < D_qk; d += GGML_F32_EPR) {
+                GGML_F32_VEC s   = GGML_F32_VEC_LOAD(st_row + d);
+                GGML_F32_VEC kvp = GGML_F32_VEC_ZERO;
+                for (int r = 0; r < RC; ++r) {
+                    kvp = GGML_F32_VEC_FMA(kvp, GGML_F32_VEC_SET1(V_st[r*D_v + p]), GGML_F32_VEC_LOAD(K_st + r*D_qk + d));
+                }
+                for (int tt = 0; tt < TB; ++tt) {
+                    GGML_F32_VEC kv = GGML_F32_VEC_ZERO;
+                    GGML_F32_VEC qw = GGML_F32_VEC_ZERO;
+                    for (int r = 0; r < RC; ++r) {
+                        kv = GGML_F32_VEC_FMA(kv, GGML_F32_VEC_SET1(v[tt][r*D_v + p]), GGML_F32_VEC_LOAD(k[tt] + r*D_qk + d));
+                        qw = GGML_F32_VEC_FMA(qw, GGML_F32_VEC_SET1(w[tt][r*D_v + p]), GGML_F32_VEC_LOAD(q[tt] + r*D_qk + d));
+                    }
+                    s = GGML_F32_VEC_MUL(GGML_F32_VEC_SET1(alpha[tt]), s);
+                    s = GGML_F32_VEC_FMA(s, GGML_F32_VEC_SET1(beta[tt]),  kvp);
+                    s = GGML_F32_VEC_FMA(s, GGML_F32_VEC_SET1(gamma[tt]), kv);
+                    acc[tt] = GGML_F32_VEC_FMA(acc[tt], s, qw);
+                    kvp = kv;
+                }
+                GGML_F32_VEC_STORE(st_row + d, s);
+            }
+            for (int tt = 0; tt < TB; ++tt) {
+                y[tt][p] += m3_hsum(acc[tt]);
+            }
+        }
+        return;
+    }
+#endif
+    for (int64_t p = 0; p < D_v; ++p) {
+        float * st_row = st + p*D_qk;
+        float acc[TB] = {};
+        for (int64_t d = 0; d < D_qk; ++d) {
+            float s = st_row[d];
+            float kvp = 0.0f;
+            for (int r = 0; r < RC; ++r) {
+                kvp += V_st[r*D_v + p]*K_st[r*D_qk + d];
+            }
+            for (int tt = 0; tt < TB; ++tt) {
+                float kv = 0.0f, qw = 0.0f;
+                for (int r = 0; r < RC; ++r) {
+                    kv += v[tt][r*D_v + p]*k[tt][r*D_qk + d];
+                    qw += w[tt][r*D_v + p]*q[tt][r*D_qk + d];
+                }
+                s = alpha[tt]*s + beta[tt]*kvp + gamma[tt]*kv;
+                acc[tt] += s*qw;
+                kvp = kv;
+            }
+            st_row[d] = s;
+        }
+        for (int tt = 0; tt < TB; ++tt) {
+            y[tt][p] += acc[tt];
+        }
+    }
+}
+
+template <int RC>
+static void m3_step_tb(
+        float * st, const float * K_st, const float * V_st,
+        const float * const * k, const float * const * q, const float * const * v, const float * const * w,
+        float * const * y, const float * alpha, const float * beta, const float * gamma,
+        int64_t TB, int64_t D_qk, int64_t D_v) {
+    switch (TB) {
+        case 4: m3_step<RC, 4>(st, K_st, V_st, k, q, v, w, y, alpha, beta, gamma, D_qk, D_v); break;
+        case 3: m3_step<RC, 3>(st, K_st, V_st, k, q, v, w, y, alpha, beta, gamma, D_qk, D_v); break;
+        case 2: m3_step<RC, 2>(st, K_st, V_st, k, q, v, w, y, alpha, beta, gamma, D_qk, D_v); break;
+        default: m3_step<RC, 1>(st, K_st, V_st, k, q, v, w, y, alpha, beta, gamma, D_qk, D_v); break;
+    }
+}
+
+static void m3_step_dispatch(
+        float * st, const float * K_st, const float * V_st,
+        const float * const * k, const float * const * q, const float * const * v, const float * const * w,
+        float * const * y, const float * alpha, const float * beta, const float * gamma,
+        int64_t R, int64_t TB, int64_t D_qk, int64_t D_v) {
+    switch (R) {
+        case 1: m3_step_tb<1>(st, K_st, V_st, k, q, v, w, y, alpha, beta, gamma, TB, D_qk, D_v); break;
+        case 2: m3_step_tb<2>(st, K_st, V_st, k, q, v, w, y, alpha, beta, gamma, TB, D_qk, D_v); break;
+        case 4: m3_step_tb<4>(st, K_st, V_st, k, q, v, w, y, alpha, beta, gamma, TB, D_qk, D_v); break;
+        case 8: m3_step_tb<8>(st, K_st, V_st, k, q, v, w, y, alpha, beta, gamma, TB, D_qk, D_v); break;
+        default: GGML_ABORT("mamba3_mimo: unsupported MIMO rank %d", (int) R);
+    }
+}
+
+size_t ggml_mamba3_mimo_work_floats(const ggml_tensor * op, int n_threads) {
+    const int64_t D_qk  = op->src[2]->ne[0];
+    const int64_t R     = op->src[4]->ne[1];
+    const int64_t H     = op->src[4]->ne[2];
+    const int64_t D_v   = op->src[4]->ne[0];
+    const int64_t n_ang = D_qk/4;
+    const bool inplace  = op->src[8] != nullptr;
+    const int64_t n_seqs = inplace ? op->src[8]->ne[0] : op->src[7]->ne[1];
+    const int64_t per_unit = D_v*D_qk + R*D_qk + R*D_v + n_ang;
+    const int64_t units = (H + n_threads - 1)/n_threads;
+    const int64_t scratch = M3_TB*(2*R*D_qk + 2*R*D_v + 2*R*D_qk + n_ang) + 2*n_ang + D_v;
+    return (size_t) (scratch + (inplace ? n_seqs*units*per_unit : 0) + CACHE_LINE_SIZE_F32);
 }
 
 static void ggml_compute_forward_mamba3_mimo_f32(
@@ -12220,7 +12413,10 @@ static void ggml_compute_forward_mamba3_mimo_f32(
     const ggml_tensor * mimo_o = dst->src[4];
     const ggml_tensor * norms  = dst->src[5];
     const ggml_tensor * misc   = dst->src[6];
-    const ggml_tensor * state  = dst->src[7];
+    const ggml_tensor * states = dst->src[7];
+    const ggml_tensor * ids    = dst->src[8];
+    const ggml_tensor * sdst   = dst->src[9];
+    const bool inplace = ids != nullptr;
 
     const float eps     = ggml_get_op_params_f32(dst, 0);
     const float a_floor = ggml_get_op_params_f32(dst, 1);
@@ -12229,140 +12425,221 @@ static void ggml_compute_forward_mamba3_mimo_f32(
     const int64_t R      = mimo_o->ne[1];
     const int64_t H      = mimo_o->ne[2];
     const int64_t D_v    = mimo_o->ne[0];
-    const int64_t n_ang  = D_qk / 4;
+    const int64_t n_ang  = D_qk/4;
     const int64_t n_tok  = pdyn->ne[1];
-    const int64_t n_seqs = state->ne[1];
-    const int64_t T      = n_tok / n_seqs;
+    const int64_t n_seqs = inplace ? ids->ne[0] : states->ne[1];
+    const int64_t T      = n_tok/n_seqs;
+    const int64_t half   = D_qk/2;
 
     const int64_t off_K    = H*D_v*D_qk;
     const int64_t off_V    = off_K + H*R*D_qk;
     const int64_t off_A    = off_V + H*R*D_v;
     const int64_t n_embd_s = off_A + H*n_ang;
+    const int64_t per_unit = D_v*D_qk + R*D_qk + R*D_v + n_ang;
 
     const float * bias_d  = (const float *) bias->data;
     const float * mxz_d   = (const float *) mxz->data;
     const float * mo_d    = (const float *) mimo_o->data;
     const float * norms_d = (const float *) norms->data;
     const float * misc_d  = (const float *) misc->data;
-
-    float * y_d  = (float *) dst->data;
-    float * st_d = y_d + D_v*H*n_tok;
+    float       * y_d     = (float *) dst->data;
 
     const int ith = params->ith;
     const int nth = params->nth;
 
-    // per-unit scratch: S (D_v, D_qk) | k, q (D_qk, R) | k_prev (D_qk, R) | v, z, v_prev (D_v, R) | ang
-    std::vector<float> buf(D_v*D_qk + 3*D_qk*R + 3*D_v*R + n_ang);
-    float * S   = buf.data();
-    float * k   = S + D_v*D_qk;
-    float * q   = k + D_qk*R;
-    float * kp  = q + D_qk*R;
-    float * v   = kp + D_qk*R;
-    float * z   = v + D_v*R;
-    float * vp  = z + D_v*R;
-    float * ang = vp + D_v*R;
+    // contiguous head ranges per thread
+    const int64_t per_th  = (H + nth - 1)/nth;
+    const int64_t h_begin = std::min<int64_t>(ith*per_th, H);
+    const int64_t h_end   = std::min<int64_t>(h_begin + per_th, H);
+    if (h_begin >= h_end) {
+        return;
+    }
+    const int64_t my_U = h_end - h_begin;
 
-    const int64_t n_units = n_seqs*H;
-    for (int64_t u = ith; u < n_units; u += nth) {
-        const int64_t seq = u / H;
-        const int64_t h   = u % H;
+    float * wbuf = (float *) params->wdata + ith*ggml_mamba3_mimo_work_floats(dst, nth);
+    float * krt  = wbuf;                       // (TB, R, D_qk)
+    float * qrt  = krt + M3_TB*R*D_qk;         // (TB, R, D_qk)
+    float * vlt  = qrt + M3_TB*R*D_qk;         // (TB, R, D_v)
+    float * wlt  = vlt + M3_TB*R*D_v;          // (TB, R, D_v)
+    float * bcn  = wlt + M3_TB*R*D_v;          // (TB, 2R, D_qk)
+    float * tanp = bcn + M3_TB*2*R*D_qk;       // (TB, n_ang)
+    float * cs   = tanp + M3_TB*n_ang;
+    float * ss   = cs + n_ang;
+    float * ztmp = ss + n_ang;                 // (D_v)
+    float * snap = ztmp + D_v;                 // (n_seqs, my_U, per_unit), in-place mode
 
-        const float * s_in  = (const float *) ((const char *) state->data + seq*state->nb[1]);
-        float       * s_out = st_d + seq*n_embd_s;
+    auto src_row = [&](int64_t seq) -> const float * {
+        if (inplace) {
+            return (const float *) ((const char *) states->data + (int64_t) ((const int32_t *) ids->data)[seq]*states->nb[1]);
+        }
+        return (const float *) ((const char *) states->data + seq*states->nb[1]);
+    };
+    auto dst_row = [&](int64_t seq) -> float * {
+        if (inplace) {
+            return (float *) ((char *) sdst->data + seq*sdst->nb[1]);
+        }
+        return y_d + D_v*H*n_tok + seq*n_embd_s;
+    };
+    auto copy_unit = [&](float * d, const float * s, int64_t h) { // packed row -> packed row, one head
+        memcpy(d + h*D_v*D_qk,      s + h*D_v*D_qk,      D_v*D_qk*sizeof(float));
+        memcpy(d + off_K + h*R*D_qk, s + off_K + h*R*D_qk, R*D_qk*sizeof(float));
+        memcpy(d + off_V + h*R*D_v,  s + off_V + h*R*D_v,  R*D_v*sizeof(float));
+        memcpy(d + off_A + h*n_ang,  s + off_A + h*n_ang,  n_ang*sizeof(float));
+    };
 
-        memcpy(S,   s_in + h*D_v*D_qk,      D_v*D_qk*sizeof(float));
-        memcpy(kp,  s_in + off_K + h*R*D_qk, R*D_qk*sizeof(float));
-        memcpy(vp,  s_in + off_V + h*R*D_v,  R*D_v*sizeof(float));
-        memcpy(ang, s_in + off_A + h*n_ang,  n_ang*sizeof(float));
-
-        const float * bias_h = bias_d + h*2*R*D_qk;
-        const float * mx_h   = mxz_d  + h*2*R*D_v;
-        const float * mz_h   = mx_h + R*D_v;
-        const float * mo_h   = mo_d   + h*R*D_v;
-        const float   D_h    = misc_d[H + h];
-
-        for (int64_t t = 0; t < T; ++t) {
-            const int64_t tok = seq*T + t;
-            const float * pd = (const float *) ((const char *) pdyn->data  + tok*pdyn->nb[1]);
-            const float * ps = (const float *) ((const char *) pstat->data + tok*pstat->nb[1]) + h*(2*D_v + 3);
-
-            const float dt    = ggml_m3_softplus(ps[2*D_v + 0] + misc_d[h]);
-            const float a     = fminf(-ggml_m3_softplus(ps[2*D_v + 1]), -a_floor);
-            const float alpha = expf(a*dt);
-            const float trap  = 1.0f/(1.0f + expf(-ps[2*D_v + 2]));
-            const float beta  = (1.0f - trap)*dt*alpha;
-            const float gamma = trap*dt;
-
-            for (int64_t i = 0; i < n_ang; ++i) {
-                const float x = ang[i] + tanhf(pd[2*R*D_qk + i])*(float) M_PI*dt;
-                ang[i] = x - (float) (2.0*M_PI)*rintf(x*(float) (0.5/M_PI));
+    if (inplace) {
+        for (int64_t seq = 0; seq < n_seqs; ++seq) {
+            const float * s = src_row(seq);
+            if (s == dst_row(seq)) {
+                continue;
             }
-
-            // k = B, q = C: rms-norm * weight + per-head bias
-            for (int64_t g = 0; g < 2*R; ++g) {
-                const float * src = pd + g*D_qk;
-                const float * w   = norms_d + (g < R ? 0 : D_qk);
-                double sum = 0.0;
-                for (int64_t d = 0; d < D_qk; ++d) {
-                    sum += (double) src[d]*(double) src[d];
-                }
-                const float sc = 1.0f/sqrtf((float) (sum/D_qk) + eps);
-                float * out = g < R ? k + g*D_qk : q + (g - R)*D_qk;
-                for (int64_t d = 0; d < D_qk; ++d) {
-                    out[d] = (src[d]*sc)*w[d] + bias_h[g*D_qk + d];
-                }
+            for (int64_t h = h_begin; h < h_end; ++h) {
+                float * sp = snap + (seq*my_U + (h - h_begin))*per_unit;
+                memcpy(sp,                               s + h*D_v*D_qk,       D_v*D_qk*sizeof(float));
+                memcpy(sp + D_v*D_qk,                    s + off_K + h*R*D_qk, R*D_qk*sizeof(float));
+                memcpy(sp + D_v*D_qk + R*D_qk,           s + off_V + h*R*D_v,  R*D_v*sizeof(float));
+                memcpy(sp + D_v*D_qk + R*D_qk + R*D_v,   s + off_A + h*n_ang,  n_ang*sizeof(float));
             }
-            // rotary on the pairs (i, i + D_qk/2), i < D_qk/4
-            for (int64_t i = 0; i < n_ang; ++i) {
-                const float c = cosf(ang[i]);
-                const float s = sinf(ang[i]);
-                for (int64_t r = 0; r < R; ++r) {
-                    float * kr = k + r*D_qk;
-                    float * qr = q + r*D_qk;
-                    const float k0 = kr[i], k2 = kr[i + D_qk/2];
-                    kr[i] = k0*c - k2*s; kr[i + D_qk/2] = k0*s + k2*c;
-                    const float q0 = qr[i], q2 = qr[i + D_qk/2];
-                    qr[i] = q0*c - q2*s; qr[i + D_qk/2] = q0*s + q2*c;
+        }
+    }
+
+    for (int64_t seq = 0; seq < n_seqs; ++seq) {
+        float * row = dst_row(seq);
+        const float * s = src_row(seq);
+        if (s != row) {
+            for (int64_t h = h_begin; h < h_end; ++h) {
+                if (inplace) {
+                    const float * sp = snap + (seq*my_U + (h - h_begin))*per_unit;
+                    memcpy(row + h*D_v*D_qk,       sp,                             D_v*D_qk*sizeof(float));
+                    memcpy(row + off_K + h*R*D_qk, sp + D_v*D_qk,                  R*D_qk*sizeof(float));
+                    memcpy(row + off_V + h*R*D_v,  sp + D_v*D_qk + R*D_qk,         R*D_v*sizeof(float));
+                    memcpy(row + off_A + h*n_ang,  sp + D_v*D_qk + R*D_qk + R*D_v, n_ang*sizeof(float));
+                } else {
+                    copy_unit(row, s, h);
                 }
             }
-            for (int64_t r = 0; r < R; ++r) {
-                for (int64_t p = 0; p < D_v; ++p) {
-                    v[r*D_v + p] = ps[D_v + p]*mx_h[r*D_v + p];
-                    z[r*D_v + p] = ps[p]*mz_h[r*D_v + p];
-                }
-            }
-
-            float * y_t = y_d + (tok*H + h)*D_v;
-            for (int64_t p = 0; p < D_v; ++p) {
-                float * Sp = S + p*D_qk;
-                for (int64_t d = 0; d < D_qk; ++d) {
-                    float c_acc = 0.0f, p_acc = 0.0f;
-                    for (int64_t r = 0; r < R; ++r) {
-                        c_acc += v[r*D_v + p]*k[r*D_qk + d];
-                        p_acc += vp[r*D_v + p]*kp[r*D_qk + d];
-                    }
-                    Sp[d] = alpha*Sp[d] + beta*p_acc + gamma*c_acc;
-                }
-                float yp = 0.0f;
-                for (int64_t r = 0; r < R; ++r) {
-                    float acc = 0.0f;
-                    for (int64_t d = 0; d < D_qk; ++d) {
-                        acc += Sp[d]*q[r*D_qk + d];
-                    }
-                    acc += D_h*v[r*D_v + p];
-                    const float zv = z[r*D_v + p];
-                    yp += acc*(zv/(1.0f + expf(-zv)))*mo_h[r*D_v + p];
-                }
-                y_t[p] = yp;
-            }
-            memcpy(kp, k, R*D_qk*sizeof(float));
-            memcpy(vp, v, R*D_v*sizeof(float));
         }
 
-        memcpy(s_out + h*D_v*D_qk,       S,   D_v*D_qk*sizeof(float));
-        memcpy(s_out + off_K + h*R*D_qk, kp,  R*D_qk*sizeof(float));
-        memcpy(s_out + off_V + h*R*D_v,  vp,  R*D_v*sizeof(float));
-        memcpy(s_out + off_A + h*n_ang,  ang, n_ang*sizeof(float));
+        for (int64_t tg = seq*T; tg < (seq + 1)*T; tg += M3_TB) {
+            const int64_t TB = std::min<int64_t>(M3_TB, (seq + 1)*T - tg);
+
+            // head-independent prep: tanh(ang_raw)*pi, rms-normed B/C * weight
+            for (int64_t tt = 0; tt < TB; ++tt) {
+                const float * pd = (const float *) ((const char *) pdyn->data + (tg + tt)*pdyn->nb[1]);
+                for (int64_t i = 0; i < n_ang; ++i) {
+                    tanp[tt*n_ang + i] = tanhf(pd[2*R*D_qk + i])*(float) M_PI;
+                }
+                for (int64_t g = 0; g < 2*R; ++g) {
+                    const float * src = pd + g*D_qk;
+                    const float * w   = norms_d + (g < R ? 0 : D_qk);
+                    float * out = bcn + (tt*2*R + g)*D_qk;
+                    double sum = 0.0;
+                    for (int64_t d = 0; d < D_qk; ++d) {
+                        sum += (double) src[d]*(double) src[d];
+                    }
+                    const float sc = 1.0f/sqrtf((float) (sum/D_qk) + eps);
+                    for (int64_t d = 0; d < D_qk; ++d) {
+                        out[d] = (src[d]*sc)*w[d];
+                    }
+                }
+            }
+
+            for (int64_t h = h_begin; h < h_end; ++h) {
+                const float * bias_h = bias_d + h*2*R*D_qk;
+                const float * mx_h   = mxz_d + h*2*R*D_v;
+                const float * mz_h   = mx_h + R*D_v;
+                const float * mo_h   = mo_d + h*R*D_v;
+                const float   D_h    = misc_d[H + h];
+                float * ang = row + off_A + h*n_ang;
+
+                float alpha[M3_TB], beta[M3_TB], gamma[M3_TB];
+                const float * kp[M3_TB], * qp[M3_TB], * vp[M3_TB], * wp[M3_TB];
+                float * yp[M3_TB];
+
+                for (int64_t tt = 0; tt < TB; ++tt) {
+                    const int64_t tok = tg + tt;
+                    const float * ps = (const float *) ((const char *) pstat->data + tok*pstat->nb[1]) + h*(2*D_v + 3);
+
+                    const float dt   = m3_softplus(ps[2*D_v + 0] + misc_d[h]);
+                    const float a    = fminf(-m3_softplus(ps[2*D_v + 1]), -a_floor);
+                    alpha[tt]        = expf(a*dt);
+                    const float trap = 1.0f/(1.0f + expf(-ps[2*D_v + 2]));
+                    beta[tt]         = (1.0f - trap)*dt*alpha[tt];
+                    gamma[tt]        = trap*dt;
+
+                    for (int64_t i = 0; i < n_ang; ++i) {
+                        const float x = ang[i] + tanp[tt*n_ang + i]*dt;
+                        ang[i] = x - (float) (2.0*M_PI)*rintf(x*(float) (0.5/M_PI));
+                    }
+                    m3_sincos_n(ang, ss, cs, n_ang);
+
+                    float * k = krt + tt*R*D_qk;
+                    float * q = qrt + tt*R*D_qk;
+                    const float * bc = bcn + tt*2*R*D_qk;
+                    for (int64_t j = 0; j < R*D_qk; ++j) {
+                        k[j] = bc[j] + bias_h[j];
+                        q[j] = bc[R*D_qk + j] + bias_h[R*D_qk + j];
+                    }
+                    // rotary on the pairs (i, i + D_qk/2), i < D_qk/4
+                    for (int64_t r = 0; r < R; ++r) {
+                        float * kr = k + r*D_qk;
+                        float * qr = q + r*D_qk;
+                        int64_t i = 0;
+#if defined(__AVX512F__)
+                        for (; i + 16 <= n_ang; i += 16) {
+                            const __m512 c  = _mm512_loadu_ps(cs + i);
+                            const __m512 sn = _mm512_loadu_ps(ss + i);
+                            const __m512 q0 = _mm512_loadu_ps(qr + i), q2 = _mm512_loadu_ps(qr + i + half);
+                            const __m512 k0 = _mm512_loadu_ps(kr + i), k2 = _mm512_loadu_ps(kr + i + half);
+                            _mm512_storeu_ps(qr + i,        _mm512_fnmadd_ps(q2, sn, _mm512_mul_ps(q0, c)));
+                            _mm512_storeu_ps(qr + i + half, _mm512_fmadd_ps (q0, sn, _mm512_mul_ps(q2, c)));
+                            _mm512_storeu_ps(kr + i,        _mm512_fnmadd_ps(k2, sn, _mm512_mul_ps(k0, c)));
+                            _mm512_storeu_ps(kr + i + half, _mm512_fmadd_ps (k0, sn, _mm512_mul_ps(k2, c)));
+                        }
+#endif
+                        for (; i < n_ang; ++i) {
+                            const float c = cs[i], sn = ss[i];
+                            const float q0 = qr[i], q2 = qr[i + half];
+                            qr[i] = q0*c - q2*sn; qr[i + half] = q0*sn + q2*c;
+                            const float k0 = kr[i], k2 = kr[i + half];
+                            kr[i] = k0*c - k2*sn; kr[i + half] = k0*sn + k2*c;
+                        }
+                    }
+
+                    // v = x*mimo_x, w = silu(z*mimo_z)*mimo_o, y seeded with sum_r w*D*v
+                    float * v = vlt + tt*R*D_v;
+                    float * w = wlt + tt*R*D_v;
+                    float * yr = y_d + (tok*H + h)*D_v;
+                    for (int64_t r = 0; r < R; ++r) {
+                        for (int64_t p = 0; p < D_v; ++p) {
+                            v[r*D_v + p]  = ps[D_v + p]*mx_h[r*D_v + p];
+                            ztmp[p]       = ps[p]*mz_h[r*D_v + p];
+                        }
+                        ggml_vec_silu_f32((int) D_v, w + r*D_v, ztmp);
+                        for (int64_t p = 0; p < D_v; ++p) {
+                            w[r*D_v + p] *= mo_h[r*D_v + p];
+                        }
+                    }
+                    for (int64_t p = 0; p < D_v; ++p) {
+                        yr[p] = 0.0f;
+                    }
+                    for (int64_t r = 0; r < R; ++r) {
+                        for (int64_t p = 0; p < D_v; ++p) {
+                            yr[p] += D_h*w[r*D_v + p]*v[r*D_v + p];
+                        }
+                    }
+
+                    kp[tt] = k; qp[tt] = q; vp[tt] = v; wp[tt] = w; yp[tt] = yr;
+                }
+
+                float * st   = row + h*D_v*D_qk;
+                float * K_st = row + off_K + h*R*D_qk;
+                float * V_st = row + off_V + h*R*D_v;
+                m3_step_dispatch(st, K_st, V_st, kp, qp, vp, wp, yp, alpha, beta, gamma, R, TB, D_qk, D_v);
+                memcpy(K_st, kp[TB - 1], R*D_qk*sizeof(float));
+                memcpy(V_st, vp[TB - 1], R*D_v*sizeof(float));
+            }
+        }
     }
 }
 

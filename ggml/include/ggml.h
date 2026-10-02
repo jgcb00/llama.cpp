@@ -2763,6 +2763,25 @@ extern "C" {
             float                 eps,
             float                 a_floor);
 
+    // same, updating the state in place in the recurrent cache (CPU backend):
+    // states = the whole cache (n_embd_s, n_rows), ids = I32 source row of each
+    // of the n_seqs sequences, state_dst = their destination rows (n_embd_s,
+    // n_seqs view of the cache). result: y only, (D_v, H, n_tok) flattened.
+    GGML_API struct ggml_tensor * ggml_mamba3_mimo_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * pdyn,
+            struct ggml_tensor  * pstat,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * mxz,
+            struct ggml_tensor  * mimo_o,
+            struct ggml_tensor  * norms,
+            struct ggml_tensor  * misc,
+            struct ggml_tensor  * states,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * state_dst,
+            float                 eps,
+            float                 a_floor);
+
     // Dragon (Olala) geodesic residual, per row of x and g (n_embd, n_rows):
     //   g_perp = g - (x.g / |x|^2) x
     //   theta  = min((min(|g_perp|/|x|, pi/4) * scale + bias) * inv_depth, pi/4)
