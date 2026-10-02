@@ -4927,6 +4927,90 @@ struct test_mamba3_mimo : public test_case {
     }
 };
 
+// GGML_OP_MAMBA3_MIMO + the cpy of the new state into the recurrent cache, as built by the
+// Dragon graph (exercises the Metal MAMBA3_MIMO + CPY fusion)
+struct test_mamba3_mimo_cache_fusion : public test_case {
+    const int64_t d_qk;
+    const int64_t r;
+    const int64_t d_v;
+    const int64_t head_count;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+
+    ggml_tensor * cpy_node = nullptr;
+    ggml_tensor * y_node   = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR6(d_qk, r, d_v, head_count, n_seq_tokens, n_seqs);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_mamba3_mimo_cache_fusion(int64_t d_qk = 128, int64_t r = 4, int64_t d_v = 64, int64_t head_count = 48,
+            int64_t n_seq_tokens = 1, int64_t n_seqs = 1)
+        : d_qk(d_qk), r(r), d_v(d_v), head_count(head_count),
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t H = head_count, n_tok = n_seq_tokens * n_seqs, n_ang = d_qk / 4;
+        const int64_t n_embd_s = H*d_v*d_qk + H*r*d_qk + H*r*d_v + H*n_ang;
+        ggml_tensor * pdyn   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*r*d_qk + n_ang, n_tok);
+        ggml_tensor * pstat  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2*d_v + 3)*H, n_tok);
+        ggml_tensor * bias   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_qk, 2*r, H);
+        ggml_tensor * mxz    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_v, 2*r, H);
+        ggml_tensor * mimo_o = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_v, r, H);
+        ggml_tensor * norms  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_qk, 2);
+        ggml_tensor * misc   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, 2);
+        ggml_tensor * state  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_s, n_seqs);
+        ggml_set_name(state, "state");
+
+        ggml_tensor * res = ggml_mamba3_mimo(ctx, pdyn, pstat, bias, mxz, mimo_o, norms, misc, state, 1e-6f, 1e-4f);
+        ggml_set_name(res, "m3_out");
+
+        // new state (tail of the result) -> rows [1, 1 + n_seqs) of the recurrent cache
+        ggml_tensor * state_new = ggml_view_2d(ctx, res, n_embd_s, n_seqs,
+                ggml_row_size(res->type, n_embd_s), ggml_row_size(res->type, d_v*H*n_tok));
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd_s, n_seqs + 2);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * dst = ggml_view_2d(ctx, cache, n_embd_s, n_seqs, cache->nb[1], cache->nb[1]);
+
+        ggml_tensor * cpy = ggml_cpy(ctx, state_new, dst);
+        ggml_set_name(cpy, "m3_cache_cpy");
+        cpy_node = cpy;
+
+        // y (head of the result)
+        ggml_tensor * y = ggml_cont(ctx, ggml_view_2d(ctx, res, d_v*H, n_tok, ggml_row_size(res->type, d_v*H), 0));
+        ggml_set_name(y, "m3_y");
+        y_node = y;
+
+        // neither the op nor the cpy is the graph output; the cpy must directly follow the op
+        return ggml_add(ctx, ggml_sum(ctx, cpy), ggml_sum(ctx, y));
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MAMBA3_MIMO_CACHE_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node, y_node }; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "state") == 0) {
+                init_tensor_uniform(t, -0.5f, 0.5f);
+            } else if (strcmp(t->name, "cache") == 0) {
+                init_tensor_uniform(t, 0.0f, 0.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GEODESIC
 struct test_geodesic : public test_case {
     const int64_t n_embd;
@@ -11449,6 +11533,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48, 150, 1)); // chunked, partial tail chunk
     test_cases.emplace_back(new test_mamba3_mimo( 16, 2,  8,  3,  33, 2)); // small dims
     test_cases.emplace_back(new test_mamba3_mimo( 64, 4, 64,  4, 100, 1));
+    test_cases.emplace_back(new test_mamba3_mimo_cache_fusion(128, 4, 64, 48,  1, 1)); // decode
+    test_cases.emplace_back(new test_mamba3_mimo_cache_fusion(128, 4, 64, 48,  1, 4)); // batched decode
+    test_cases.emplace_back(new test_mamba3_mimo_cache_fusion(128, 4, 64, 48, 96, 2)); // chunked prefill
+    test_cases.emplace_back(new test_mamba3_mimo_cache_fusion( 16, 2,  8,  3, 33, 2)); // generic dims
     test_cases.emplace_back(new test_geodesic(1536, 1, 1.0f));
     test_cases.emplace_back(new test_geodesic(1536, 7, 0.25f));
     test_cases.emplace_back(new test_geodesic(1536, 512, 1.0f/36));

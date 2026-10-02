@@ -142,6 +142,13 @@
 #define OP_LIGHTNING_INDEXER_NSG     8
 #define OP_LIGHTNING_INDEXER_NBPTG   8
 
+// Dragon Mamba3-MIMO (kernels/mamba3.metal): threads/simdgroups per threadgroup, chunk length of
+// the chunked (prefill) path, max MIMO rank of the generic path
+#define OP_MAMBA3_MIMO_NTH   256
+#define OP_MAMBA3_MIMO_NSG   8
+#define OP_MAMBA3_MIMO_CHUNK 32
+#define OP_MAMBA3_MIMO_MAX_R 8
+
 #define OP_UNARY_NUM_SCALE      10
 #define OP_UNARY_NUM_FILL       11
 #define OP_UNARY_NUM_CLAMP      12
@@ -1008,6 +1015,47 @@ typedef struct {
     uint64_t nb3;
     uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
 } ggml_metal_kargs_gated_delta_net;
+
+// Dragon Mamba3-MIMO mixer core (kernels/mamba3.metal); all strides/offsets in floats
+typedef struct {
+    int32_t D_qk;
+    int32_t R;
+    int32_t D_v;
+    int32_t H;
+    int32_t T;            // tokens per sequence
+    int32_t n_seqs;
+    int32_t n_chunks;     // chunked path only (1 otherwise)
+    int32_t pad0;
+    int64_t pdyn_s;       // token stride of pdyn
+    int64_t pstat_s;      // token stride of pstat
+    int64_t s_in_s;       // seq stride of the input state
+    int64_t s_out_s;      // seq stride of the output state (n_embd_s, or the cache row stride when fused)
+    int64_t off_K;        // packed state section offsets: [S | k_prev | v_prev | ang]
+    int64_t off_V;
+    int64_t off_A;
+    int64_t ws_state_off; // chunked path workspace: [ang | chunk states | chunk decays]
+    int64_t ws_decay_off;
+    float   eps;
+    float   a_floor;
+} ggml_metal_kargs_mamba3_mimo;
+
+// Dragon geodesic residual (kernels/mamba3.metal)
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    float    inv_depth;
+} ggml_metal_kargs_geodesic;
 
 typedef struct {
     int32_t  ne00;
