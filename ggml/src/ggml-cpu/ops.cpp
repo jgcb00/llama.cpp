@@ -9428,6 +9428,14 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                             for (int64_t dk = 0; dk < DK; dk++) {
                                 K_f32[dk * KV_TILE_SZ + tk] = GGML_CPU_FP16_TO_FP32(k_f16[dk]);
                             }
+                        } else if (kv_type == GGML_TYPE_Q8_0) {
+                            const block_q8_0 * kb = (const block_q8_0 *)k_data;
+                            for (int64_t ib = 0; ib < DK/QK8_0; ib++) {
+                                const float d = GGML_CPU_FP16_TO_FP32(kb[ib].d);
+                                for (int64_t j = 0; j < QK8_0; j++) {
+                                    K_f32[(ib*QK8_0 + j) * KV_TILE_SZ + tk] = d * kb[ib].qs[j];
+                                }
+                            }
                         } else {
                             const float * k_f32_src = (const float *)k_data;
                             for (int64_t dk = 0; dk < DK; dk++) {
@@ -9442,6 +9450,14 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                         const char * v_data = (const char *)v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
                         if (kv_type == GGML_TYPE_F16) {
                             ggml_cpu_fp16_to_fp32((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
+                        } else if (kv_type == GGML_TYPE_Q8_0) {
+                            const block_q8_0 * vb = (const block_q8_0 *)v_data;
+                            for (int64_t ib = 0; ib < DV/QK8_0; ib++) {
+                                const float d = GGML_CPU_FP16_TO_FP32(vb[ib].d);
+                                for (int64_t j = 0; j < QK8_0; j++) {
+                                    V32[tk * DV + ib*QK8_0 + j] = d * vb[ib].qs[j];
+                                }
+                            }
                         } else {
                             memcpy(V32 + tk * DV, v_data, DV * sizeof(float));
                         }
@@ -9943,6 +9959,292 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk_blocked(
         }
     }
 }
+// Decode (one query token per stream), all heads of one stream at once over the
+// KV range [ic_start, ic_end). The KV cache interleaves heads per cell (a cell
+// is n_kv_heads contiguous rows), so iterating cell-major and head-minor inside
+// a 32-cell block reads K and V strictly sequentially - a per-head scan instead
+// jumps a whole cell stride per row and defeats the prefetchers. The G query
+// heads sharing a KV head reuse each converted K/V row (GQA). Same per-head math
+// as the blocked kernel; needs a head-independent mask and no ALiBi.
+template <ggml_type type_KV, int G>
+static void ggml_compute_forward_flash_attn_ext_f16_decode_stream(
+        const ggml_compute_params * params,
+        ggml_tensor * dst,
+        int iq3,
+        int64_t ic_start, int64_t ic_end,
+        float * partials, int64_t partial_stride) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
+
+    const int64_t DK  = nek0;
+    const int64_t DV  = nev0;
+    const int64_t NH  = neq2;
+    const int64_t NKV = nek2;
+
+    float scale         = 1.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+    if (logit_softcap != 0) {
+        scale /= logit_softcap;
+    }
+
+    constexpr int64_t FA_BLK = 32;
+
+    static thread_local std::vector<float> tl;
+    const size_t need = (size_t) (NH*DK + NH*DV + 2*NH + 2*NH*FA_BLK + 16);
+    if (tl.size() < need) {
+        tl.resize(need);
+    }
+    float * Qf   = tl.data();          // (NH, DK)
+    float * VKQ  = Qf   + NH*DK;       // (NH, DV)
+    float * S    = VKQ  + NH*DV;
+    float * M    = S    + NH;
+    float * sblk = M    + NH;          // (NH, FA_BLK)
+    float * pbuf = sblk + NH*FA_BLK;   // (NH, FA_BLK)
+
+    for (int64_t h = 0; h < NH; ++h) {
+        S[h] = 0.0f;
+        M[h] = -INFINITY;
+        memset(VKQ + h*DV, 0, DV*sizeof(float));
+        const float * pq = (const float *) ((char *) q->data + (h*nbq2 + iq3*nbq3));
+        if constexpr (type_KV == GGML_TYPE_F16) {
+            for (int64_t d = 0; d < DK; ++d) {
+                Qf[h*DK + d] = GGML_CPU_FP16_TO_FP32(GGML_CPU_FP32_TO_FP16(pq[d]));
+            }
+        } else {
+            memcpy(Qf + h*DK, pq, DK*sizeof(float));
+        }
+    }
+
+    const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
+
+    const char * k_base = (const char *) k->data + (iq3/(neq3/nek3))*nbk3;
+    const char * v_base = (const char *) v->data + (iq3/(neq3/nev3))*nbv3;
+
+    const __m512 vinf   = _mm512_set1_ps(-INFINITY);
+    const __m512 vscale = _mm512_set1_ps(scale);
+
+    int64_t ic = ic_start;
+    for (; ic + FA_BLK <= ic_end; ic += FA_BLK) {
+        __m512 mblk0, mblk1;
+        if (mp) {
+            mblk0 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(mp + ic)));
+            mblk1 = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(mp + ic + 16)));
+            const __mmask16 valid0 = _mm512_cmp_ps_mask(mblk0, vinf, _CMP_NEQ_UQ);
+            const __mmask16 valid1 = _mm512_cmp_ps_mask(mblk1, vinf, _CMP_NEQ_UQ);
+            if ((valid0 | valid1) == 0) {
+                continue;
+            }
+        } else {
+            mblk0 = _mm512_setzero_ps();
+            mblk1 = _mm512_setzero_ps();
+        }
+
+        // scores: cell-major, head-minor (sequential K reads)
+        for (int64_t j = 0; j < FA_BLK; ++j) {
+            for (int64_t kh = 0; kh < NKV; ++kh) {
+                __m512 acc[G];
+                for (int g = 0; g < G; ++g) {
+                    acc[g] = _mm512_setzero_ps();
+                }
+                const float * qg = Qf + kh*G*DK;
+                if constexpr (type_KV == GGML_TYPE_F16) {
+                    const ggml_fp16_t * kr = (const ggml_fp16_t *)(k_base + kh*nbk2 + (ic + j)*nbk1);
+                    for (int64_t d = 0; d < DK; d += 16) {
+                        const __m512 kv = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(kr + d)));
+                        for (int g = 0; g < G; ++g) {
+                            acc[g] = _mm512_fmadd_ps(kv, _mm512_loadu_ps(qg + g*DK + d), acc[g]);
+                        }
+                    }
+                } else {
+                    const block_q8_0 * kr = (const block_q8_0 *)(k_base + kh*nbk2 + (ic + j)*nbk1);
+                    for (int64_t ib = 0; ib < DK/QK8_0; ++ib) {
+                        const __m256i qs = _mm256_loadu_si256((const __m256i *) kr[ib].qs);
+                        const __m512  f0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_castsi256_si128(qs)));
+                        const __m512  f1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_extracti128_si256(qs, 1)));
+                        const __m512  dk = _mm512_set1_ps(GGML_CPU_FP16_TO_FP32(kr[ib].d));
+                        for (int g = 0; g < G; ++g) {
+                            __m512 bacc = _mm512_mul_ps  (f0, _mm512_loadu_ps(qg + g*DK + ib*QK8_0));
+                            bacc        = _mm512_fmadd_ps(f1, _mm512_loadu_ps(qg + g*DK + ib*QK8_0 + 16), bacc);
+                            acc[g] = _mm512_fmadd_ps(bacc, dk, acc[g]);
+                        }
+                    }
+                }
+                for (int g = 0; g < G; ++g) {
+                    sblk[(kh*G + g)*FA_BLK + j] = _mm512_reduce_add_ps(acc[g]);
+                }
+            }
+        }
+
+        // per-head block softmax update
+        bool any = false;
+        for (int64_t h = 0; h < NH; ++h) {
+            __m512 s0 = _mm512_mul_ps(_mm512_loadu_ps(sblk + h*FA_BLK),      vscale);
+            __m512 s1 = _mm512_mul_ps(_mm512_loadu_ps(sblk + h*FA_BLK + 16), vscale);
+            if (logit_softcap != 0.0f) {
+                const __m512 vone = _mm512_set1_ps(1.0f);
+                const __m512 vtwo = _mm512_set1_ps(2.0f);
+                const __m512 vcap = _mm512_set1_ps(logit_softcap);
+                const __m512 e0 = ggml_v_expf(_mm512_mul_ps(s0, vtwo));
+                const __m512 e1 = ggml_v_expf(_mm512_mul_ps(s1, vtwo));
+                s0 = _mm512_mul_ps(_mm512_sub_ps(vone, _mm512_div_ps(vtwo, _mm512_add_ps(e0, vone))), vcap);
+                s1 = _mm512_mul_ps(_mm512_sub_ps(vone, _mm512_div_ps(vtwo, _mm512_add_ps(e1, vone))), vcap);
+            }
+            s0 = _mm512_add_ps(s0, mblk0);
+            s1 = _mm512_add_ps(s1, mblk1);
+            const float bm = MAX(_mm512_reduce_max_ps(s0), _mm512_reduce_max_ps(s1));
+            if (bm == -INFINITY) {
+                _mm512_storeu_ps(pbuf + h*FA_BLK,      _mm512_setzero_ps());
+                _mm512_storeu_ps(pbuf + h*FA_BLK + 16, _mm512_setzero_ps());
+                continue;
+            }
+            if (bm > M[h]) {
+                const float ms = expf(M[h] - bm);
+                ggml_vec_scale_f32(DV, VKQ + h*DV, ms);
+                S[h] *= ms;
+                M[h] = bm;
+            }
+            const __m512 vM = _mm512_set1_ps(M[h]);
+            const __m512 p0 = ggml_v_expf(_mm512_sub_ps(s0, vM));
+            const __m512 p1 = ggml_v_expf(_mm512_sub_ps(s1, vM));
+            S[h] += _mm512_reduce_add_ps(p0) + _mm512_reduce_add_ps(p1);
+            _mm512_storeu_ps(pbuf + h*FA_BLK,      p0);
+            _mm512_storeu_ps(pbuf + h*FA_BLK + 16, p1);
+            any = true;
+        }
+        if (!any) {
+            continue;
+        }
+
+        // V: cell-major, head-minor (sequential V reads)
+        for (int64_t j = 0; j < FA_BLK; ++j) {
+            for (int64_t kh = 0; kh < NKV; ++kh) {
+                float pj[G];
+                bool nz = false;
+                for (int g = 0; g < G; ++g) {
+                    pj[g] = pbuf[(kh*G + g)*FA_BLK + j];
+                    nz |= pj[g] != 0.0f;
+                }
+                if (!nz) {
+                    continue;
+                }
+                float * vg = VKQ + kh*G*DV;
+                if constexpr (type_KV == GGML_TYPE_F16) {
+                    const ggml_fp16_t * vr = (const ggml_fp16_t *)(v_base + kh*nbv2 + (ic + j)*nbv1);
+                    for (int64_t d = 0; d < DV; d += 16) {
+                        const __m512 vv = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(vr + d)));
+                        for (int g = 0; g < G; ++g) {
+                            _mm512_storeu_ps(vg + g*DV + d, _mm512_fmadd_ps(vv, _mm512_set1_ps(pj[g]), _mm512_loadu_ps(vg + g*DV + d)));
+                        }
+                    }
+                } else {
+                    const block_q8_0 * vr = (const block_q8_0 *)(v_base + kh*nbv2 + (ic + j)*nbv1);
+                    for (int64_t ib = 0; ib < DV/QK8_0; ++ib) {
+                        const __m256i qs = _mm256_loadu_si256((const __m256i *) vr[ib].qs);
+                        const __m512  f0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_castsi256_si128(qs)));
+                        const __m512  f1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(_mm256_extracti128_si256(qs, 1)));
+                        const float   dv = GGML_CPU_FP16_TO_FP32(vr[ib].d);
+                        const int64_t d  = ib*QK8_0;
+                        for (int g = 0; g < G; ++g) {
+                            const __m512 vp = _mm512_set1_ps(pj[g]*dv);
+                            _mm512_storeu_ps(vg + g*DV + d,      _mm512_fmadd_ps(f0, vp, _mm512_loadu_ps(vg + g*DV + d)));
+                            _mm512_storeu_ps(vg + g*DV + d + 16, _mm512_fmadd_ps(f1, vp, _mm512_loadu_ps(vg + g*DV + d + 16)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // scalar tail (same math as the blocked kernel's tail)
+    for (; ic < ic_end; ++ic) {
+        const float mv = mp ? GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+        if (mv == -INFINITY) {
+            continue;
+        }
+        for (int64_t h = 0; h < NH; ++h) {
+            const int64_t kh = h/G;
+            const float * qh = Qf + h*DK;
+            float * vh = VKQ + h*DV;
+            float s = 0.0f;
+            if constexpr (type_KV == GGML_TYPE_F16) {
+                const ggml_fp16_t * kr = (const ggml_fp16_t *)(k_base + kh*nbk2 + ic*nbk1);
+                for (int64_t d = 0; d < DK; ++d) {
+                    s += GGML_CPU_FP16_TO_FP32(kr[d]) * qh[d];
+                }
+            } else {
+                const block_q8_0 * kr = (const block_q8_0 *)(k_base + kh*nbk2 + ic*nbk1);
+                for (int64_t ib = 0; ib < DK/QK8_0; ++ib) {
+                    float bs = 0.0f;
+                    for (int64_t d = 0; d < QK8_0; ++d) {
+                        bs += kr[ib].qs[d] * qh[ib*QK8_0 + d];
+                    }
+                    s += GGML_CPU_FP16_TO_FP32(kr[ib].d) * bs;
+                }
+            }
+            s = s*scale;
+            if (logit_softcap != 0.0f) {
+                s = logit_softcap*tanhf(s);
+            }
+            s += mv;
+            const float Mold = M[h];
+            float ms = 1.0f, vs = 1.0f;
+            if (s > M[h]) {
+                M[h] = s;
+                ms = expf(Mold - M[h]);
+                ggml_vec_scale_f32(DV, vh, ms);
+            } else {
+                vs = expf(s - M[h]);
+            }
+            if constexpr (type_KV == GGML_TYPE_F16) {
+                const ggml_fp16_t * vr = (const ggml_fp16_t *)(v_base + kh*nbv2 + ic*nbv1);
+                for (int64_t d = 0; d < DV; ++d) {
+                    vh[d] += GGML_CPU_FP16_TO_FP32(vr[d]) * vs;
+                }
+            } else {
+                const block_q8_0 * vr = (const block_q8_0 *)(v_base + kh*nbv2 + ic*nbv1);
+                for (int64_t ib = 0; ib < DV/QK8_0; ++ib) {
+                    const float dv = GGML_CPU_FP16_TO_FP32(vr[ib].d) * vs;
+                    for (int64_t d = 0; d < QK8_0; ++d) {
+                        vh[ib*QK8_0 + d] += vr[ib].qs[d] * dv;
+                    }
+                }
+            }
+            S[h] = S[h]*ms + vs;
+        }
+    }
+
+    for (int64_t h = 0; h < NH; ++h) {
+        if (sinks && ic_start == 0) {
+            const float s = ((float *)((char *) sinks->data))[h];
+            float ms = 1.0f, vs = 1.0f;
+            if (s > M[h]) {
+                ms = expf(M[h] - s);
+                M[h] = s;
+                ggml_vec_scale_f32(DV, VKQ + h*DV, ms);
+            } else {
+                vs = expf(s - M[h]);
+            }
+            S[h] = S[h]*ms + vs;
+        }
+        float * partial = partials + (iq3*NH + h)*partial_stride;
+        partial[0] = M[h];
+        partial[1] = S[h];
+        memcpy(partial + 2, VKQ + h*DV, DV*sizeof(float));
+    }
+}
+
 #endif // __AVX512F__ && __AVX512DQ__
 
 static void ggml_compute_forward_flash_attn_ext_f16(
@@ -10028,6 +10330,29 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 #endif
 
         if (ic_start < nek1) {
+#if defined(__AVX512F__) && defined(__AVX512DQ__)
+            // all heads of a stream per KV block: sequential K/V reads, GQA reuse
+            const int64_t gqa = neq2/nek2;
+            static const bool no_stream = getenv("GGML_FA_NO_STREAM") != nullptr;
+            const bool use_stream = !no_stream && use_blocked && neq2 % nek2 == 0 && neq2/nev2 == gqa &&
+                                    (gqa == 1 || gqa == 2 || gqa == 4 || gqa == 8) &&
+                                    (dst->src[3] == nullptr || dst->src[3]->ne[2] == 1) &&
+                                    ((float *) dst->op_params)[1] == 0.0f; // no ALiBi
+            if (use_stream) {
+                for (int64_t iq3 = 0; iq3 < neq3; ++iq3) {
+#define FA_STREAM(G) (k->type == GGML_TYPE_F16 \
+        ? ggml_compute_forward_flash_attn_ext_f16_decode_stream<GGML_TYPE_F16,  G>(params, dst, iq3, ic_start, ic_end, chunk_partials, partial_stride) \
+        : ggml_compute_forward_flash_attn_ext_f16_decode_stream<GGML_TYPE_Q8_0, G>(params, dst, iq3, ic_start, ic_end, chunk_partials, partial_stride))
+                    switch (gqa) {
+                        case 1:  FA_STREAM(1); break;
+                        case 2:  FA_STREAM(2); break;
+                        case 4:  FA_STREAM(4); break;
+                        default: FA_STREAM(8); break;
+                    }
+#undef FA_STREAM
+                }
+            } else
+#endif
             for (int64_t row = 0; row < n_rows; row++) {
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
                 if (use_blocked) {
@@ -10083,9 +10408,10 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
+        // q8_0 K/V is dequantized while packing each tile
         bool use_tiled = !use_ref &&
                                (q->type == GGML_TYPE_F32 &&
-                                kv_is_f32_or_f16 &&
+                                (kv_is_f32_or_f16 || (kv_is_q8_0 && DK % QK8_0 == 0 && DV % QK8_0 == 0)) &&
                                 k->type == v->type &&
                                 neq1 >= Q_TILE_SZ);
 #if defined(GGML_SIMD) && !defined(__x86_64__) && !defined(_M_X64)
