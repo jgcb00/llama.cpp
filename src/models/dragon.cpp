@@ -872,6 +872,10 @@ struct dragon_m_kernel_userdata {
     float   rms_eps;
     int64_t D_qk, D_v, R, H;
     const dragon_packed_weights * w;
+    // in-place mode: src[2] is the whole recurrent cache (n_embd_s, rs_size),
+    // src[4] the I32 source-row ids of the n_seqs sequences, src[3] the
+    // destination rows; the state is updated directly in the destination rows
+    bool inplace = false;
     // raw bf16 projection weights for the decode mega-kernel
     const ggml_tensor * w_in = nullptr;
     const ggml_tensor * w_wo = nullptr;
@@ -1323,6 +1327,26 @@ static void dragon_v_shift_kernel(ggml_tensor * dst, int ith, int nth, void * us
 
 
 
+// Per-thread scratch reused across kernel calls: the M-kernel runs ~29x per
+// token, and fresh zero-filled std::vectors (some past the mmap threshold) cost
+// more than the decode-step math itself.
+struct dragon_span {
+    float * p; size_t n;
+    float * data()  const { return p; }
+    float * begin() const { return p; }
+    float * end()   const { return p + n; }
+    size_t  size()  const { return n; }
+    float & operator[](size_t i) const { return p[i]; }
+};
+static dragon_span dragon_scratch(int slot, size_t n) {
+    static thread_local std::vector<float> bufs[16];
+    std::vector<float> & b = bufs[slot];
+    if (b.size() < n) {
+        b.resize(n);
+    }
+    return { b.data(), n };
+}
+
 static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void * userdata) {
     // Raw-input kernel (CuteDSL-step style): consumes the two projection GEMM
     // outputs directly and folds B/C RMS-norm (+weight), per-head bias, x/z
@@ -1494,13 +1518,13 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
     }
 
     // Local SSM state for this thread's units: (my_U, Dv_sl, D_qk) fp32.
-    std::vector<float> ssm_state((size_t) my_U * Dv_sl * D_qk, 0.0f);
+    dragon_span ssm_state = dragon_scratch(0, (size_t) my_U * Dv_sl * D_qk);
     // Per-unit previous-step K and V (for trapezoid β term). K is duplicated
     // across the S slices of a head (identical values); V is row-sliced.
-    std::vector<float> K_state((size_t) my_U * R * D_qk, 0.0f);
-    std::vector<float> V_state((size_t) my_U * R * Dv_sl, 0.0f);
+    dragon_span K_state = dragon_scratch(1, (size_t) my_U * R * D_qk);
+    dragon_span V_state = dragon_scratch(2, (size_t) my_U * R * Dv_sl);
     // Cumulative rotary angle per unit (duplicated across slices of a head).
-    std::vector<float> angle_state((size_t) my_U * num_angles, 0.0f);
+    dragon_span angle_state = dragon_scratch(3, (size_t) my_U * num_angles);
 
     // Offsets into the packed (n_embd_s,) state blob — must match the layout
     // computed by llama_hparams::n_embd_s() for Dragon.
@@ -1510,11 +1534,11 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
     const int64_t n_state_per_seq = off_ang_glob + H * num_angles;
 
     // Per-step rotated q, k scratch: (D_qk, R) × token-group (TB_MAX = 4).
-    std::vector<float> q_rot((size_t) 4 * D_qk * R);
-    std::vector<float> k_rot((size_t) 4 * D_qk * R);
+    dragon_span q_rot = dragon_scratch(4, (size_t) 4 * D_qk * R);
+    dragon_span k_rot = dragon_scratch(5, (size_t) 4 * D_qk * R);
     // Per-(unit, t) materialized v/z rows: (Dv_sl, R) × token-group.
-    std::vector<float> v_loc((size_t) 4 * Dv_sl * R);
-    std::vector<float> z_loc((size_t) 4 * Dv_sl * R);
+    dragon_span v_loc = dragon_scratch(6, (size_t) 4 * Dv_sl * R);
+    dragon_span z_loc = dragon_scratch(7, (size_t) 4 * Dv_sl * R);
 
     // L is laid out as n_seqs blocks of n_seq_tokens consecutive tokens.
     const int64_t n_seqs       = std::max<int64_t>(1, n_seqs_kernel);
@@ -1531,6 +1555,37 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
         state_out = y_d + n_y;  // legacy: packed state appended to y in dst
     }
 
+    // In-place mode: each sequence's destination row is updated directly. A
+    // sequence whose source row differs (new sequence -> shared zero row, moved
+    // or swapped cell) is first snapshotted: all slices of one head, across all
+    // sequences, belong to this thread, so taking every snapshot before the
+    // first write makes the in-place update race-free.
+    const bool inplace = ud->inplace;
+    GGML_ASSERT(!inplace || (st_mode == DRAGON_STATE_F32 && S == 1 && state_out != nullptr));
+    const int32_t * src_ids = inplace ? (const int32_t *) dst->src[4]->data : nullptr;
+    auto src_row = [&](int64_t seq) -> const float * {
+        return (const float *) ((const char *) state_in->data + (int64_t) src_ids[seq] * state_in->nb[1]);
+    };
+    const int64_t per_unit = D_v * D_qk + R * D_qk + R * D_v + num_angles;
+    dragon_span snap = { nullptr, 0 };
+    if (inplace) {
+        snap = dragon_scratch(12, (size_t) (n_seqs * my_U * per_unit));
+        for (int64_t seq = 0; seq < n_seqs; ++seq) {
+            const float * src = src_row(seq);
+            if (src == state_out + seq * n_state_per_seq) {
+                continue;
+            }
+            for (int64_t u = u_begin; u < u_end; ++u) {
+                const int64_t h = u;
+                float * sp = snap.data() + (seq * my_U + (u - u_begin)) * per_unit;
+                std::memcpy(sp,                                       src + h * D_v * D_qk,             (size_t) D_v * D_qk * sizeof(float));
+                std::memcpy(sp + D_v * D_qk,                          src + off_K_glob + h * R * D_qk,  (size_t) R * D_qk * sizeof(float));
+                std::memcpy(sp + D_v * D_qk + R * D_qk,               src + off_V_glob + h * R * D_v,   (size_t) R * D_v * sizeof(float));
+                std::memcpy(sp + D_v * D_qk + R * D_qk + R * D_v,     src + off_ang_glob + h * num_angles, (size_t) num_angles * sizeof(float));
+            }
+        }
+    }
+
     // Zero output rows owned by this thread (we accumulate y over R).
     for (int64_t u = u_begin; u < u_end; ++u) {
         const int64_t h  = u / S;
@@ -1543,7 +1598,19 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
 
     for (int64_t seq = 0; seq < n_seqs; ++seq) {
         // Reset / seed state for this sequence.
-        if (state_in_d) {
+        float * row_seq = inplace ? state_out + seq * n_state_per_seq : nullptr;
+        if (inplace) {
+            if (src_row(seq) != row_seq) {
+                for (int64_t u = u_begin; u < u_end; ++u) {
+                    const int64_t h = u;
+                    const float * sp = snap.data() + (seq * my_U + (u - u_begin)) * per_unit;
+                    std::memcpy(row_seq + h * D_v * D_qk,             sp,                                   (size_t) D_v * D_qk * sizeof(float));
+                    std::memcpy(row_seq + off_K_glob + h * R * D_qk,  sp + D_v * D_qk,                      (size_t) R * D_qk * sizeof(float));
+                    std::memcpy(row_seq + off_V_glob + h * R * D_v,   sp + D_v * D_qk + R * D_qk,           (size_t) R * D_v * sizeof(float));
+                    std::memcpy(row_seq + off_ang_glob + h * num_angles, sp + D_v * D_qk + R * D_qk + R * D_v, (size_t) num_angles * sizeof(float));
+                }
+            }
+        } else if (state_in_d) {
             const float * state_in_seq = state_in_d + seq * n_state_per_seq;
             for (int64_t u = u_begin; u < u_end; ++u) {
                 const int64_t ul = u - u_begin;
@@ -1575,10 +1642,10 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
     // processed in groups of up to TB_MAX so the state sweep (the dominant
     // memory traffic) runs once per group — see dragon_simd_fused_step_tb.
     constexpr int64_t TB_MAX = 4;
-    std::vector<float> tanh_ang_pi((size_t) TB_MAX * num_angles);
-    std::vector<float> cs_buf((size_t) num_angles);
-    std::vector<float> ss_buf((size_t) num_angles);
-    std::vector<float> bc_norm((size_t) TB_MAX * 2 * R * D_qk); // per-t RMS-normed [B | C]
+    dragon_span tanh_ang_pi = dragon_scratch(8, (size_t) TB_MAX * num_angles);
+    dragon_span cs_buf = dragon_scratch(9, (size_t) num_angles);
+    dragon_span ss_buf = dragon_scratch(10, (size_t) num_angles);
+    dragon_span bc_norm = dragon_scratch(11, (size_t) TB_MAX * 2 * R * D_qk); // per-t RMS-normed [B | C]
     const int64_t seq_t0  = seq * n_seq_tokens;
     const int64_t seq_t1  = (seq + 1) * n_seq_tokens;
     for (int64_t tg = seq_t0; tg < seq_t1; tg += TB_MAX) {
@@ -1619,7 +1686,7 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
             const float * mx_h   = mxz_d + h * mxz_s2 + p0;          // (D_v, 2R): [mimo_x | mimo_z]
             const float * mz_h   = mx_h + R * D_v;
             const float   D_h    = misc_d[H + h];
-            float * ang_st = angle_state.data() + ul * num_angles;
+            float * ang_st = inplace ? row_seq + off_ang_glob + h * num_angles : angle_state.data() + ul * num_angles;
 
             float alpha_g[TB_MAX], beta_g[TB_MAX], gamma_g[TB_MAX];
             const float * kpv[TB_MAX], * qpv[TB_MAX], * vpv[TB_MAX], * zpv[TB_MAX];
@@ -1730,9 +1797,9 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
             }
 
             // --- Fused group: TB tokens' updates in one pass over the state ---
-            float * K_st = K_state.data() + ul * R * D_qk;
-            float * V_st = V_state.data() + ul * R * Dv_sl;
-            float * st   = ssm_state.data() + ul * Dv_sl * D_qk;
+            float * K_st = inplace ? row_seq + off_K_glob + h * R * D_qk : K_state.data() + ul * R * D_qk;
+            float * V_st = inplace ? row_seq + off_V_glob + h * R * D_v  : V_state.data() + ul * R * Dv_sl;
+            float * st   = inplace ? row_seq + h * D_v * D_qk            : ssm_state.data() + ul * Dv_sl * D_qk;
             const float * mo = mimo_d + h * m_s2 + p0;
             dragon_simd_fused_step_group(st, K_st, V_st, kpv, qpv, vpv, zpv,
                                          mo, m_s1, ypv, alpha_g, beta_g, gamma_g, D_h,
@@ -1747,7 +1814,7 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
         // Per-seq state writeback. Each unit writes only its own row slice;
         // the head-wide K/angle sections (duplicated across slices) are
         // written by slice 0 only.
-        if (state_out) {
+        if (state_out && !inplace) {
             float * state_out_seq = state_out + seq * n_state_per_seq;
             for (int64_t u = u_begin; u < u_end; ++u) {
                 const int64_t ul = u - u_begin;
@@ -2580,7 +2647,23 @@ static ggml_tensor * build_dragon_m_mixer_real(
     // Bind the recurrent state buffer so the cache is wired in even though we
     // do not yet read/write through it (single-pass prefill only).
     ggml_tensor * ssm_states_all = mctx_recr->get_s_l(il);
-    ggml_tensor * rs_view = gctx.build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), gctx.ubatch.n_seqs);
+
+    // The default CPU kernel updates the f32 state in place in the cache: the
+    // state gather (a get_rows of ~1.7 MB/layer per sequence) is replaced by
+    // the source-row ids, read by the kernel itself.
+    static const bool inplace_env_ok = !dragon_env_on("DRAGON_M_PRIM") && !std::getenv("DRAGON_M_DECODE_PRIM") &&
+                                       !std::getenv("DRAGON_M_CHUNK_SIZE") && !dragon_env_on("DRAGON_MEGA_DECODE") &&
+                                       !dragon_env_on("DRAGON_M_COLSPLIT") && !dragon_env_on("DRAGON_NO_INPLACE_STATE");
+    const bool state_inplace = inplace_env_ok && !dragon_use_ggml_op() && dragon_state_mode() == DRAGON_STATE_F32;
+    ggml_tensor * rs_states = nullptr, * rs_ids = nullptr;
+    ggml_tensor * rs_view = state_inplace
+        ? gctx.build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), gctx.ubatch.n_seqs,
+              [&](ggml_context * c, ggml_tensor * states, ggml_tensor * ids) {
+                  rs_states = states;
+                  rs_ids    = ids;
+                  return ggml_view_1d(c, states, 1, 0);
+              })
+        : gctx.build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), gctx.ubatch.n_seqs);
 
     // Per-stage dump scaffolding — only dumps for the first M layer, gated on
     // the DRAGON_DUMP_DIR env var; no-op otherwise.
@@ -2913,6 +2996,7 @@ static ggml_tensor * build_dragon_m_mixer_real(
                 ssm_states_all->nb[1], kv_head * row_size);
         ggml_tensor * args[4] = { cur, proj_dyn, rs_view, state_dst };
         auto * ud = (dragon_m_kernel_userdata *) std::malloc(sizeof(dragon_m_kernel_userdata));
+        ud->inplace = false;
         ud->n_seqs  = ubatch.n_seqs;
         ud->rms_eps = hparams.f_norm_rms_eps;
         ud->D_qk = D_qk; ud->D_v = D_v; ud->R = R; ud->H = H_ssm;
@@ -2939,11 +3023,12 @@ static ggml_tensor * build_dragon_m_mixer_real(
                 hparams.n_embd_s(), gctx.ubatch.n_seqs,
                 ssm_states_all->nb[1],
                 kv_head * row_size);
-        ggml_tensor * args[4] = { proj_dyn, proj_static, rs_view, state_dst };
+        ggml_tensor * args[5] = { proj_dyn, proj_static, state_inplace ? rs_states : rs_view, state_dst, rs_ids };
         // Heap-allocated so the userdata pointer outlives graph build. ggml runs
         // the kernel during graph execution, by which time the local stack would
         // be gone.
         auto * ud = (dragon_m_kernel_userdata *) std::malloc(sizeof(dragon_m_kernel_userdata));
+        ud->inplace = state_inplace;
         ud->n_seqs  = ubatch.n_seqs;
         ud->rms_eps = hparams.f_norm_rms_eps;
         ud->D_qk = D_qk; ud->D_v = D_v; ud->R = R; ud->H = H_ssm;
@@ -2951,7 +3036,7 @@ static ggml_tensor * build_dragon_m_mixer_real(
         ud->w_in = nullptr; ud->w_wo = nullptr;
         y = ggml_custom_4d(ctx, GGML_TYPE_F32,
                            D_v, H_ssm, n_tokens, 1,
-                           args, 4,
+                           args, state_inplace ? 5 : 4,
                            dragon_mamba3_mimo_kernel,
                            /*n_tasks=*/ GGML_N_TASKS_MAX,
                            /*userdata=*/ ud);
