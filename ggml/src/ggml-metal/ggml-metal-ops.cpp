@@ -368,6 +368,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_gated_delta_net(ctx, idx);
             } break;
+        case GGML_OP_MAMBA3_MIMO:
+            {
+                n_fuse = ggml_metal_op_mamba3_mimo(ctx, idx);
+            } break;
+        case GGML_OP_GEODESIC:
+            {
+                n_fuse = ggml_metal_op_geodesic(ctx, idx);
+            } break;
         case GGML_OP_SOLVE_TRI:
             {
                 n_fuse = ggml_metal_op_solve_tri(ctx, idx);
@@ -2013,6 +2021,280 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
 
     return n_fuse;
+}
+
+// MAMBA3_MIMO dims and the chunked-path decision, shared by the encoder and the workspace size
+struct ggml_metal_mamba3_mimo_dims {
+    int64_t D_qk, R, D_v, H, n_ang;
+    int64_t n_tok, n_seqs, T;
+    int64_t SD, n_embd_s;
+    int64_t n_chunks; // 0: serial path
+};
+
+static ggml_metal_mamba3_mimo_dims ggml_metal_mamba3_mimo_get_dims(const ggml_tensor * op) {
+    ggml_metal_mamba3_mimo_dims d;
+
+    d.D_qk   = op->src[2]->ne[0];
+    d.R      = op->src[4]->ne[1];
+    d.D_v    = op->src[4]->ne[0];
+    d.H      = op->src[4]->ne[2];
+    d.n_ang  = d.D_qk/4;
+    d.n_tok  = op->src[0]->ne[1];
+    d.n_seqs = op->src[7]->ne[1];
+    d.T      = d.n_tok/d.n_seqs;
+    d.SD     = d.D_qk*d.D_v;
+
+    d.n_embd_s = d.H*d.SD + d.H*d.R*d.D_qk + d.H*d.R*d.D_v + d.H*d.n_ang;
+
+    // short ubatches (decode, spec-decode verify, short prompts) run one serial pass
+    d.n_chunks = d.T < 2*OP_MAMBA3_MIMO_CHUNK ? 0 : (d.T + OP_MAMBA3_MIMO_CHUNK - 1)/OP_MAMBA3_MIMO_CHUNK;
+
+    return d;
+}
+
+size_t ggml_metal_op_mamba3_mimo_extra_ws(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_MAMBA3_MIMO);
+
+    const ggml_metal_mamba3_mimo_dims d = ggml_metal_mamba3_mimo_get_dims(op);
+
+    if (d.n_chunks == 0) {
+        return 0;
+    }
+
+    // [ang (n_ang, H, n_tok) | chunk states (SD, n_chunks, H, n_seqs) | chunk decays (n_chunks, H, n_seqs)]
+    const int64_t n = d.n_tok*d.H*d.n_ang + d.n_chunks*d.n_seqs*d.H*d.SD + d.n_chunks*d.n_seqs*d.H;
+
+    return GGML_PAD(n*sizeof(float), 16);
+}
+
+int ggml_metal_op_mamba3_mimo(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const bool use_fusion   = ctx->use_fusion();
+    const int  debug_fusion = ggml_metal_fusion_info_debug(ctx->finfo);
+
+    const ggml_tensor * pdyn  = op->src[0];
+    const ggml_tensor * pstat = op->src[1];
+    const ggml_tensor * state = op->src[7];
+
+    const ggml_metal_mamba3_mimo_dims d = ggml_metal_mamba3_mimo_get_dims(op);
+
+    GGML_ASSERT(d.n_tok == d.T*d.n_seqs);
+    GGML_ASSERT(d.R <= OP_MAMBA3_MIMO_MAX_R);
+    GGML_ASSERT(state->ne[0] == d.n_embd_s);
+    GGML_ASSERT(pdyn->nb[0] == sizeof(float) && pstat->nb[0] == sizeof(float) && state->nb[0] == sizeof(float));
+    GGML_ASSERT(pdyn->nb[1] % sizeof(float) == 0 && pstat->nb[1] % sizeof(float) == 0 && state->nb[1] % sizeof(float) == 0);
+
+    const int64_t y_size = d.D_v*d.H*d.n_tok;
+
+    ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
+
+    // y at the start of dst, followed by the new state (n_embd_s, n_seqs)
+    ggml_metal_buffer_id bid_s_out = bid_dst;
+    bid_s_out.offs += y_size*sizeof(float);
+    int64_t s_out_s = d.n_embd_s;
+
+    int n_fuse = 1;
+
+    // when fused with the trailing cache cpy, the new state is written straight into the recurrent
+    // cache and the cpy is skipped (see GGML_METAL_FUSION_MAMBA3_CACHE)
+    if (use_fusion) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_MAMBA3_CACHE) {
+            const ggml_tensor * dst_cache = ctx->node(idx + 1)->src[1]; // cache view
+
+            bid_s_out = ggml_metal_get_buffer_id(dst_cache);
+            s_out_s   = dst_cache->nb[1]/sizeof(float);
+            n_fuse    = 2;
+
+            ctx->count_fusions(fusion);
+
+            if (debug_fusion > 1) {
+                GGML_LOG_DEBUG("%s: fuse: MAMBA3_MIMO + CPY\n", __func__);
+            }
+        }
+    }
+
+    // chunked-path workspace, after dst (see ggml_backend_metal_buffer_type_get_alloc_size)
+    ggml_metal_buffer_id bid_ws = bid_dst;
+    bid_ws.offs += ggml_nbytes(op);
+
+    const int64_t ws_state_off = d.n_tok*d.H*d.n_ang;
+    const int64_t ws_decay_off = ws_state_off + d.n_chunks*d.n_seqs*d.H*d.SD;
+
+    ggml_metal_kargs_mamba3_mimo args = {
+        /*.D_qk         =*/ (int32_t) d.D_qk,
+        /*.R            =*/ (int32_t) d.R,
+        /*.D_v          =*/ (int32_t) d.D_v,
+        /*.H            =*/ (int32_t) d.H,
+        /*.T            =*/ (int32_t) d.T,
+        /*.n_seqs       =*/ (int32_t) d.n_seqs,
+        /*.n_chunks     =*/ (int32_t) std::max<int64_t>(d.n_chunks, 1),
+        /*.pad0         =*/ 0,
+        /*.pdyn_s       =*/ (int64_t) (pdyn->nb[1]/sizeof(float)),
+        /*.pstat_s      =*/ (int64_t) (pstat->nb[1]/sizeof(float)),
+        /*.s_in_s       =*/ (int64_t) (state->nb[1]/sizeof(float)),
+        /*.s_out_s      =*/ s_out_s,
+        /*.off_K        =*/ d.H*d.SD,
+        /*.off_V        =*/ d.H*d.SD + d.H*d.R*d.D_qk,
+        /*.off_A        =*/ d.H*d.SD + d.H*d.R*d.D_qk + d.H*d.R*d.D_v,
+        /*.ws_state_off =*/ ws_state_off,
+        /*.ws_decay_off =*/ ws_decay_off,
+        /*.eps          =*/ ggml_get_op_params_f32(op, 0),
+        /*.a_floor      =*/ ggml_get_op_params_f32(op, 1),
+    };
+
+    // when the chunked path is not used there is no workspace: bind dst so that every buffer
+    // argument is valid (the serial kernel does not access it)
+    if (d.n_chunks == 0) {
+        bid_ws = bid_dst;
+    }
+
+    const int nth = OP_MAMBA3_MIMO_NTH;
+
+    // main kernel: serial / phase 1 / phase 3, one threadgroup per (chunk, head, seq)
+    auto encode_main = [&](ggml_metal_mamba3_mimo_kernel kernel, int64_t n_tg_x) {
+        auto pipeline = ggml_metal_library_get_pipeline_mamba3_mimo(lib, op, kernel, true);
+
+        if (ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) < nth) {
+            // the register-state fast path does not fit 256 threads on this device: use the
+            // generic kernel (state in device memory)
+            static bool warned = false;
+            if (!warned) {
+                GGML_LOG_WARN("%s: register-state kernel limited to %d threads per threadgroup, using the generic kernel\n",
+                        __func__, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+                warned = true;
+            }
+            pipeline = ggml_metal_library_get_pipeline_mamba3_mimo(lib, op, kernel, false);
+        }
+
+        GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+        int ida = 0;
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), ida++);
+        for (int i = 0; i < 8; ++i) {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[i]), ida++);
+        }
+        ggml_metal_encoder_set_buffer  (enc, bid_dst,   ida++); // y
+        ggml_metal_encoder_set_buffer  (enc, bid_s_out, ida++); // new state
+        ggml_metal_encoder_set_buffer  (enc, bid_ws,    ida++); // workspace
+
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, n_tg_x, d.H, d.n_seqs, nth, 1, 1);
+    };
+
+    if (d.n_chunks == 0) {
+        encode_main(GGML_METAL_MAMBA3_MIMO_SERIAL, 1);
+
+        return n_fuse;
+    }
+
+    // angles: per-token rotary phases (+ the final phases into the new state)
+    {
+        auto pipeline = ggml_metal_library_get_pipeline_mamba3_mimo(lib, op, GGML_METAL_MAMBA3_MIMO_ANGLES, true);
+
+        int ida = 0;
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), ida++);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), ida++); // pdyn
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), ida++); // pstat
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[6]), ida++); // misc
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[7]), ida++); // state
+        ggml_metal_encoder_set_buffer  (enc, bid_s_out,                            ida++);
+        ggml_metal_encoder_set_buffer  (enc, bid_ws,                               ida++);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, d.H, d.n_seqs, 1, 32, 1, 1);
+    }
+
+    ggml_metal_op_concurrency_reset(ctx);
+
+    // phase 1: chunk-local states and alpha products
+    encode_main(GGML_METAL_MAMBA3_MIMO_PHASE1, d.n_chunks);
+
+    ggml_metal_op_concurrency_reset(ctx);
+
+    // phase 2: scan over the chunks
+    {
+        auto pipeline = ggml_metal_library_get_pipeline_mamba3_mimo(lib, op, GGML_METAL_MAMBA3_MIMO_CHUNK_SCAN, true);
+
+        int ida = 0;
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), ida++);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[7]), ida++); // state
+        ggml_metal_encoder_set_buffer  (enc, bid_s_out,                            ida++);
+        ggml_metal_encoder_set_buffer  (enc, bid_ws,                               ida++);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (d.SD + nth - 1)/nth, d.H, d.n_seqs, nth, 1, 1);
+    }
+
+    ggml_metal_op_concurrency_reset(ctx);
+
+    // phase 3: outputs from the carry-ins (+ the last k/v into the new state)
+    encode_main(GGML_METAL_MAMBA3_MIMO_PHASE3, d.n_chunks);
+
+    return n_fuse;
+}
+
+int ggml_metal_op_geodesic(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+
+    GGML_ASSERT(nb00 == sizeof(float) && nb10 == sizeof(float) && nb0 == sizeof(float));
+
+    auto pipeline = ggml_metal_library_get_pipeline_geodesic(lib, op);
+
+    ggml_metal_kargs_geodesic args = {
+        /*.ne00      =*/ ne00,
+        /*.ne01      =*/ ne01,
+        /*.ne02      =*/ ne02,
+        /*.ne03      =*/ ne03,
+        /*.nb01      =*/ nb01,
+        /*.nb02      =*/ nb02,
+        /*.nb03      =*/ nb03,
+        /*.nb11      =*/ nb11,
+        /*.nb12      =*/ nb12,
+        /*.nb13      =*/ nb13,
+        /*.nb1       =*/ nb1,
+        /*.nb2       =*/ nb2,
+        /*.nb3       =*/ nb3,
+        /*.inv_depth =*/ ggml_get_op_params_f32(op, 0),
+    };
+
+    // 1 simdgroup per 128 elements, up to 8 (n_embd = 1536 -> 256 threads)
+    int nsg = (ne00 + 127)/128;
+    nsg = std::max(1, std::min(nsg, 8));
+    nsg = std::min(nsg, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)/32);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         5);
+
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, 32*nsg, 1, 1);
+
+    return 1;
 }
 
 int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {

@@ -137,6 +137,7 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     X(SSM,             ssm)            \
     X(WKV,             wkv)            \
     X(GATED_DELTA_NET, gated_delta_net)\
+    X(MAMBA3,          mamba3)         \
     X(SOLVE_TRI,       solve_tri)      \
     X(ROPE,            rope)           \
     X(CONV,            conv)           \
@@ -1841,6 +1842,38 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
+        case GGML_OP_MAMBA3_MIMO:
+            {
+                if (!has_simdgroup_reduction || op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                for (int i = 0; i < 8; ++i) {
+                    if (op->src[i] == NULL || op->src[i]->type != GGML_TYPE_F32 || op->src[i]->nb[0] != sizeof(float)) {
+                        return false;
+                    }
+                }
+                const int64_t D_qk  = op->src[2]->ne[0];
+                const int64_t R     = op->src[4]->ne[1];
+                const int64_t D_v   = op->src[4]->ne[0];
+                const int64_t n_ang = D_qk/4;
+                // threadgroup staging buffers (see ggml_metal_library_get_pipeline_mamba3_mimo)
+                const size_t smem = (3*R*D_qk + 3*R*D_v + 3*n_ang + 2*R + 4)*sizeof(float);
+                return R <= OP_MAMBA3_MIMO_MAX_R &&
+                       ggml_is_contiguous_rows(op->src[0]) &&
+                       ggml_is_contiguous_rows(op->src[1]) &&
+                       ggml_is_contiguous_rows(op->src[7]) &&
+                       smem <= dev->props.max_theadgroup_memory_size;
+            }
+        case GGML_OP_GEODESIC:
+            return has_simdgroup_reduction &&
+                op->type         == GGML_TYPE_F32 &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                op->src[3]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous_rows(op->src[0]) &&
+                ggml_is_contiguous_rows(op->src[1]) &&
+                ggml_is_contiguous_rows(op);
         case GGML_OP_SOLVE_TRI:
             return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_MUL_MAT:

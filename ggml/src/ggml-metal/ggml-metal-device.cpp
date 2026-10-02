@@ -728,6 +728,75 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(
     return res;
 }
 
+// true if the register-state fast path of kernels/mamba3.metal is instantiated for these dims
+static bool ggml_metal_mamba3_mimo_fast(int64_t D_qk, int64_t D_v, int64_t R) {
+    return D_qk == 128 && D_v == 64 && R == 4;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mamba3_mimo(ggml_metal_library_t lib, const ggml_tensor * op, ggml_metal_mamba3_mimo_kernel kernel, bool allow_fast) {
+    GGML_ASSERT(op->op == GGML_OP_MAMBA3_MIMO);
+
+    const int64_t D_qk  = op->src[2]->ne[0];
+    const int64_t R     = op->src[4]->ne[1];
+    const int64_t D_v   = op->src[4]->ne[0];
+    const int64_t n_ang = D_qk/4;
+
+    // allow_fast == false selects the generic kernels (state in device memory) even for the
+    // fast-path dims; both use the same workspace layout, so they can be mixed freely
+    const char * dims = allow_fast && ggml_metal_mamba3_mimo_fast(D_qk, D_v, R) ? "d128_v64_r4" : "gen";
+
+    char base[256];
+    char name[256];
+
+    bool main_kernel = true;
+
+    switch (kernel) {
+        case GGML_METAL_MAMBA3_MIMO_SERIAL:     snprintf(base, 256, "kernel_mamba3_mimo_serial_%s", dims); break;
+        case GGML_METAL_MAMBA3_MIMO_PHASE1:     snprintf(base, 256, "kernel_mamba3_mimo_phase1_%s", dims); break;
+        case GGML_METAL_MAMBA3_MIMO_PHASE3:     snprintf(base, 256, "kernel_mamba3_mimo_phase3_%s", dims); break;
+        case GGML_METAL_MAMBA3_MIMO_ANGLES:     snprintf(base, 256, "kernel_mamba3_mimo_angles");     main_kernel = false; break;
+        case GGML_METAL_MAMBA3_MIMO_CHUNK_SCAN: snprintf(base, 256, "kernel_mamba3_mimo_chunk_scan"); main_kernel = false; break;
+        default: GGML_ABORT("fatal error");
+    }
+
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    res.nsg = OP_MAMBA3_MIMO_NSG;
+
+    if (main_kernel) {
+        // [ k x2 | q | v x2 | gz | cs | sn | ang | rms | coef ] - keep in sync with kernels/mamba3.metal
+        // (and with the supports_op check)
+        res.smem = GGML_PAD((3*R*D_qk + 3*R*D_v + 3*n_ang + 2*R + 4)*sizeof(float), 16);
+    }
+
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_geodesic(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_GEODESIC);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_geodesic_%s", ggml_type_name(op->src[0]->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    // per-simdgroup partial sums of the two reductions
+    res.smem = GGML_PAD(2*32*sizeof(float), 16);
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];
