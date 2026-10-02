@@ -1085,6 +1085,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "MAMBA3_MIMO",
+    "GEODESIC",
 
     "UNARY",
 
@@ -1102,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1200,7 +1201,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
-    "mamba3_mimo(q, k, v, coefs, s)",
+    "mamba3_mimo(pdyn, pstat, ..., s)",
+    "geodesic(x, g)",
 
     "unary(x)",
 
@@ -1218,7 +1220,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6623,54 +6625,83 @@ struct ggml_tensor * ggml_dsv4_hc_post(
 
 struct ggml_tensor * ggml_mamba3_mimo(
         struct ggml_context * ctx,
-        struct ggml_tensor  * q,
-        struct ggml_tensor  * k,
-        struct ggml_tensor  * v,
-        struct ggml_tensor  * coefs,
-        struct ggml_tensor  * state) {
-    GGML_ASSERT(ggml_is_contiguous(q));
-    GGML_ASSERT(ggml_is_contiguous(k));
-    GGML_ASSERT(ggml_is_contiguous(v));
-    GGML_ASSERT(ggml_is_contiguous(coefs));
-    GGML_ASSERT(ggml_is_contiguous(state));
+        struct ggml_tensor  * pdyn,
+        struct ggml_tensor  * pstat,
+        struct ggml_tensor  * bias,
+        struct ggml_tensor  * mxz,
+        struct ggml_tensor  * mimo_o,
+        struct ggml_tensor  * norms,
+        struct ggml_tensor  * misc,
+        struct ggml_tensor  * state,
+        float                 eps,
+        float                 a_floor) {
+    struct ggml_tensor * srcs[8] = { pdyn, pstat, bias, mxz, mimo_o, norms, misc, state };
+    for (int i = 0; i < 8; ++i) {
+        GGML_ASSERT(srcs[i]->type == GGML_TYPE_F32);
+    }
+    GGML_ASSERT(ggml_is_contiguous_rows(pdyn) && ggml_is_contiguous_rows(pstat));
+    for (int i = 2; i < 8; ++i) {
+        GGML_ASSERT(ggml_is_contiguous(srcs[i]));
+    }
 
-    GGML_ASSERT(q->type == GGML_TYPE_F32);
-    GGML_ASSERT(k->type == GGML_TYPE_F32);
-    GGML_ASSERT(v->type == GGML_TYPE_F32);
-    GGML_ASSERT(coefs->type == GGML_TYPE_F32);
-    GGML_ASSERT(state->type == GGML_TYPE_F32);
+    const int64_t D_qk  = bias->ne[0];
+    const int64_t R     = mimo_o->ne[1];
+    const int64_t H     = mimo_o->ne[2];
+    const int64_t D_v   = mimo_o->ne[0];
+    const int64_t n_ang = D_qk / 4;
+    const int64_t n_tok = pdyn->ne[1];
 
-    const int64_t D_qk     = q->ne[0];
-    const int64_t R        = q->ne[1];
-    const int64_t H        = q->ne[2];
-    const int64_t D_v      = v->ne[0];
-    const int64_t n_tokens = coefs->ne[2];
-    const int64_t n_seqs   = coefs->ne[3];
+    GGML_ASSERT(D_qk % 4 == 0);
+    GGML_ASSERT(bias->ne[1] == 2*R && bias->ne[2] == H);
+    GGML_ASSERT(mxz->ne[0] == D_v && mxz->ne[1] == 2*R && mxz->ne[2] == H);
+    GGML_ASSERT(norms->ne[0] == D_qk && norms->ne[1] == 2);
+    GGML_ASSERT(misc->ne[0] == H && misc->ne[1] == 2);
+    GGML_ASSERT(pdyn->ne[0] == 2*R*D_qk + n_ang);
+    GGML_ASSERT(pstat->ne[0] == (2*D_v + 3)*H && pstat->ne[1] == n_tok);
 
-    GGML_ASSERT(k->ne[0] == D_qk && k->ne[1] == R && k->ne[2] == H);
-    GGML_ASSERT(v->ne[1] == R && v->ne[2] == H);
-    GGML_ASSERT(q->ne[3] == n_tokens * n_seqs);
-    GGML_ASSERT(k->ne[3] == n_tokens * n_seqs);
-    GGML_ASSERT(v->ne[3] == n_tokens * n_seqs);
+    const int64_t n_embd_s = H*D_v*D_qk + H*R*D_qk + H*R*D_v + H*n_ang;
+    GGML_ASSERT(state->ne[0] == n_embd_s);
+    const int64_t n_seqs = state->ne[1];
+    GGML_ASSERT(n_seqs >= 1 && n_tok % n_seqs == 0);
 
-    // coefs rows are [alpha | beta | gamma]
-    GGML_ASSERT(coefs->ne[0] == 3 && coefs->ne[1] == H);
+    const int64_t ne[1] = { D_v*H*n_tok + n_embd_s*n_seqs };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 1, ne);
 
-    // state holds the initial state s0 only: (D_qk, D_v, H) per seq
-    GGML_ASSERT(ggml_nelements(state) == D_qk * D_v * H * n_seqs);
+    float params[2] = { eps, a_floor };
+    ggml_set_op_params(result, params, sizeof(params));
 
-    // the final state is appended as rows of size D_v*R*H
-    GGML_ASSERT(D_qk % R == 0);
-    const int64_t state_rows = (D_qk / R) * n_seqs;
-    const int64_t ne[4] = { D_v * R * H, n_tokens * n_seqs + state_rows, 1, 1 };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op = GGML_OP_MAMBA3_MIMO;
+    for (int i = 0; i < 8; ++i) {
+        result->src[i] = srcs[i];
+    }
 
-    result->op     = GGML_OP_MAMBA3_MIMO;
-    result->src[0] = q;
-    result->src[1] = k;
-    result->src[2] = v;
-    result->src[3] = coefs;
-    result->src[4] = state;
+    return result;
+}
+
+// ggml_geodesic
+
+struct ggml_tensor * ggml_geodesic(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * bias,
+        float                 inv_depth) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_nelements(scale) == 1 && ggml_nelements(bias) == 1);
+    GGML_ASSERT(ggml_are_same_shape(x, g));
+    GGML_ASSERT(ggml_is_contiguous_rows(x) && ggml_is_contiguous_rows(g));
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
+
+    ggml_set_op_params_f32(result, 0, inv_depth);
+
+    result->op     = GGML_OP_GEODESIC;
+    result->src[0] = x;
+    result->src[1] = g;
+    result->src[2] = scale;
+    result->src[3] = bias;
 
     return result;
 }
