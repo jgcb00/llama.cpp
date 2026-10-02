@@ -447,7 +447,7 @@ void llama_model_dragon::load_arch_hparams(llama_model_loader & ml) {
     }
 
     // ---- MoE ----
-    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp);
+    ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, true);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,               hparams.n_expert_shared, false);
     ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,              hparams.expert_weights_scale, false);
@@ -512,7 +512,7 @@ void llama_model_dragon::load_arch_tensors(llama_model_loader &) {
 
     // MoE constants
     const int64_t moe_n_embd = hparams.moe_latent_size > 0 ? (int64_t) hparams.moe_latent_size : (int64_t) n_embd;
-    const int64_t ff_exp     = (int64_t) hparams.n_ff_exp;
+    const int64_t ff_exp     = (int64_t) hparams.n_ff_exp();
     const int64_t ff_shexp   = (int64_t) hparams.n_ff_shexp;
 
     // ---- embeddings + LM head (no final norm: dragon.final_norm == false) ----
