@@ -1844,7 +1844,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
         case GGML_OP_MAMBA3_MIMO:
             {
-                if (!has_simdgroup_reduction || op->type != GGML_TYPE_F32) {
+                if (!has_simdgroup_reduction || op->type != GGML_TYPE_F32 || op->src[8] != nullptr) { // in-place mode: CPU only
                     return false;
                 }
                 for (int i = 0; i < 8; ++i) {

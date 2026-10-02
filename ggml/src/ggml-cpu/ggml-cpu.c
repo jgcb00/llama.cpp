@@ -3033,6 +3033,10 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
                     } break;
+                case GGML_OP_MAMBA3_MIMO:
+                    {
+                        cur = ggml_mamba3_mimo_work_floats(node, n_tasks) * sizeof(float) * n_tasks;
+                    } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {
                         const int64_t S_v = node->src[2]->ne[0];

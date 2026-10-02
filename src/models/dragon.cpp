@@ -65,6 +65,10 @@ static bool dragon_state_bf16() { return dragon_state_mode() != DRAGON_STATE_F32
 // forces all of it (validates the GPU graph against the CPU one).
 static thread_local bool dragon_layer_cpu = true;
 
+static ggml_tensor * f32c_static(ggml_context * ctx, ggml_tensor * t) {
+    return t->type == GGML_TYPE_F32 ? t : ggml_cast(ctx, t, GGML_TYPE_F32);
+}
+
 static bool dragon_env_on(const char * name) {
     const char * e = std::getenv(name);
     return e && e[0] && e[0] != '0';
@@ -944,7 +948,8 @@ static ggml_tensor * build_dragon_geodesic(
     if (force_ref) {
         return build_dragon_geodesic_ref(ctx, x, g, scale_scalar, bias_scalar, il);
     }
-    if (!dragon_layer_cpu) {
+    static const bool cpu_custom_geo = dragon_env_on("DRAGON_CPU_CUSTOM_GEO");
+    if (!dragon_layer_cpu || !cpu_custom_geo) {
         return ggml_geodesic(ctx, x, g, scale_scalar, bias_scalar, 1.0f / (float) (il + 1));
     }
     return build_dragon_geodesic_fused(ctx, x, g, scale_scalar, bias_scalar, il);
@@ -3110,11 +3115,7 @@ static ggml_tensor * build_dragon_m_mixer_real(
     //   * Default                      — CPU-only custom op (fastest on CPU).
     ggml_tensor * y = nullptr;
     ggml_tensor * out_pre = nullptr;
-    if (fused_op) {
-        // Portable path (GPU layers): GGML_OP_MAMBA3_MIMO consumes the raw
-        // projections and the gathered state, returns [y | new state]; the
-        // state is scattered back into the recurrent cache by a cpy.
-        GGML_ASSERT((int64_t) ubatch.n_seqs * (int64_t) ubatch.n_seq_tokens == n_tokens);
+    auto m3_consts = [&](ggml_tensor ** c_bias, ggml_tensor ** c_mxz, ggml_tensor ** c_norms, ggml_tensor ** c_misc) {
         // packed by the converter; older GGUFs pack in the graph
         ggml_tensor * bias  = layer.ssm_m3_bias ? layer.ssm_m3_bias :
                 ggml_concat(ctx, layer.ssm_b_bias, layer.ssm_c_bias, 1);                       // (D_qk, 2R, H)
@@ -3129,8 +3130,35 @@ static ggml_tensor * build_dragon_m_mixer_real(
         auto f32c = [&](ggml_tensor * t) {
             return t->type == GGML_TYPE_F32 ? t : ggml_cast(ctx, t, GGML_TYPE_F32);
         };
+        *c_bias = f32c(bias); *c_mxz = f32c(mxz); *c_norms = f32c(norms); *c_misc = f32c(misc);
+    };
+    static const bool cpu_custom_m = dragon_env_on("DRAGON_CPU_CUSTOM_M");
+    if (state_inplace && !cpu_custom_m && !mega_decode) {
+        // CPU default: GGML_OP_MAMBA3_MIMO in-place mode - reads each sequence's
+        // source row of the cache and updates its destination row in place
+        GGML_ASSERT((int64_t) ubatch.n_seqs * (int64_t) ubatch.n_seq_tokens == n_tokens);
+        ggml_tensor * c_bias, * c_mxz, * c_norms, * c_misc;
+        m3_consts(&c_bias, &c_mxz, &c_norms, &c_misc);
+        const auto kv_head = mctx_recr->get_head();
+        const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+        ggml_tensor * state_dst = ggml_view_2d(ctx, ssm_states_all,
+                hparams.n_embd_s(), ubatch.n_seqs, ssm_states_all->nb[1], kv_head * row_size);
+        ggml_tensor * res = ggml_mamba3_mimo_inplace(ctx, proj_dyn, proj_static,
+                c_bias, c_mxz, f32c_static(ctx, layer.ssm_mimo_o), c_norms, c_misc,
+                rs_states, rs_ids, state_dst, hparams.f_norm_rms_eps, 1e-4f);
+        ggml_set_name(res, "m_kernel");
+        y = ggml_reshape_3d(ctx, res, D_v, H_ssm, n_tokens);
+        goto post_recurrence;
+    }
+    if (fused_op) {
+        // Portable path (GPU layers): GGML_OP_MAMBA3_MIMO consumes the raw
+        // projections and the gathered state, returns [y | new state]; the
+        // state is scattered back into the recurrent cache by a cpy.
+        GGML_ASSERT((int64_t) ubatch.n_seqs * (int64_t) ubatch.n_seq_tokens == n_tokens);
+        ggml_tensor * c_bias, * c_mxz, * c_norms, * c_misc;
+        m3_consts(&c_bias, &c_mxz, &c_norms, &c_misc);
         ggml_tensor * res = ggml_mamba3_mimo(ctx, proj_dyn, proj_static,
-                f32c(bias), f32c(mxz), f32c(layer.ssm_mimo_o), f32c(norms), f32c(misc),
+                c_bias, c_mxz, f32c_static(ctx, layer.ssm_mimo_o), c_norms, c_misc,
                 rs_view, hparams.f_norm_rms_eps, 1e-4f);
         ggml_set_name(res, "m_kernel");
         const size_t es = ggml_element_size(res);
