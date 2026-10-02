@@ -762,6 +762,11 @@ void llama_model_dragon::load_arch_tensors(llama_model_loader &) {
             layer.ssm_mimo_x = create_tensor(tn(LLM_TENSOR_SSM_MIMO_X, i), { Hdim_ssm, R, H_ssm }, 0);
             layer.ssm_mimo_z = create_tensor(tn(LLM_TENSOR_SSM_MIMO_Z, i), { Hdim_ssm, R, H_ssm }, 0);
             layer.ssm_mimo_o = create_tensor(tn(LLM_TENSOR_SSM_MIMO_O, i), { Hdim_ssm, R, H_ssm }, 0);
+
+            layer.ssm_m3_bias  = create_tensor(tn(LLM_TENSOR_SSM_M3_BIAS,  i), { d_state, 2*R, H_ssm },  TENSOR_NOT_REQUIRED);
+            layer.ssm_m3_mxz   = create_tensor(tn(LLM_TENSOR_SSM_M3_MXZ,   i), { Hdim_ssm, 2*R, H_ssm }, TENSOR_NOT_REQUIRED);
+            layer.ssm_m3_norms = create_tensor(tn(LLM_TENSOR_SSM_M3_NORMS, i), { d_state, 2 },          TENSOR_NOT_REQUIRED);
+            layer.ssm_m3_misc  = create_tensor(tn(LLM_TENSOR_SSM_M3_MISC,  i), { H_ssm, 2 },            TENSOR_NOT_REQUIRED);
         } else {
             layer.wq                  = create_tensor(tn(LLM_TENSOR_ATTN_Q,              "weight", i), { n_embd, n_head_attn * head_dim }, 0);
             layer.attn_wa_k           = create_tensor(tn(LLM_TENSOR_ATTN_WA_K,           "weight", i), { n_embd, n_kv  * tpa_rank }, 0);
@@ -3110,12 +3115,15 @@ static ggml_tensor * build_dragon_m_mixer_real(
         // projections and the gathered state, returns [y | new state]; the
         // state is scattered back into the recurrent cache by a cpy.
         GGML_ASSERT((int64_t) ubatch.n_seqs * (int64_t) ubatch.n_seq_tokens == n_tokens);
-        ggml_tensor * bias   = ggml_concat(ctx, layer.ssm_b_bias, layer.ssm_c_bias, 1);       // (D_qk, 2R, H)
-        ggml_tensor * mxz    = ggml_concat(ctx, layer.ssm_mimo_x, layer.ssm_mimo_z, 1);       // (D_v, 2R, H)
-        ggml_tensor * norms  = ggml_concat(ctx,
+        // packed by the converter; older GGUFs pack in the graph
+        ggml_tensor * bias  = layer.ssm_m3_bias ? layer.ssm_m3_bias :
+                ggml_concat(ctx, layer.ssm_b_bias, layer.ssm_c_bias, 1);                       // (D_qk, 2R, H)
+        ggml_tensor * mxz   = layer.ssm_m3_mxz ? layer.ssm_m3_mxz :
+                ggml_concat(ctx, layer.ssm_mimo_x, layer.ssm_mimo_z, 1);                       // (D_v, 2R, H)
+        ggml_tensor * norms = layer.ssm_m3_norms ? layer.ssm_m3_norms : ggml_concat(ctx,
                 ggml_reshape_2d(ctx, layer.ssm_b_norm, D_qk, 1),
                 ggml_reshape_2d(ctx, layer.ssm_c_norm, D_qk, 1), 1);                           // (D_qk, 2)
-        ggml_tensor * misc   = ggml_concat(ctx,
+        ggml_tensor * misc  = layer.ssm_m3_misc ? layer.ssm_m3_misc : ggml_concat(ctx,
                 ggml_reshape_2d(ctx, layer.ssm_dt_bias, H_ssm, 1),
                 ggml_reshape_2d(ctx, layer.ssm_d,       H_ssm, 1), 1);                         // (H, 2)
         auto f32c = [&](ggml_tensor * t) {

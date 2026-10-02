@@ -604,6 +604,11 @@ struct llama_layer {
     struct ggml_tensor * ssm_mimo_x  = nullptr; // (n_head, R, headdim)
     struct ggml_tensor * ssm_mimo_z  = nullptr; // (n_head, R, headdim)
     struct ggml_tensor * ssm_mimo_o  = nullptr; // (n_head, R, headdim)
+    // packed GGML_OP_MAMBA3_MIMO constants (optional; built from the above by the converter)
+    struct ggml_tensor * ssm_m3_bias  = nullptr;
+    struct ggml_tensor * ssm_m3_mxz   = nullptr;
+    struct ggml_tensor * ssm_m3_norms = nullptr;
+    struct ggml_tensor * ssm_m3_misc  = nullptr;
 
     // Dragon Diff-TPA-V2 (V layer)
     struct ggml_tensor * attn_wa_k           = nullptr; // (hidden, n_kv · rank)
