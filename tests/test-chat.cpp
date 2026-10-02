@@ -4859,6 +4859,264 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
+    // Olala (Dragon 7A1B) tests - custom parser
+    // Unique feature: <|channel_start|>NAME<|content|>...<|channel_end|> channels, XML-wrapped
+    // JSON tool calls in a dedicated tools channel, and a generation prompt that leaves the
+    // analysis channel open. Cases mirror jgcb00/olala parsers/test_olala_parsers.py.
+    {
+        auto tst = peg_tester("models/templates/Olala.jinja", detailed_debug);
+
+        const std::string A          = "Some analysis here.";
+        const std::string FINAL_EMPTY = "<|channel_start|>final<|content|><|channel_end|>";
+        auto tools_ch = [](const std::string & calls) {
+            return "<|channel_start|>tools<|content|><toolcalls>" + calls + "</toolcalls><|channel_end|>";
+        };
+        auto call = [](const std::string & id, const std::string & name, const std::string & args) {
+            return "<call id=\"" + id + "\"><name>" + name + "</name><arguments>" + args + "</arguments></call>";
+        };
+
+        // Plain answer, no tools channel
+        tst.test(A + "<|channel_end|><|channel_start|>final<|content|>It is sunny in Paris.<|channel_end|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(simple_assist_msg("It is sunny in Paris.", A))
+            .run();
+
+        // Same with the EOS token reaching the parser as text
+        tst.test(A + "<|channel_end|><|channel_start|>final<|content|>Hello, world!\nWhat's up?<|channel_end|><|im_end|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(simple_assist_msg("Hello, world!\nWhat's up?", A))
+            .run();
+
+        // Missing <|channel_end|> on the final channel at EOS
+        tst.test(A + "<|channel_end|><|channel_start|>final<|content|>Hello, world!\nWhat's up?")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(simple_assist_msg("Hello, world!\nWhat's up?", A))
+            .run();
+
+        // Analysis closer skipped: reasoning stops at the final opener
+        tst.test(A + "<|channel_start|>final<|content|>Hello.<|channel_end|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(simple_assist_msg("Hello.", A))
+            .run();
+
+        // Truncated mid-analysis (hit max_tokens): everything is reasoning
+        tst.test("I was still thinking when the budget ran out")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect_reasoning("I was still thinking when the budget ran out")
+            .run();
+
+        // reasoning_format=none: the analysis channel stays inline, markers included
+        tst.test(A + "<|channel_end|><|channel_start|>final<|content|>Hello.<|channel_end|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_NONE)
+            .expect_content("<|channel_start|>analysis<|content|>" + A + "<|channel_end|>Hello.")
+            .run();
+
+        // Reasoning disabled: the generation prompt closes the analysis channel
+        tst.test("<|channel_start|>final<|content|>Hello.<|channel_end|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(false)
+            .expect(simple_assist_msg("Hello."))
+            .run();
+
+        // Single tool call, empty final channel
+        tst.test(A + "<|channel_end|>" + FINAL_EMPTY + tools_ch(call("call_0", "get_weather", R"({"city": "Paris"})")))
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ get_weather_tool })
+            .expect(simple_assist_msg("", A, "get_weather", R"({"city": "Paris"})", "call_0"))
+            .expect_reconstruction()
+            .run();
+
+        // Two parallel tool calls
+        tst.test(A + "<|channel_end|>" + FINAL_EMPTY +
+                 tools_ch(call("call_0", "get_weather", R"({"city": "Paris"})") +
+                          call("call_1", "get_weather", R"({"city": "Tokyo"})")))
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .parallel_tool_calls(true)
+            .tools({ get_weather_tool })
+            .expect_reasoning(A)
+            .expect_tool_calls({
+                { "get_weather", R"({"city": "Paris"})", "call_0" },
+                { "get_weather", R"({"city": "Tokyo"})", "call_1" },
+            })
+            .expect_reconstruction()
+            .run();
+
+        // Parallel calls to different tools whose names share a prefix
+        tst.test(A + "<|channel_end|>" + FINAL_EMPTY +
+                 tools_ch(call("call_0", "special_function", R"({"arg1": 1})") +
+                          call("1", "special_function_with_opt", R"({"arg1": 1, "arg2": 2})")))
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .parallel_tool_calls(true)
+            .tools({ special_function_tool, special_function_tool_with_optional_param })
+            .expect_reasoning(A)
+            .expect_tool_calls({
+                { "special_function", R"({"arg1": 1})", "call_0" },
+                { "special_function_with_opt", R"({"arg1": 1, "arg2": 2})", "1" },
+            })
+            .run();
+
+        // Final text alongside a tool call
+        tst.test(A + "<|channel_end|><|channel_start|>final<|content|>Let me check that.<|channel_end|>" +
+                 tools_ch(call("call_0", "get_weather", R"({"city": "Paris"})")))
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ get_weather_tool })
+            .expect(simple_assist_msg("Let me check that.", A, "get_weather", R"({"city": "Paris"})", "call_0"))
+            .expect_reconstruction()
+            .run();
+
+        // Nested JSON and </arguments>-like text inside the arguments
+        tst.test(A + "<|channel_end|>" + FINAL_EMPTY +
+                 tools_ch(call("call_0", "python", R"JSON({"code": "print('</arguments></call>')"})JSON")))
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ python_tool })
+            .expect(simple_assist_msg("", A, "python", R"JSON({"code": "print('</arguments></call>')"})JSON", "call_0"))
+            .run();
+
+        tst.test(A + "<|channel_end|>" + FINAL_EMPTY +
+                 tools_ch(call("call_0", "nested_args", R"({"tags": ["a", "b"], "entries": [{"id": 1, "label": "x"}]})")))
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ nested_args_tool })
+            .expect(simple_assist_msg("", A, "nested_args", R"({"tags": ["a", "b"], "entries": [{"id": 1, "label": "x"}]})", "call_0"))
+            .run();
+
+        // Empty arguments
+        tst.test(A + "<|channel_end|>" + FINAL_EMPTY + tools_ch(call("call_0", "empty_args", "{}")))
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ empty_args_tool })
+            .expect(simple_assist_msg("", A, "empty_args", "{}", "call_0"))
+            .run();
+
+        // Missing id: left empty for the server to synthesise one
+        tst.test(A + "<|channel_end|>" + FINAL_EMPTY + tools_ch(call("", "get_weather", R"({"city": "Paris"})")))
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ get_weather_tool })
+            .expect(simple_assist_msg("", A, "get_weather", R"({"city": "Paris"})", ""))
+            .run();
+
+        // Whitespace between the XML elements, missing </toolcalls> and <|channel_end|>
+        tst.test(A + "<|channel_end|>" + FINAL_EMPTY +
+                 "<|channel_start|>tools<|content|><toolcalls>\n  <call id=\"call_0\">\n    <name>get_weather</name>\n"
+                 "    <arguments>{\"city\": \"Paris\"}</arguments>\n  </call>\n")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ get_weather_tool })
+            .expect(simple_assist_msg("", A, "get_weather", R"({"city": "Paris"})", "call_0"))
+            .run();
+
+        // Tools channel straight after the analysis channel (no final channel)
+        tst.test(A + "<|channel_end|>" + tools_ch(call("call_0", "get_weather", R"({"city": "Paris"})")))
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ get_weather_tool })
+            .expect(simple_assist_msg("", A, "get_weather", R"({"city": "Paris"})", "call_0"))
+            .run();
+
+        // Truncated mid-call while streaming: the open call streams with partial arguments
+        tst.test(A + "<|channel_end|>" + FINAL_EMPTY +
+                 "<|channel_start|>tools<|content|><toolcalls><call id=\"call_0\"><name>get_weather</name>"
+                 "<arguments>{\"city\": \"Par")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ get_weather_tool })
+            .is_partial(true)
+            .expect(simple_assist_msg("", A, "get_weather", R"({"city": "Par)", "call_0"))
+            .run();
+
+        // tool_choice=none with tools: the tools channel must not leak into the content
+        tst.test(A + "<|channel_end|><|channel_start|>final<|content|>Sure.<|channel_end|>" +
+                 tools_ch(call("call_0", "get_weather", R"({"city": "Paris"})")))
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ get_weather_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_NONE)
+            .expect(simple_assist_msg("Sure.", A))
+            .run();
+
+        // No tools in the request, tools channel emitted anyway: dropped
+        tst.test(A + "<|channel_end|><|channel_start|>final<|content|>Hello.<|channel_end|>" +
+                 tools_ch(call("call_0", "get_weather", R"({"city": "Paris"})")))
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(simple_assist_msg("Hello.", A))
+            .run();
+
+        // Reasoning disabled, no tools, but the model emits a tools channel anyway, twice (seen live)
+        tst.test("<|channel_start|>final<|content|>Hello!<|channel_end|>" + tools_ch(call("call_0", "say_hello", "{}")) +
+                 "<|channel_start|>final<|content|>Hello!<|channel_end|>" + tools_ch(call("call_0", "say_hello", "{}")) +
+                 "<|im_end|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(false)
+            .expect(simple_assist_msg("Hello!"))
+            .run();
+
+        // tool_choice=required: eager grammar, the tools channel is mandatory
+        tst.test(A + "<|channel_end|>" + FINAL_EMPTY + tools_ch(call("call_0", "get_weather", R"({"city": "Paris"})")))
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ get_weather_tool })
+            .tool_choice(COMMON_CHAT_TOOL_CHOICE_REQUIRED)
+            .expect(simple_assist_msg("", A, "get_weather", R"({"city": "Paris"})", "call_0"))
+            .run();
+
+        // Response format: the final channel holds the JSON
+        tst.test(A + "<|channel_end|><|channel_start|>final<|content|>{\"amount\": 123.45, \"date\": \"2025-12-03\"}<|channel_end|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .json_schema(invoice_schema)
+            .expect_reasoning(A)
+            .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
+            .run();
+
+        // Continuation of a partial final answer
+        tst.test("world!\nWhat's up?<|channel_end|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .messages({ message_user, message_assist_prefill_content })
+            .add_generation_prompt(false)
+            .continue_final_message(COMMON_CHAT_CONTINUATION_CONTENT)
+            .expect_reasoning("I'm thinking")
+            .expect_content("Hello, world!\nWhat's up?")
+            .run();
+
+        // Prompt rendering
+        {
+            auto tmpls = read_templates("models/templates/Olala.jinja");
+
+            common_chat_msg tool_call_msg = simple_assist_msg("", "", "get_weather", R"({"city": "Paris"})", "call_0");
+
+            common_chat_msg tool_msg;
+            tool_msg.role         = "tool";
+            tool_msg.tool_name    = "get_weather";
+            tool_msg.tool_call_id = "call_0";
+            tool_msg.content      = R"({"temp_c": 21})";
+
+            common_chat_templates_inputs inputs;
+            inputs.messages              = { message_user, tool_call_msg, tool_msg };
+            inputs.tools                 = { get_weather_tool };
+            inputs.add_generation_prompt = true;
+
+            auto params = common_chat_templates_apply(tmpls.get(), inputs);
+            auto expect_in_prompt = [&](const std::string & needle) {
+                if (params.prompt.find(needle) == std::string::npos) {
+                    throw std::runtime_error("Olala: missing in prompt: " + needle + "\n>>> Prompt:\n" + params.prompt);
+                }
+            };
+            // arguments are rendered as a JSON object, not as a quoted string
+            expect_in_prompt(R"(<toolcalls><call id="call_0"><name>get_weather</name><arguments>{"city": "Paris"}</arguments></call></toolcalls>)");
+            expect_in_prompt(R"(<|im_start|>tool<|channel_start|>metadata<|content|>{"name": "get_weather", "id": "call_0"}<|channel_end|><|channel_start|>tool_output<|content|>{"temp_c": 21}<|channel_end|><|im_end|>)");
+            expect_in_prompt("Reasoning effort: medium");
+            if (!string_ends_with(params.prompt, "<|im_start|>assistant<|channel_start|>analysis<|content|>")) {
+                throw std::runtime_error("Olala: wrong generation prompt:\n" + params.prompt);
+            }
+
+            // enable_thinking=false (OAI reasoning_effort "none") closes the analysis channel
+            inputs.enable_thinking = false;
+            params = common_chat_templates_apply(tmpls.get(), inputs);
+            expect_in_prompt("Reasoning effort: none");
+            if (!string_ends_with(params.prompt, "<|im_start|>assistant<|channel_start|>analysis<|content|><|channel_end|>")) {
+                throw std::runtime_error("Olala: analysis channel not closed with thinking disabled:\n" + params.prompt);
+            }
+
+            // reasoning_effort is passed through to the template
+            inputs.enable_thinking = true;
+            inputs.chat_template_kwargs["reasoning_effort"] = "\"high\"";
+            params = common_chat_templates_apply(tmpls.get(), inputs);
+            expect_in_prompt("Reasoning effort: high");
+        }
+    }
+
     // Kimi-K3 tests - custom parser
     // Unique feature: XTML tags built from <|open|>/<|close|>/<|sep|>, and a
     // generation prompt that leaves the think section already open.
@@ -7570,6 +7828,7 @@ static void test_reasoning_effort_caps() {
     assert_supports_effort("models/templates/openai-gpt-oss-120b.jinja", true);
     assert_supports_effort("models/templates/upstage-Solar-Open-100B.jinja", true);
     assert_supports_effort("models/templates/Cohere2MoE.jinja", true);
+    assert_supports_effort("models/templates/Olala.jinja", true);
     assert_supports_effort("models/templates/meta-llama-Llama-3.1-8B-Instruct.jinja", false);
     assert_supports_effort("models/templates/Qwen-Qwen3-0.6B.jinja", false);
 }
