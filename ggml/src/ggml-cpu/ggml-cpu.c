@@ -3115,14 +3115,16 @@ static void ggml_prof_print(void) {
     for (int i = 0; i < GGML_OP_COUNT; i++) {
         if (g_ggml_prof.op_us[i] < 0) g_ggml_prof.op_us[i] = -g_ggml_prof.op_us[i];
     }
-    fprintf(stderr, "-- by tensor name (top 40) --\n");
-    for (int k = 0; k < 40; k++) {
+    const char * top_env = getenv("GGML_OP_PROFILE_TOP");
+    const int n_top = top_env ? atoi(top_env) : 40;
+    fprintf(stderr, "-- by tensor name (top %d) --\n", n_top);
+    for (int k = 0; k < n_top; k++) {
         int best = -1;
         double best_us = 0.0;
         for (int i = 0; i < g_ggml_prof.n_names; i++) {
             if (g_ggml_prof.names[i].us > best_us) { best_us = g_ggml_prof.names[i].us; best = i; }
         }
-        if (best < 0 || best_us < g_ggml_prof.total_us * 0.002) break;
+        if (best < 0 || (!top_env && best_us < g_ggml_prof.total_us * 0.002)) break;
         fprintf(stderr, "%-40s %12.1f %10lld %7.1f%%\n", g_ggml_prof.names[best].name,
                 g_ggml_prof.names[best].us / 1000.0, (long long) g_ggml_prof.names[best].n,
                 100.0 * best_us / g_ggml_prof.total_us);
