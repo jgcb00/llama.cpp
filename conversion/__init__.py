@@ -72,6 +72,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "Dots3NoteTextForCausalLM": "dots3",
     "DotsOCRForCausalLM": "qwen",
     "DragonForCausalLM": "dragon",
+    "OlalaForCausalLM": "dragon",
     "DreamModel": "dream",
     "Ernie4_5ForCausalLM": "ernie",
     "Ernie4_5_ForCausalLM": "ernie",

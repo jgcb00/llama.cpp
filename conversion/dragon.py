@@ -15,7 +15,7 @@ import gguf
 from . import ModelBase, TextModel, logger
 
 
-@ModelBase.register("DragonForCausalLM")
+@ModelBase.register("DragonForCausalLM", "OlalaForCausalLM")
 class DragonModel(TextModel):
     model_arch = gguf.MODEL_ARCH.DRAGON
 
@@ -79,7 +79,8 @@ class DragonModel(TextModel):
         if isinstance(cfg.get("extra_special_tokens"), list):
             tmp = Path(tempfile.mkdtemp(prefix="dragon_vocab_"))
             # Only copy the small files AutoTokenizer needs.
-            for name in ("tokenizer.json", "vocab.json", "merges.txt", "added_tokens.json", "special_tokens_map.json"):
+            for name in ("tokenizer.json", "vocab.json", "merges.txt", "added_tokens.json", "special_tokens_map.json",
+                         "chat_template.jinja", "chat_template.json"):
                 src = self.dir_model / name
                 if src.exists():
                     shutil.copy(src, tmp / name)
