@@ -101,7 +101,7 @@ static inline void m3_build_operands(
     const int D_v  = DQK > 0 ? DV  : args.D_v;
     const int R    = DQK > 0 ? RR  : args.R;
 
-    const int half    = D_qk/2;
+    const int hf      = D_qk/2;
     const int quarter = D_qk/4;
 
     const int n_kq = (want_qz ? 2 : 1)*R*D_qk;
@@ -118,10 +118,10 @@ static inline void m3_build_operands(
         float out;
         if (d < quarter) {
             const float v0 = src[d       ]*sc*w[d       ] + b[d       ];
-            const float v2 = src[d + half]*sc*w[d + half] + b[d + half];
+            const float v2 = src[d + hf]*sc*w[d + hf] + b[d + hf];
             out = v0*cs[d] - v2*sn[d];
-        } else if (d >= half && d < half + quarter) {
-            const int i = d - half;
+        } else if (d >= hf && d < hf + quarter) {
+            const int i = d - hf;
             const float v0 = src[i]*sc*w[i] + b[i];
             const float v2 = src[d]*sc*w[d] + b[d];
             out = v0*sn[i] + v2*cs[i];
@@ -568,9 +568,9 @@ kernel void kernel_mamba3_mimo_chunk_scan(
     float s = s_in[seq*args.s_in_s + h*SD + i];
 
     for (int n = 0; n < n_chunks; ++n) {
-        const float local = W[(int64_t) n*SD];
+        const float lcl = W[(int64_t) n*SD];
         W[(int64_t) n*SD] = s;
-        s = pa[n]*s + local;
+        s = pa[n]*s + lcl;
     }
 
     s_out[seq*args.s_out_s + h*SD + i] = s;
