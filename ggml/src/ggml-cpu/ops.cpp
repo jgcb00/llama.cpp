@@ -13051,6 +13051,381 @@ void ggml_compute_forward_geodesic(
     }
 }
 
+
+// ggml_compute_forward_dragon_moe
+//
+// Fused Dragon latent-MoE block for small token counts (decode). Four stages
+// separated by three barriers instead of ~14 graph nodes:
+//   A: lat = W_ld x, logits = W_r x, ush = W_us x          (rows split over threads)
+//   B: sel/weights (every thread, redundant); up = W_up[sel] lat; dsh = W_ds relu2(ush)
+//   C: down = W_down[sel] relu2(up)
+//   D: routed = sum_k w_k down_k; out = W_lu routed + dsh
+// Every thread quantizes the f32 operands it needs into its own scratch (no
+// extra barrier); the f32 matmul outputs live in a shared region of the work
+// buffer. The per-row vec_dot is the same one ggml's mul_mat uses, so the
+// numerics match the unfused graph.
+
+struct dragon_moe_dims {
+    int64_t n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k;
+};
+
+static dragon_moe_dims dragon_moe_get_dims(const ggml_tensor * op) {
+    dragon_moe_dims d;
+    d.n_embd   = op->src[0]->ne[0];
+    d.n_tok    = op->src[0]->ne[1];
+    d.n_lat    = op->src[1]->ne[1];
+    d.n_expert = op->src[2]->ne[1];
+    d.n_ff     = op->src[4]->ne[1];
+    d.n_ff_sh  = op->src[7]->ne[1];
+    d.k        = ggml_get_op_params_i32(op, 0);
+    return d;
+}
+
+// padded size of one quantized activation row for weights of type wtype
+static inline size_t dragon_moe_qrow(enum ggml_type wtype, int64_t n) {
+    const enum ggml_type vdt = ggml_get_type_traits_cpu(wtype)->vec_dot_type;
+    return GGML_PAD(ggml_row_size(vdt, n), 64);
+}
+
+struct dragon_moe_ws {
+    // shared (bytes from the start of the work buffer)
+    size_t lat, logits, ush, up, dsh, down, shared;
+    // per-thread (bytes from the start of the thread's scratch)
+    size_t xq_ld, xq_r, xq_sh, latq, upq, ushq, routedq, routed, tmp, sel, wsel, scores, taken, per_thread;
+};
+
+static dragon_moe_ws dragon_moe_layout(const ggml_tensor * op) {
+    const dragon_moe_dims d = dragon_moe_get_dims(op);
+    const int64_t T = d.n_tok, k = d.k;
+    dragon_moe_ws w;
+    size_t off = 0;
+    auto take = [&](size_t bytes) { const size_t o = off; off += GGML_PAD(bytes, 64); return o; };
+    w.lat    = take(T*d.n_lat*sizeof(float));
+    w.logits = take(T*d.n_expert*sizeof(float));
+    w.ush    = take(T*d.n_ff_sh*sizeof(float));
+    w.up     = take(T*k*d.n_ff*sizeof(float));
+    w.dsh    = take(T*d.n_ff_sh*sizeof(float));
+    w.down   = take(T*k*d.n_lat*sizeof(float));
+    w.shared = off;
+    off = 0;
+    w.xq_ld   = take(T*dragon_moe_qrow(op->src[1]->type, d.n_embd));
+    w.xq_r    = take(T*dragon_moe_qrow(op->src[2]->type, d.n_embd));
+    w.xq_sh   = take(T*dragon_moe_qrow(op->src[7]->type, d.n_embd));
+    w.latq    = take(T*dragon_moe_qrow(op->src[4]->type, d.n_lat));
+    w.upq     = take(T*k*dragon_moe_qrow(op->src[5]->type, d.n_ff));
+    w.ushq    = take(T*dragon_moe_qrow(op->src[8]->type, d.n_ff_sh));
+    w.routedq = take(T*dragon_moe_qrow(op->src[6]->type, d.n_lat));
+    w.routed  = take(T*d.n_lat*sizeof(float));
+    w.tmp     = take(std::max(d.n_ff, d.n_ff_sh)*sizeof(float));
+    w.sel     = take(T*k*sizeof(int32_t));
+    w.wsel    = take(T*k*sizeof(float));
+    w.scores  = take(d.n_expert*sizeof(float));
+    w.taken   = take(d.n_expert);
+    w.per_thread = off;
+    return w;
+}
+
+size_t ggml_dragon_moe_work_size(const ggml_tensor * op, int n_threads) {
+    const dragon_moe_ws w = dragon_moe_layout(op);
+    return w.shared + (size_t) n_threads*w.per_thread + 64;
+}
+
+static void dragon_moe_quantize(enum ggml_type wtype, const float * src, void * dst, int64_t n) {
+    const enum ggml_type vdt = ggml_get_type_traits_cpu(wtype)->vec_dot_type;
+    if (vdt == GGML_TYPE_F32) {
+        memcpy(dst, src, n*sizeof(float));
+        return;
+    }
+    ggml_from_float_t from_float = ggml_get_type_traits_cpu(vdt)->from_float;
+    GGML_ASSERT(from_float != nullptr);
+    from_float(src, dst, n);
+}
+
+static inline void dragon_moe_relu2(float * dst, const float * src, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) {
+        const float r = src[i] > 0.0f ? src[i] : 0.0f;
+        dst[i] = r*r;
+    }
+}
+
+static inline float dragon_moe_sigmoid(float x) {
+    return 1.0f/(1.0f + expf(-x));
+}
+
+// scores = sigmoid(logits) + bias; ids of the k largest (desc, ties -> lower
+// index, all-NaN -> in-bounds fallback), same as the graph path.
+static void dragon_moe_select(const float * lt, const float * bd, int64_t n_expert, int64_t k,
+                              int32_t * ids, float * scores, uint8_t * taken) {
+    for (int64_t e = 0; e < n_expert; ++e) {
+        scores[e] = dragon_moe_sigmoid(lt[e]) + bd[e];
+        taken[e]  = 0;
+    }
+    for (int64_t i = 0; i < k; ++i) {
+        int64_t best = -1;
+        float   bv   = -FLT_MAX;
+        for (int64_t e = 0; e < n_expert; ++e) {
+            if (!taken[e] && scores[e] > bv) {
+                bv = scores[e];
+                best = e;
+            }
+        }
+        if (best < 0) {
+            best = i;
+        }
+        taken[best] = 1;
+        ids[i] = (int32_t) best;
+    }
+}
+
+// out[t*out_stride + r] = W[r] . xq[t], r in [r0, r1)
+static void dragon_moe_gemv(const ggml_tensor * W, const char * wbase, int64_t K, int64_t r0, int64_t r1,
+                            const char * xq, size_t xq_stride, int64_t T, float * out, int64_t out_stride) {
+    ggml_vec_dot_t const vec_dot = ggml_get_type_traits_cpu(W->type)->vec_dot;
+    const size_t nb1 = W->nb[1];
+    for (int64_t r = r0; r < r1; ++r) {
+        const char * wrow = wbase + r*nb1;
+        for (int64_t t = 0; t < T; ++t) {
+            vec_dot((int) K, out + t*out_stride + r, 0, wrow, 0, xq + t*xq_stride, 0, 1);
+        }
+    }
+}
+
+static inline void dragon_moe_split(int64_t n, int ith, int nth, int64_t * a, int64_t * b) {
+    *a = n*ith/nth;
+    *b = n*(ith + 1)/nth;
+}
+
+static void ggml_compute_forward_dragon_moe_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x      = dst->src[0];
+    const ggml_tensor * W_ld   = dst->src[1];
+    const ggml_tensor * W_r    = dst->src[2];
+    const ggml_tensor * r_bias = dst->src[3];
+    const ggml_tensor * W_up   = dst->src[4];
+    const ggml_tensor * W_down = dst->src[5];
+    const ggml_tensor * W_lu   = dst->src[6];
+    const ggml_tensor * W_us   = dst->src[7];
+    const ggml_tensor * W_ds   = dst->src[8];
+
+    const dragon_moe_dims d = dragon_moe_get_dims(dst);
+    const int64_t T = d.n_tok, k = d.k;
+    float w_scale;
+    memcpy(&w_scale, (const int32_t *) dst->op_params + 1, sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const dragon_moe_ws ws = dragon_moe_layout(dst);
+    GGML_ASSERT(params->wsize >= ws.shared + (size_t) nth*ws.per_thread);
+    char * shared = (char *) params->wdata;
+    char * mine   = shared + ws.shared + (size_t) ith*ws.per_thread;
+
+    float * lat    = (float *) (shared + ws.lat);
+    float * logits = (float *) (shared + ws.logits);
+    float * ush    = (float *) (shared + ws.ush);
+    float * up     = (float *) (shared + ws.up);
+    float * dsh    = (float *) (shared + ws.dsh);
+    float * down   = (float *) (shared + ws.down);
+
+    char    * xq_ld   = mine + ws.xq_ld;
+    char    * xq_r    = mine + ws.xq_r;
+    char    * xq_sh   = mine + ws.xq_sh;
+    char    * latq    = mine + ws.latq;
+    char    * upq     = mine + ws.upq;
+    char    * ushq    = mine + ws.ushq;
+    char    * routedq = mine + ws.routedq;
+    float   * routed  = (float *)   (mine + ws.routed);
+    float   * tmp     = (float *)   (mine + ws.tmp);
+    int32_t * sel     = (int32_t *) (mine + ws.sel);
+    float   * wsel    = (float *)   (mine + ws.wsel);
+    float   * scores  = (float *)   (mine + ws.scores);
+    uint8_t * taken   = (uint8_t *) (mine + ws.taken);
+
+    const size_t qs_ld = dragon_moe_qrow(W_ld->type,   d.n_embd);
+    const size_t qs_r  = dragon_moe_qrow(W_r->type,    d.n_embd);
+    const size_t qs_sh = dragon_moe_qrow(W_us->type,   d.n_embd);
+    const size_t qs_up = dragon_moe_qrow(W_up->type,   d.n_lat);
+    const size_t qs_dn = dragon_moe_qrow(W_down->type, d.n_ff);
+    const size_t qs_ds = dragon_moe_qrow(W_ds->type,   d.n_ff_sh);
+    const size_t qs_lu = dragon_moe_qrow(W_lu->type,   d.n_lat);
+
+    const float * xd = (const float *) x->data;
+    const float * bd = (const float *) r_bias->data;
+
+    int64_t a, b;
+
+    // ---- stage A: lat, logits, ush from x
+    {
+        const enum ggml_type vdt_ld = ggml_get_type_traits_cpu(W_ld->type)->vec_dot_type;
+        const enum ggml_type vdt_r  = ggml_get_type_traits_cpu(W_r->type)->vec_dot_type;
+        const enum ggml_type vdt_sh = ggml_get_type_traits_cpu(W_us->type)->vec_dot_type;
+        for (int64_t t = 0; t < T; ++t) {
+            dragon_moe_quantize(W_ld->type, xd + t*d.n_embd, xq_ld + t*qs_ld, d.n_embd);
+        }
+        const char * xq_r_use = xq_ld;
+        size_t qs_r_use = qs_ld;
+        if (vdt_r != vdt_ld) {
+            for (int64_t t = 0; t < T; ++t) {
+                dragon_moe_quantize(W_r->type, xd + t*d.n_embd, xq_r + t*qs_r, d.n_embd);
+            }
+            xq_r_use = xq_r;
+            qs_r_use = qs_r;
+        }
+        const char * xq_sh_use = xq_ld;
+        size_t qs_sh_use = qs_ld;
+        if (vdt_sh != vdt_ld) {
+            if (vdt_sh == vdt_r) {
+                xq_sh_use = xq_r_use;
+                qs_sh_use = qs_r_use;
+            } else {
+                for (int64_t t = 0; t < T; ++t) {
+                    dragon_moe_quantize(W_us->type, xd + t*d.n_embd, xq_sh + t*qs_sh, d.n_embd);
+                }
+                xq_sh_use = xq_sh;
+                qs_sh_use = qs_sh;
+            }
+        }
+
+        dragon_moe_split(d.n_lat, ith, nth, &a, &b);
+        dragon_moe_gemv(W_ld, (const char *) W_ld->data, d.n_embd, a, b, xq_ld, qs_ld, T, lat, d.n_lat);
+        dragon_moe_split(d.n_expert, ith, nth, &a, &b);
+        dragon_moe_gemv(W_r, (const char *) W_r->data, d.n_embd, a, b, xq_r_use, qs_r_use, T, logits, d.n_expert);
+        dragon_moe_split(d.n_ff_sh, ith, nth, &a, &b);
+        dragon_moe_gemv(W_us, (const char *) W_us->data, d.n_embd, a, b, xq_sh_use, qs_sh_use, T, ush, d.n_ff_sh);
+    }
+    ggml_barrier(params->threadpool);
+
+    // ---- stage B: selection + weights (redundant per thread), expert up, shared down
+    {
+        for (int64_t t = 0; t < T; ++t) {
+            const float * lt = logits + t*d.n_expert;
+            int32_t * st = sel  + t*k;
+            float   * wt = wsel + t*k;
+            dragon_moe_select(lt, bd, d.n_expert, k, st, scores, taken);
+            float sum = 0.0f;
+            for (int64_t i = 0; i < k; ++i) {
+                wt[i] = dragon_moe_sigmoid(lt[st[i]]);
+                sum += wt[i];
+            }
+            if (sum < 6.103515625e-5f) {
+                sum = 6.103515625e-5f;
+            }
+            for (int64_t i = 0; i < k; ++i) {
+                wt[i] = (wt[i]/sum)*w_scale;
+            }
+            dragon_moe_quantize(W_up->type, lat + t*d.n_lat, latq + t*qs_up, d.n_lat);
+        }
+
+        // expert up rows, flattened over (t, kk, row)
+        {
+            ggml_vec_dot_t const vec_dot = ggml_get_type_traits_cpu(W_up->type)->vec_dot;
+            const int64_t n_rows = T*k*d.n_ff;
+            dragon_moe_split(n_rows, ith, nth, &a, &b);
+            for (int64_t i = a; i < b; ) {
+                const int64_t t  = i/(k*d.n_ff);
+                const int64_t kk = (i/d.n_ff) % k;
+                const int64_t r0 = i % d.n_ff;
+                const int64_t r1 = std::min<int64_t>(d.n_ff, r0 + (b - i));
+                const int32_t e  = sel[t*k + kk];
+                GGML_ASSERT(e >= 0 && e < d.n_expert);
+                const char * wbase = (const char *) W_up->data + (size_t) e*W_up->nb[2];
+                const char * xq    = latq + t*qs_up;
+                float * out = up + (t*k + kk)*d.n_ff;
+                for (int64_t r = r0; r < r1; ++r) {
+                    vec_dot((int) d.n_lat, out + r, 0, wbase + r*W_up->nb[1], 0, xq, 0, 1);
+                }
+                i += r1 - r0;
+            }
+        }
+
+        // shared expert down: relu2 of ush, then W_ds rows
+        dragon_moe_split(d.n_embd, ith, nth, &a, &b);
+        if (a < b) {
+            for (int64_t t = 0; t < T; ++t) {
+                dragon_moe_relu2(tmp, ush + t*d.n_ff_sh, d.n_ff_sh);
+                dragon_moe_quantize(W_ds->type, tmp, ushq + t*qs_ds, d.n_ff_sh);
+            }
+            dragon_moe_gemv(W_ds, (const char *) W_ds->data, d.n_ff_sh, a, b, ushq, qs_ds, T, dsh, d.n_embd);
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    // ---- stage C: expert down rows, flattened over (t, kk, row)
+    {
+        ggml_vec_dot_t const vec_dot = ggml_get_type_traits_cpu(W_down->type)->vec_dot;
+        const int64_t n_rows = T*k*d.n_lat;
+        dragon_moe_split(n_rows, ith, nth, &a, &b);
+        int64_t last_pair = -1;
+        for (int64_t i = a; i < b; ) {
+            const int64_t t  = i/(k*d.n_lat);
+            const int64_t kk = (i/d.n_lat) % k;
+            const int64_t r0 = i % d.n_lat;
+            const int64_t r1 = std::min<int64_t>(d.n_lat, r0 + (b - i));
+            const int64_t pair = t*k + kk;
+            if (pair != last_pair) {
+                dragon_moe_relu2(tmp, up + pair*d.n_ff, d.n_ff);
+                dragon_moe_quantize(W_down->type, tmp, upq + pair*qs_dn, d.n_ff);
+                last_pair = pair;
+            }
+            const int32_t e = sel[pair];
+            const char * wbase = (const char *) W_down->data + (size_t) e*W_down->nb[2];
+            const char * xq    = upq + pair*qs_dn;
+            float * out = down + pair*d.n_lat;
+            for (int64_t r = r0; r < r1; ++r) {
+                vec_dot((int) d.n_ff, out + r, 0, wbase + r*W_down->nb[1], 0, xq, 0, 1);
+            }
+            i += r1 - r0;
+        }
+    }
+    ggml_barrier(params->threadpool);
+
+    // ---- stage D: weighted reduce (redundant per thread), latent up + shared
+    {
+        dragon_moe_split(d.n_embd, ith, nth, &a, &b);
+        if (a < b) {
+            for (int64_t t = 0; t < T; ++t) {
+                const float * et = down + t*k*d.n_lat;
+                const float * wt = wsel + t*k;
+                float * ot = routed + t*d.n_lat;
+                for (int64_t i = 0; i < d.n_lat; ++i) {
+                    ot[i] = et[i]*wt[0];
+                }
+                for (int64_t kk = 1; kk < k; ++kk) {
+                    const float * ei = et + kk*d.n_lat;
+                    const float  wi = wt[kk];
+                    for (int64_t i = 0; i < d.n_lat; ++i) {
+                        ot[i] += ei[i]*wi;
+                    }
+                }
+                dragon_moe_quantize(W_lu->type, ot, routedq + t*qs_lu, d.n_lat);
+            }
+            float * out = (float *) dst->data;
+            dragon_moe_gemv(W_lu, (const char *) W_lu->data, d.n_lat, a, b, routedq, qs_lu, T, out, d.n_embd);
+            for (int64_t t = 0; t < T; ++t) {
+                for (int64_t r = a; r < b; ++r) {
+                    out[t*d.n_embd + r] += dsh[t*d.n_embd + r];
+                }
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_dragon_moe(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_dragon_moe_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(

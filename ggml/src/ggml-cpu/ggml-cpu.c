@@ -2113,6 +2113,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_geodesic(params, tensor);
             } break;
+        case GGML_OP_DRAGON_MOE:
+            {
+                ggml_compute_forward_dragon_moe(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2298,6 +2302,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_POST:
         case GGML_OP_MAMBA3_MIMO:
         case GGML_OP_GEODESIC:
+        case GGML_OP_DRAGON_MOE:
             {
                 n_tasks = n_threads;
             } break;
@@ -3036,6 +3041,10 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_MAMBA3_MIMO:
                     {
                         cur = ggml_mamba3_mimo_work_floats(node, n_tasks) * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_DRAGON_MOE:
+                    {
+                        cur = ggml_dragon_moe_work_size(node, n_tasks);
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {
