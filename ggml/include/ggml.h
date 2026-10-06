@@ -587,6 +587,7 @@ extern "C" {
         GGML_OP_DSV4_HC_POST,
         GGML_OP_MAMBA3_MIMO,
         GGML_OP_GEODESIC,
+        GGML_OP_DRAGON_MOE,
 
         GGML_OP_UNARY,
 
@@ -2794,6 +2795,27 @@ extern "C" {
             struct ggml_tensor  * scale,
             struct ggml_tensor  * bias,
             float                 inv_depth);
+
+
+    // Dragon (Olala) latent MoE block, fused (CPU backend). x: (n_embd, T) f32.
+    //   lat    = w_lat_down^T x                                        (n_lat, T)
+    //   logits = w_router^T x (f32); sel = top-k of sigmoid(logits) + router_bias
+    //   w_k    = sigmoid(logits[sel_k]) / max(sum_k sigmoid(logits[sel_k]), 2^-14) * w_scale
+    //   routed = w_lat_up^T sum_k w_k * (w_down_exps[sel_k]^T relu(w_up_exps[sel_k]^T lat)^2)
+    //   out    = routed + w_down_sh^T relu(w_up_sh^T x)^2                 (n_embd, T)
+    GGML_API struct ggml_tensor * ggml_dragon_moe(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_lat_down,   // (n_embd, n_lat)
+            struct ggml_tensor  * w_router,     // (n_embd, n_expert) f32
+            struct ggml_tensor  * router_bias,  // (n_expert) f32
+            struct ggml_tensor  * w_up_exps,    // (n_lat, n_ff, n_expert)
+            struct ggml_tensor  * w_down_exps,  // (n_ff, n_lat, n_expert)
+            struct ggml_tensor  * w_lat_up,     // (n_lat, n_embd)
+            struct ggml_tensor  * w_up_sh,      // (n_embd, n_ff_sh)
+            struct ggml_tensor  * w_down_sh,    // (n_ff_sh, n_embd)
+            int                   n_expert_used,
+            float                 w_scale);
 
     // custom operators
 

@@ -1345,6 +1345,25 @@ static void dragon_m_mega_reduce_kernel(ggml_tensor * dst, int ith, int nth, voi
 // norm_w + w_scale for Dragon's config. The ggml chain is 8 selection nodes +
 // mul + 5 adds per layer; fused it is 3 custom nodes around the mul_mat_ids.
 
+
+// Fused CPU MoE op (GGML_OP_DRAGON_MOE) for short ubatches (decode): one node
+// instead of ~14. Not usable when a weight sits in a repacked CPU buffer
+// (interleaved layout the op cannot read): run with --no-repack on q4_K files,
+// which is faster on x86 anyway. DRAGON_FUSED_MOE_MAX_T sets the token limit
+// (default 8, 0 disables).
+static bool dragon_tensor_repacked(const ggml_tensor * w) {
+    return w != nullptr && w->buffer != nullptr &&
+        std::strcmp(ggml_backend_buffer_name(w->buffer), "CPU_REPACK") == 0;
+}
+
+static int64_t dragon_fused_moe_max_tokens() {
+    static const int64_t v = [] {
+        const char * e = std::getenv("DRAGON_FUSED_MOE_MAX_T");
+        return e ? std::max<int64_t>(0, std::atoll(e)) : (int64_t) 8;
+    }();
+    return v;
+}
+
 struct dragon_moe_userdata {
     float w_scale;
 };
@@ -3621,96 +3640,121 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
         // ----- MoE + shared expert -----
         residual = cur;
 
-        // n_embd → moe_latent_size bottleneck before the routed experts.
-        ggml_tensor * inp_latent = ggml_mul_mat(ctx0, model.layers[il].ffn_latent_down, cur);
-        cb(inp_latent, "moe_inp_latent", il);
-
-        // Sigmoid router with per-expert bias (DeepSeek-V3 style). HF does the
-        // routing matmul, sigmoid, bias-add, and top-k strictly in fp32; even a
-        // single bf16 cast here can flip which experts get selected. Force fp32
-        // on the input so the matmul output is fp32 and build_moe_ffn's
-        // downstream sigmoid + bias + top-k operate on fp32 values.
-        ggml_tensor * cur_f32 = ggml_cont(ctx0, ggml_cast(ctx0, cur, GGML_TYPE_F32));
-        ggml_tensor * router_logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur_f32);
-        cb(router_logits, "moe_router_logits", il);
-        // Optional dump of the top-k selection for HF↔llama.cpp router comparison.
-        if (dragon_dump_dir()) {
-            ggml_tensor * probs    = ggml_sigmoid(ctx0, router_logits);
-            ggml_tensor * probs_b  = ggml_add(ctx0, probs, model.layers[il].ffn_exp_probs_b);
-            ggml_tensor * topk_idx = ggml_argsort_top_k(ctx0, probs_b, n_expert_used);
-            ggml_tensor * topk_f32 = ggml_cast(ctx0, topk_idx, GGML_TYPE_F32);
-            topk_f32 = dragon_maybe_dump(ctx0, topk_f32, "moe_topk_blk%02d.bin", il);
-            // Anchor in graph so the dump op isn't optimised away.
-            cur = ggml_add(ctx0, cur, ggml_scale(ctx0, ggml_sum_rows(ctx0, topk_f32), 0.0f));
-        }
-
         static const bool force_no_fused_moe = std::getenv("DRAGON_NO_FUSED_MOE") != nullptr;
-        ggml_tensor * routed = nullptr;
-        if (force_no_fused_moe || !dragon_layer_cpu) {
-            routed = build_moe_ffn(
-                    inp_latent,
+        ggml_tensor * y_mlp = nullptr;
+        const bool use_moe_op = dragon_layer_cpu && !force_no_fused_moe && !dragon_dump_dir() &&
+            cur->ne[1] <= dragon_fused_moe_max_tokens() &&
+            !dragon_tensor_repacked(model.layers[il].ffn_latent_down) &&
+            !dragon_tensor_repacked(model.layers[il].ffn_up_exps) &&
+            !dragon_tensor_repacked(model.layers[il].ffn_down_exps) &&
+            !dragon_tensor_repacked(model.layers[il].ffn_latent_up) &&
+            !dragon_tensor_repacked(model.layers[il].ffn_up_shexp) &&
+            !dragon_tensor_repacked(model.layers[il].ffn_down_shexp);
+        if (use_moe_op) {
+            // Whole MoE block (latent down, router, top-k, experts, latent up,
+            // shared expert, sum) as one CPU op: 3 barriers instead of ~14 nodes.
+            y_mlp = ggml_dragon_moe(ctx0, cur,
+                    model.layers[il].ffn_latent_down,
                     model.layers[il].ffn_gate_inp,
-                    model.layers[il].ffn_up_exps,
-                    nullptr, // no gate (ungated ReLU²)
-                    model.layers[il].ffn_down_exps,
                     model.layers[il].ffn_exp_probs_b,
-                    n_expert, n_expert_used,
-                    LLM_FFN_RELU_SQR, /*norm_w=*/true, hparams.expert_weights_scale,
-                    (llama_expert_gating_func_type) hparams.expert_gating_func,
-                    il, router_logits);
+                    model.layers[il].ffn_up_exps,
+                    model.layers[il].ffn_down_exps,
+                    model.layers[il].ffn_latent_up,
+                    model.layers[il].ffn_up_shexp,
+                    model.layers[il].ffn_down_shexp,
+                    (int) n_expert_used, hparams.expert_weights_scale);
+            cb(y_mlp, "mlp_out", il);
         } else {
-            // Fused selection/weights/reduce (3 custom nodes instead of 14
-            // small ggml nodes around the two mul_mat_ids).
-            const int64_t n_lat = inp_latent->ne[0];
-            const int64_t L_moe = inp_latent->ne[1];
-            ggml_tensor * targs[2] = { router_logits, model.layers[il].ffn_exp_probs_b };
-            ggml_tensor * sel = ggml_custom_4d(ctx0, GGML_TYPE_I32,
-                    n_expert_used, L_moe, 1, 1, targs, 2,
-                    dragon_moe_topk_kernel, GGML_N_TASKS_MAX, nullptr);
-            ggml_set_name(sel, "moe_topk_fused");
-            auto * mud = (dragon_moe_userdata *) std::malloc(sizeof(dragon_moe_userdata));
-            mud->w_scale = hparams.expert_weights_scale;
-            ggml_tensor * w_sel = ggml_custom_4d(ctx0, GGML_TYPE_F32,
-                    n_expert_used, L_moe, 1, 1, targs, 2,
-                    dragon_moe_weights_kernel, GGML_N_TASKS_MAX, mud);
-            ggml_set_name(w_sel, "moe_weights_fused");
+            // n_embd → moe_latent_size bottleneck before the routed experts.
+            ggml_tensor * inp_latent = ggml_mul_mat(ctx0, model.layers[il].ffn_latent_down, cur);
+            cb(inp_latent, "moe_inp_latent", il);
 
-            ggml_tensor * lat3 = ggml_reshape_3d(ctx0, inp_latent, n_lat, 1, L_moe);
-            ggml_tensor * up = ggml_mul_mat_id(ctx0, model.layers[il].ffn_up_exps, lat3, sel);
-            ggml_set_name(up, "ffn_moe_up");
-            up = ggml_map_custom1(ctx0, up, dragon_relu_sqr_kernel, GGML_N_TASKS_MAX, nullptr);
-            ggml_tensor * down = ggml_mul_mat_id(ctx0, model.layers[il].ffn_down_exps, up, sel);
-            ggml_set_name(down, "ffn_moe_down");
-            ggml_tensor * rargs[2] = { down, w_sel };
-            routed = ggml_custom_4d(ctx0, GGML_TYPE_F32,
-                    n_lat, L_moe, 1, 1, rargs, 2,
-                    dragon_moe_reduce_kernel, GGML_N_TASKS_MAX, nullptr);
-            ggml_set_name(routed, "moe_reduce_fused");
+            // Sigmoid router with per-expert bias (DeepSeek-V3 style). HF does the
+            // routing matmul, sigmoid, bias-add, and top-k strictly in fp32; even a
+            // single bf16 cast here can flip which experts get selected. Force fp32
+            // on the input so the matmul output is fp32 and build_moe_ffn's
+            // downstream sigmoid + bias + top-k operate on fp32 values.
+            ggml_tensor * cur_f32 = ggml_cont(ctx0, ggml_cast(ctx0, cur, GGML_TYPE_F32));
+            ggml_tensor * router_logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur_f32);
+            cb(router_logits, "moe_router_logits", il);
+            // Optional dump of the top-k selection for HF↔llama.cpp router comparison.
+            if (dragon_dump_dir()) {
+                ggml_tensor * probs    = ggml_sigmoid(ctx0, router_logits);
+                ggml_tensor * probs_b  = ggml_add(ctx0, probs, model.layers[il].ffn_exp_probs_b);
+                ggml_tensor * topk_idx = ggml_argsort_top_k(ctx0, probs_b, n_expert_used);
+                ggml_tensor * topk_f32 = ggml_cast(ctx0, topk_idx, GGML_TYPE_F32);
+                topk_f32 = dragon_maybe_dump(ctx0, topk_f32, "moe_topk_blk%02d.bin", il);
+                // Anchor in graph so the dump op isn't optimised away.
+                cur = ggml_add(ctx0, cur, ggml_scale(ctx0, ggml_sum_rows(ctx0, topk_f32), 0.0f));
+            }
+
+                ggml_tensor * routed = nullptr;
+            if (force_no_fused_moe || !dragon_layer_cpu) {
+                routed = build_moe_ffn(
+                        inp_latent,
+                        model.layers[il].ffn_gate_inp,
+                        model.layers[il].ffn_up_exps,
+                        nullptr, // no gate (ungated ReLU²)
+                        model.layers[il].ffn_down_exps,
+                        model.layers[il].ffn_exp_probs_b,
+                        n_expert, n_expert_used,
+                        LLM_FFN_RELU_SQR, /*norm_w=*/true, hparams.expert_weights_scale,
+                        (llama_expert_gating_func_type) hparams.expert_gating_func,
+                        il, router_logits);
+            } else {
+                // Fused selection/weights/reduce (3 custom nodes instead of 14
+                // small ggml nodes around the two mul_mat_ids).
+                const int64_t n_lat = inp_latent->ne[0];
+                const int64_t L_moe = inp_latent->ne[1];
+                ggml_tensor * targs[2] = { router_logits, model.layers[il].ffn_exp_probs_b };
+                ggml_tensor * sel = ggml_custom_4d(ctx0, GGML_TYPE_I32,
+                        n_expert_used, L_moe, 1, 1, targs, 2,
+                        dragon_moe_topk_kernel, GGML_N_TASKS_MAX, nullptr);
+                ggml_set_name(sel, "moe_topk_fused");
+                auto * mud = (dragon_moe_userdata *) std::malloc(sizeof(dragon_moe_userdata));
+                mud->w_scale = hparams.expert_weights_scale;
+                ggml_tensor * w_sel = ggml_custom_4d(ctx0, GGML_TYPE_F32,
+                        n_expert_used, L_moe, 1, 1, targs, 2,
+                        dragon_moe_weights_kernel, GGML_N_TASKS_MAX, mud);
+                ggml_set_name(w_sel, "moe_weights_fused");
+
+                ggml_tensor * lat3 = ggml_reshape_3d(ctx0, inp_latent, n_lat, 1, L_moe);
+                ggml_tensor * up = ggml_mul_mat_id(ctx0, model.layers[il].ffn_up_exps, lat3, sel);
+                ggml_set_name(up, "ffn_moe_up");
+                up = ggml_map_custom1(ctx0, up, dragon_relu_sqr_kernel, GGML_N_TASKS_MAX, nullptr);
+                ggml_tensor * down = ggml_mul_mat_id(ctx0, model.layers[il].ffn_down_exps, up, sel);
+                ggml_set_name(down, "ffn_moe_down");
+                ggml_tensor * rargs[2] = { down, w_sel };
+                routed = ggml_custom_4d(ctx0, GGML_TYPE_F32,
+                        n_lat, L_moe, 1, 1, rargs, 2,
+                        dragon_moe_reduce_kernel, GGML_N_TASKS_MAX, nullptr);
+                ggml_set_name(routed, "moe_reduce_fused");
+            }
+            cb(routed, "moe_routed_pre_up", il);
+
+            // moe_latent_size → n_embd back up.
+            routed = ggml_mul_mat(ctx0, model.layers[il].ffn_latent_up, routed);
+            cb(routed, "moe_routed", il);
+
+            // Dense shared expert: n_embd → ff_shexp → ReLU² → n_embd, no gate.
+            ggml_tensor * shared = nullptr;
+            if (dragon_layer_cpu && !force_no_fused_moe) {
+                shared = ggml_mul_mat(ctx0, model.layers[il].ffn_up_shexp, cur);
+                shared = ggml_map_custom1(ctx0, shared, dragon_relu_sqr_kernel, GGML_N_TASKS_MAX, nullptr);
+                shared = ggml_mul_mat(ctx0, model.layers[il].ffn_down_shexp, shared);
+            } else {
+                shared = build_ffn(cur,
+                    model.layers[il].ffn_up_shexp,   nullptr, nullptr,
+                    nullptr,                          nullptr, nullptr,
+                    model.layers[il].ffn_down_shexp, nullptr, nullptr,
+                    nullptr,
+                    LLM_FFN_RELU_SQR, LLM_FFN_PAR, il);
+            }
+            cb(shared, "moe_shared", il);
+
+            y_mlp = ggml_add(ctx0, routed, shared);
+            cb(y_mlp, "mlp_out", il);
         }
-        cb(routed, "moe_routed_pre_up", il);
-
-        // moe_latent_size → n_embd back up.
-        routed = ggml_mul_mat(ctx0, model.layers[il].ffn_latent_up, routed);
-        cb(routed, "moe_routed", il);
-
-        // Dense shared expert: n_embd → ff_shexp → ReLU² → n_embd, no gate.
-        ggml_tensor * shared = nullptr;
-        if (dragon_layer_cpu && !force_no_fused_moe) {
-            shared = ggml_mul_mat(ctx0, model.layers[il].ffn_up_shexp, cur);
-            shared = ggml_map_custom1(ctx0, shared, dragon_relu_sqr_kernel, GGML_N_TASKS_MAX, nullptr);
-            shared = ggml_mul_mat(ctx0, model.layers[il].ffn_down_shexp, shared);
-        } else {
-            shared = build_ffn(cur,
-                model.layers[il].ffn_up_shexp,   nullptr, nullptr,
-                nullptr,                          nullptr, nullptr,
-                model.layers[il].ffn_down_shexp, nullptr, nullptr,
-                nullptr,
-                LLM_FFN_RELU_SQR, LLM_FFN_PAR, il);
-        }
-        cb(shared, "moe_shared", il);
-
-        ggml_tensor * y_mlp = ggml_add(ctx0, routed, shared);
-        cb(y_mlp, "mlp_out", il);
 
         // ----- Geodesic-residual #2 -----
         cur = build_dragon_geodesic(ctx0, residual, y_mlp,

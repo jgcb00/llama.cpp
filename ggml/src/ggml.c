@@ -1086,6 +1086,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_POST",
     "MAMBA3_MIMO",
     "GEODESIC",
+    "DRAGON_MOE",
 
     "UNARY",
 
@@ -1103,7 +1104,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1203,6 +1204,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_post(x, residual, post, comb)",
     "mamba3_mimo(pdyn, pstat, ..., s)",
     "geodesic(x, g)",
+    "dragon_moe(x, ...)",
 
     "unary(x)",
 
@@ -1220,7 +1222,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6748,6 +6750,61 @@ struct ggml_tensor * ggml_geodesic(
     result->src[1] = g;
     result->src[2] = scale;
     result->src[3] = bias;
+
+    return result;
+}
+
+
+// ggml_dragon_moe
+
+struct ggml_tensor * ggml_dragon_moe(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w_lat_down,
+        struct ggml_tensor  * w_router,
+        struct ggml_tensor  * router_bias,
+        struct ggml_tensor  * w_up_exps,
+        struct ggml_tensor  * w_down_exps,
+        struct ggml_tensor  * w_lat_up,
+        struct ggml_tensor  * w_up_sh,
+        struct ggml_tensor  * w_down_sh,
+        int                   n_expert_used,
+        float                 w_scale) {
+    struct ggml_tensor * srcs[9] = { x, w_lat_down, w_router, router_bias, w_up_exps, w_down_exps, w_lat_up, w_up_sh, w_down_sh };
+    for (int i = 0; i < 9; ++i) {
+        GGML_ASSERT(srcs[i] != NULL);
+        GGML_ASSERT(ggml_is_contiguous(srcs[i]));
+    }
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w_router->type == GGML_TYPE_F32 && router_bias->type == GGML_TYPE_F32);
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t n_tok    = x->ne[1];
+    const int64_t n_lat    = w_lat_down->ne[1];
+    const int64_t n_expert = w_router->ne[1];
+    const int64_t n_ff     = w_up_exps->ne[1];
+    const int64_t n_ff_sh  = w_up_sh->ne[1];
+
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(w_lat_down->ne[0] == n_embd);
+    GGML_ASSERT(w_router->ne[0] == n_embd && router_bias->ne[0] == n_expert);
+    GGML_ASSERT(w_up_exps->ne[0] == n_lat && w_up_exps->ne[2] == n_expert);
+    GGML_ASSERT(w_down_exps->ne[0] == n_ff && w_down_exps->ne[1] == n_lat && w_down_exps->ne[2] == n_expert);
+    GGML_ASSERT(w_lat_up->ne[0] == n_lat && w_lat_up->ne[1] == n_embd);
+    GGML_ASSERT(w_up_sh->ne[0] == n_embd);
+    GGML_ASSERT(w_down_sh->ne[0] == n_ff_sh && w_down_sh->ne[1] == n_embd);
+    GGML_ASSERT(n_expert_used >= 1 && n_expert_used <= n_expert);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+
+    int32_t params[2];
+    params[0] = n_expert_used;
+    memcpy(&params[1], &w_scale, sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op = GGML_OP_DRAGON_MOE;
+    for (int i = 0; i < 9; ++i) {
+        result->src[i] = srcs[i];
+    }
 
     return result;
 }
