@@ -12715,7 +12715,205 @@ static void m3_step_dispatch(
     }
 }
 
-size_t ggml_mamba3_mimo_work_floats(const ggml_tensor * op, int n_threads) {
+// Prefill path (T >= M3_PREFILL_T tokens per sequence): the state is swept
+// d-major (U[d][p], p contiguous) one token at a time with the rank-R
+// operands k/q broadcast and v/accumulators held in registers, so the
+// output needs no horizontal reductions. The trapezoid term is folded into
+// the state with the "shifted gamma" identity of the chunked reference:
+//   U_t = S_t + delta_t kv_t,  delta_t = (1 - trap_{t+1}) dt_{t+1}  (0 on the last token)
+//   U_t = alpha_t U_{t-1} + (gamma_t + delta_t) kv_t
+//   y_t = q_t^T S_t = q_t^T U_t - delta_t sum_r' v_r' (k_r' . q_r)
+// 10 FMA-port ops per state element and token instead of 13, and no
+// kv_prev recomputation. S is transposed into the thread's scratch at the
+// start of the batch and back at the end.
+#define M3_PREFILL_T 4
+
+template <int R, int NVB>
+static void m3_prefill_token(
+        float * GGML_RESTRICT U, const float * k, const float * q, const float * v, float * o,
+        float alpha, float c, int64_t D_qk, int64_t D_v) {
+#if defined(M3_SIMD)
+    if (D_v % (NVB*GGML_F32_EPR) == 0) {
+        const GGML_F32_VEC av = GGML_F32_VEC_SET1(alpha);
+        const GGML_F32_VEC cv = GGML_F32_VEC_SET1(c);
+        for (int64_t p0 = 0; p0 < D_v; p0 += NVB*GGML_F32_EPR) {
+            GGML_F32_VEC vb[R][NVB];
+            GGML_F32_VEC acc[R][NVB];
+            for (int r = 0; r < R; ++r) {
+                for (int j = 0; j < NVB; ++j) {
+                    vb[r][j]  = GGML_F32_VEC_LOAD(v + r*D_v + p0 + j*GGML_F32_EPR);
+                    acc[r][j] = GGML_F32_VEC_ZERO;
+                }
+            }
+            for (int64_t d = 0; d < D_qk; ++d) {
+                float * Ud = U + d*D_v + p0;
+                GGML_F32_VEC kb[R], qb[R];
+                for (int r = 0; r < R; ++r) {
+                    kb[r] = GGML_F32_VEC_SET1(k[r*D_qk + d]);
+                    qb[r] = GGML_F32_VEC_SET1(q[r*D_qk + d]);
+                }
+                for (int j = 0; j < NVB; ++j) {
+                    GGML_F32_VEC s  = GGML_F32_VEC_LOAD(Ud + j*GGML_F32_EPR);
+                    GGML_F32_VEC kv = GGML_F32_VEC_MUL(kb[0], vb[0][j]);
+                    for (int r = 1; r < R; ++r) {
+                        kv = GGML_F32_VEC_FMA(kv, kb[r], vb[r][j]);
+                    }
+                    s = GGML_F32_VEC_FMA(GGML_F32_VEC_MUL(av, s), cv, kv);
+                    GGML_F32_VEC_STORE(Ud + j*GGML_F32_EPR, s);
+                    for (int r = 0; r < R; ++r) {
+                        acc[r][j] = GGML_F32_VEC_FMA(acc[r][j], qb[r], s);
+                    }
+                }
+            }
+            for (int r = 0; r < R; ++r) {
+                for (int j = 0; j < NVB; ++j) {
+                    GGML_F32_VEC_STORE(o + r*D_v + p0 + j*GGML_F32_EPR, acc[r][j]);
+                }
+            }
+        }
+        return;
+    }
+#endif
+    for (int r = 0; r < R; ++r) {
+        for (int64_t p = 0; p < D_v; ++p) {
+            o[r*D_v + p] = 0.0f;
+        }
+    }
+    for (int64_t d = 0; d < D_qk; ++d) {
+        float * Ud = U + d*D_v;
+        for (int64_t p = 0; p < D_v; ++p) {
+            float kv = 0.0f;
+            for (int r = 0; r < R; ++r) {
+                kv += k[r*D_qk + d]*v[r*D_v + p];
+            }
+            const float sn = alpha*Ud[p] + c*kv;
+            Ud[p] = sn;
+            for (int r = 0; r < R; ++r) {
+                o[r*D_v + p] += q[r*D_qk + d]*sn;
+            }
+        }
+    }
+}
+
+static void m3_prefill_token_dispatch(
+        float * U, const float * k, const float * q, const float * v, float * o,
+        float alpha, float c, int64_t R, int64_t D_qk, int64_t D_v) {
+#if defined(M3_SIMD) && GGML_F32_EPR >= 16
+    constexpr int NVB = 2;
+#else
+    constexpr int NVB = 1;
+#endif
+    switch (R) {
+        case 1: m3_prefill_token<1, NVB>(U, k, q, v, o, alpha, c, D_qk, D_v); break;
+        case 2: m3_prefill_token<2, NVB>(U, k, q, v, o, alpha, c, D_qk, D_v); break;
+        case 4: m3_prefill_token<4, NVB>(U, k, q, v, o, alpha, c, D_qk, D_v); break;
+        case 8: m3_prefill_token<8, NVB>(U, k, q, v, o, alpha, c, D_qk, D_v); break;
+        default: GGML_ABORT("mamba3_mimo: unsupported MIMO rank %d", (int) R);
+    }
+}
+
+
+// y = sum_r w_r * (o_r + D v_r - delta sum_r' v_r' G[r'][r]),  G[r'][r] = k_r' . q_r
+static void m3_prefill_epilogue(
+        float * yr, const float * o, const float * k, const float * q, const float * v, const float * w,
+        float * G, float D_h, float delta, int64_t R, int64_t D_qk, int64_t D_v) {
+#if defined(M3_SIMD)
+    if (D_qk % GGML_F32_EPR == 0 && D_v % GGML_F32_EPR == 0) {
+        if (delta != 0.0f && R <= 8) {
+            GGML_F32_VEC acc[8][8];
+            for (int64_t r2 = 0; r2 < R; ++r2) {
+                for (int64_t r = 0; r < R; ++r) {
+                    acc[r2][r] = GGML_F32_VEC_ZERO;
+                }
+            }
+            for (int64_t d = 0; d < D_qk; d += GGML_F32_EPR) {
+                GGML_F32_VEC kv[8], qv[8];
+                for (int64_t r = 0; r < R; ++r) {
+                    kv[r] = GGML_F32_VEC_LOAD(k + r*D_qk + d);
+                    qv[r] = GGML_F32_VEC_LOAD(q + r*D_qk + d);
+                }
+                for (int64_t r2 = 0; r2 < R; ++r2) {
+                    for (int64_t r = 0; r < R; ++r) {
+                        acc[r2][r] = GGML_F32_VEC_FMA(acc[r2][r], kv[r2], qv[r]);
+                    }
+                }
+            }
+            for (int64_t r2 = 0; r2 < R; ++r2) {
+                for (int64_t r = 0; r < R; ++r) {
+                    G[r2*R + r] = m3_hsum(acc[r2][r]);
+                }
+            }
+        } else if (delta != 0.0f) {
+            for (int64_t r2 = 0; r2 < R; ++r2) {
+                for (int64_t r = 0; r < R; ++r) {
+                    GGML_F32_VEC acc = GGML_F32_VEC_ZERO;
+                    for (int64_t d = 0; d < D_qk; d += GGML_F32_EPR) {
+                        acc = GGML_F32_VEC_FMA(acc, GGML_F32_VEC_LOAD(k + r2*D_qk + d), GGML_F32_VEC_LOAD(q + r*D_qk + d));
+                    }
+                    G[r2*R + r] = m3_hsum(acc);
+                }
+            }
+        }
+        const GGML_F32_VEC Dv = GGML_F32_VEC_SET1(D_h);
+        const GGML_F32_VEC nd = GGML_F32_VEC_SET1(-delta);
+        for (int64_t p = 0; p < D_v; p += GGML_F32_EPR) {
+            GGML_F32_VEC y = GGML_F32_VEC_ZERO;
+            for (int64_t r = 0; r < R; ++r) {
+                GGML_F32_VEC t = GGML_F32_VEC_FMA(GGML_F32_VEC_LOAD(o + r*D_v + p), Dv, GGML_F32_VEC_LOAD(v + r*D_v + p));
+                if (delta != 0.0f) {
+                    GGML_F32_VEC corr = GGML_F32_VEC_ZERO;
+                    for (int64_t r2 = 0; r2 < R; ++r2) {
+                        corr = GGML_F32_VEC_FMA(corr, GGML_F32_VEC_LOAD(v + r2*D_v + p), GGML_F32_VEC_SET1(G[r2*R + r]));
+                    }
+                    t = GGML_F32_VEC_FMA(t, nd, corr);
+                }
+                y = GGML_F32_VEC_FMA(y, GGML_F32_VEC_LOAD(w + r*D_v + p), t);
+            }
+            GGML_F32_VEC_STORE(yr + p, y);
+        }
+        return;
+    }
+#endif
+    if (delta != 0.0f) {
+        for (int64_t r2 = 0; r2 < R; ++r2) {
+            for (int64_t r = 0; r < R; ++r) {
+                float g = 0.0f;
+                for (int64_t d = 0; d < D_qk; ++d) {
+                    g += k[r2*D_qk + d]*q[r*D_qk + d];
+                }
+                G[r2*R + r] = g;
+            }
+        }
+    }
+    for (int64_t p = 0; p < D_v; ++p) {
+        float y = 0.0f;
+        for (int64_t r = 0; r < R; ++r) {
+            float corr = 0.0f;
+            if (delta != 0.0f) {
+                for (int64_t r2 = 0; r2 < R; ++r2) {
+                    corr += v[r2*D_v + p]*G[r2*R + r];
+                }
+            }
+            y += w[r*D_v + p]*(o[r*D_v + p] + D_h*v[r*D_v + p] - delta*corr);
+        }
+        yr[p] = y;
+    }
+}
+
+static bool m3_legacy_path(void) {
+    static const bool legacy = getenv("GGML_M3_LEGACY") != nullptr && atoi(getenv("GGML_M3_LEGACY")) != 0;
+    return legacy;
+}
+
+// work buffer: [shared per-token prep (n_tok x (2R D_qk + n_ang)) | per-thread scratch]
+static size_t m3_shared_floats(const ggml_tensor * op) {
+    const int64_t D_qk  = op->src[2]->ne[0];
+    const int64_t R     = op->src[4]->ne[1];
+    const int64_t n_tok = op->src[0]->ne[1];
+    return (size_t) n_tok*(2*R*D_qk + D_qk/4) + CACHE_LINE_SIZE_F32;
+}
+
+static size_t m3_thread_floats(const ggml_tensor * op, int n_threads) {
     const int64_t D_qk  = op->src[2]->ne[0];
     const int64_t R     = op->src[4]->ne[1];
     const int64_t H     = op->src[4]->ne[2];
@@ -12725,8 +12923,13 @@ size_t ggml_mamba3_mimo_work_floats(const ggml_tensor * op, int n_threads) {
     const int64_t n_seqs = inplace ? op->src[8]->ne[0] : op->src[7]->ne[1];
     const int64_t per_unit = D_v*D_qk + R*D_qk + R*D_v + n_ang;
     const int64_t units = (H + n_threads - 1)/n_threads;
-    const int64_t scratch = M3_TB*(2*R*D_qk + 2*R*D_v + 2*R*D_qk + n_ang) + 2*n_ang + D_v;
+    const int64_t scratch = M3_TB*(2*R*D_qk + 2*R*D_v + 2*R*D_qk + n_ang) + 2*n_ang + D_v
+                          + D_qk*D_v + R*D_v + R*R;   // U (d-major state), o, G
     return (size_t) (scratch + (inplace ? n_seqs*units*per_unit : 0) + CACHE_LINE_SIZE_F32);
+}
+
+size_t ggml_mamba3_mimo_work_size(const ggml_tensor * op, int n_threads) {
+    return (m3_shared_floats(op) + (size_t) n_threads*m3_thread_floats(op, n_threads))*sizeof(float);
 }
 
 static void ggml_compute_forward_mamba3_mimo_f32(
@@ -12773,16 +12976,17 @@ static void ggml_compute_forward_mamba3_mimo_f32(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    const bool prefill = T >= M3_PREFILL_T && !m3_legacy_path();
+
     // contiguous head ranges per thread
     const int64_t per_th  = (H + nth - 1)/nth;
     const int64_t h_begin = std::min<int64_t>(ith*per_th, H);
     const int64_t h_end   = std::min<int64_t>(h_begin + per_th, H);
-    if (h_begin >= h_end) {
-        return;
-    }
-    const int64_t my_U = h_end - h_begin;
+    const int64_t my_U    = h_end - h_begin;
 
-    float * wbuf = (float *) params->wdata + ith*ggml_mamba3_mimo_work_floats(dst, nth);
+    float * shared = (float *) params->wdata;                     // (n_tok, 2R D_qk + n_ang): [bcn | tanp]
+    const int64_t prep_stride = 2*R*D_qk + n_ang;
+    float * wbuf = shared + m3_shared_floats(dst) + ith*m3_thread_floats(dst, nth);
     float * krt  = wbuf;                       // (TB, R, D_qk)
     float * qrt  = krt + M3_TB*R*D_qk;         // (TB, R, D_qk)
     float * vlt  = qrt + M3_TB*R*D_qk;         // (TB, R, D_v)
@@ -12792,7 +12996,44 @@ static void ggml_compute_forward_mamba3_mimo_f32(
     float * cs   = tanp + M3_TB*n_ang;
     float * ss   = cs + n_ang;
     float * ztmp = ss + n_ang;                 // (D_v)
-    float * snap = ztmp + D_v;                 // (n_seqs, my_U, per_unit), in-place mode
+    float * Ubuf = ztmp + D_v;                 // (D_qk, D_v) d-major state, prefill path
+    float * obuf = Ubuf + D_qk*D_v;            // (R, D_v)
+    float * Gbuf = obuf + R*D_v;               // (R, R)
+    float * snap = Gbuf + R*R;                 // (n_seqs, my_U, per_unit), in-place mode
+
+    // head-independent per-token prep: tanh(ang_raw)*pi, rms-normed B/C * weight
+    auto prep_token = [&](int64_t tok, float * bc_out, float * tan_out) {
+        const float * pd = (const float *) ((const char *) pdyn->data + tok*pdyn->nb[1]);
+        for (int64_t i = 0; i < n_ang; ++i) {
+            tan_out[i] = tanhf(pd[2*R*D_qk + i])*(float) M_PI;
+        }
+        for (int64_t g = 0; g < 2*R; ++g) {
+            const float * src = pd + g*D_qk;
+            const float * w   = norms_d + (g < R ? 0 : D_qk);
+            float * out = bc_out + g*D_qk;
+            double sum = 0.0;
+            for (int64_t d = 0; d < D_qk; ++d) {
+                sum += (double) src[d]*(double) src[d];
+            }
+            const float sc = 1.0f/sqrtf((float) (sum/D_qk) + eps);
+            for (int64_t d = 0; d < D_qk; ++d) {
+                out[d] = (src[d]*sc)*w[d];
+            }
+        }
+    };
+
+    if (prefill) {
+        // every thread preps a slice of the tokens, then all wait
+        const int64_t t0 = n_tok*ith/nth, t1 = n_tok*(ith + 1)/nth;
+        for (int64_t tok = t0; tok < t1; ++tok) {
+            prep_token(tok, shared + tok*prep_stride, shared + tok*prep_stride + 2*R*D_qk);
+        }
+        ggml_barrier(params->threadpool);
+    }
+
+    if (my_U <= 0) {
+        return;
+    }
 
     auto src_row = [&](int64_t seq) -> const float * {
         if (inplace) {
@@ -12829,6 +13070,95 @@ static void ggml_compute_forward_mamba3_mimo_f32(
         }
     }
 
+    // per-(token, head) scalars from the static projection
+    auto tok_scalars = [&](int64_t tok, int64_t h, float & dt, float & alpha, float & trap) {
+        const float * ps = (const float *) ((const char *) pstat->data + tok*pstat->nb[1]) + h*(2*D_v + 3);
+        dt = m3_softplus(ps[2*D_v + 0] + misc_d[h]);
+        const float a = fminf(-m3_softplus(ps[2*D_v + 1]), -a_floor);
+        alpha = expf(a*dt);
+        trap  = 1.0f/(1.0f + expf(-ps[2*D_v + 2]));
+    };
+
+    // k/q (bias + rotary at the head's current angle state), v, w for one token
+    auto build_kqvw = [&](int64_t tok, int64_t h, const float * bc, const float * tanp_t, float dt,
+                          float * ang, float * k, float * q, float * v, float * w) {
+        const float * ps     = (const float *) ((const char *) pstat->data + tok*pstat->nb[1]) + h*(2*D_v + 3);
+        const float * bias_h = bias_d + h*2*R*D_qk;
+        const float * mx_h   = mxz_d + h*2*R*D_v;
+        const float * mz_h   = mx_h + R*D_v;
+        const float * mo_h   = mo_d + h*R*D_v;
+
+        for (int64_t i = 0; i < n_ang; ++i) {
+            const float x = ang[i] + tanp_t[i]*dt;
+            ang[i] = x - (float) (2.0*M_PI)*rintf(x*(float) (0.5/M_PI));
+        }
+        m3_sincos_n(ang, ss, cs, n_ang);
+
+        {
+            int64_t j = 0;
+#if defined(M3_SIMD)
+            for (; j + GGML_F32_EPR <= R*D_qk; j += GGML_F32_EPR) {
+                GGML_F32_VEC_STORE(k + j, GGML_F32_VEC_ADD(GGML_F32_VEC_LOAD(bc + j), GGML_F32_VEC_LOAD(bias_h + j)));
+                GGML_F32_VEC_STORE(q + j, GGML_F32_VEC_ADD(GGML_F32_VEC_LOAD(bc + R*D_qk + j), GGML_F32_VEC_LOAD(bias_h + R*D_qk + j)));
+            }
+#endif
+            for (; j < R*D_qk; ++j) {
+                k[j] = bc[j] + bias_h[j];
+                q[j] = bc[R*D_qk + j] + bias_h[R*D_qk + j];
+            }
+        }
+        // rotary on the pairs (i, i + D_qk/2), i < D_qk/4
+        for (int64_t r = 0; r < R; ++r) {
+            float * kr = k + r*D_qk;
+            float * qr = q + r*D_qk;
+            int64_t i = 0;
+#if defined(__AVX512F__)
+            for (; i + 16 <= n_ang; i += 16) {
+                const __m512 c  = _mm512_loadu_ps(cs + i);
+                const __m512 sn = _mm512_loadu_ps(ss + i);
+                const __m512 q0 = _mm512_loadu_ps(qr + i), q2 = _mm512_loadu_ps(qr + i + half);
+                const __m512 k0 = _mm512_loadu_ps(kr + i), k2 = _mm512_loadu_ps(kr + i + half);
+                _mm512_storeu_ps(qr + i,        _mm512_fnmadd_ps(q2, sn, _mm512_mul_ps(q0, c)));
+                _mm512_storeu_ps(qr + i + half, _mm512_fmadd_ps (q0, sn, _mm512_mul_ps(q2, c)));
+                _mm512_storeu_ps(kr + i,        _mm512_fnmadd_ps(k2, sn, _mm512_mul_ps(k0, c)));
+                _mm512_storeu_ps(kr + i + half, _mm512_fmadd_ps (k0, sn, _mm512_mul_ps(k2, c)));
+            }
+#endif
+            for (; i < n_ang; ++i) {
+                const float c = cs[i], sn = ss[i];
+                const float q0 = qr[i], q2 = qr[i + half];
+                qr[i] = q0*c - q2*sn; qr[i + half] = q0*sn + q2*c;
+                const float k0 = kr[i], k2 = kr[i + half];
+                kr[i] = k0*c - k2*sn; kr[i + half] = k0*sn + k2*c;
+            }
+        }
+
+        // v = x*mimo_x, w = silu(z*mimo_z)*mimo_o
+        for (int64_t r = 0; r < R; ++r) {
+            int64_t p = 0;
+#if defined(M3_SIMD)
+            for (; p + GGML_F32_EPR <= D_v; p += GGML_F32_EPR) {
+                GGML_F32_VEC_STORE(v + r*D_v + p, GGML_F32_VEC_MUL(GGML_F32_VEC_LOAD(ps + D_v + p), GGML_F32_VEC_LOAD(mx_h + r*D_v + p)));
+                GGML_F32_VEC_STORE(ztmp + p,      GGML_F32_VEC_MUL(GGML_F32_VEC_LOAD(ps + p),       GGML_F32_VEC_LOAD(mz_h + r*D_v + p)));
+            }
+#endif
+            for (; p < D_v; ++p) {
+                v[r*D_v + p] = ps[D_v + p]*mx_h[r*D_v + p];
+                ztmp[p]      = ps[p]*mz_h[r*D_v + p];
+            }
+            ggml_vec_silu_f32((int) D_v, w + r*D_v, ztmp);
+            p = 0;
+#if defined(M3_SIMD)
+            for (; p + GGML_F32_EPR <= D_v; p += GGML_F32_EPR) {
+                GGML_F32_VEC_STORE(w + r*D_v + p, GGML_F32_VEC_MUL(GGML_F32_VEC_LOAD(w + r*D_v + p), GGML_F32_VEC_LOAD(mo_h + r*D_v + p)));
+            }
+#endif
+            for (; p < D_v; ++p) {
+                w[r*D_v + p] *= mo_h[r*D_v + p];
+            }
+        }
+    };
+
     for (int64_t seq = 0; seq < n_seqs; ++seq) {
         float * row = dst_row(seq);
         const float * s = src_row(seq);
@@ -12846,36 +13176,88 @@ static void ggml_compute_forward_mamba3_mimo_f32(
             }
         }
 
+        if (prefill) {
+            const int64_t tok0 = seq*T, tok1 = (seq + 1)*T;
+            for (int64_t h = h_begin; h < h_end; ++h) {
+                float * st   = row + h*D_v*D_qk;
+                float * K_st = row + off_K + h*R*D_qk;
+                float * V_st = row + off_V + h*R*D_v;
+                float * ang  = row + off_A + h*n_ang;
+                const float D_h = misc_d[H + h];
+                float * k = krt, * q = qrt, * v = vlt, * w = wlt;
+
+                // U_0 = S_0^T + delta_0 kv_0^T, delta_0 = (1 - trap_1) dt_1
+                float dt_n, alpha_n, trap_n;
+                tok_scalars(tok0, h, dt_n, alpha_n, trap_n);
+                const float delta0 = (1.0f - trap_n)*dt_n;
+                for (int64_t p = 0; p < D_v; ++p) {
+                    const float * srow = st + p*D_qk;
+                    for (int64_t d = 0; d < D_qk; ++d) {
+                        float kv = 0.0f;
+                        for (int64_t r = 0; r < R; ++r) {
+                            kv += V_st[r*D_v + p]*K_st[r*D_qk + d];
+                        }
+                        Ubuf[d*D_v + p] = srow[d] + delta0*kv;
+                    }
+                }
+
+                for (int64_t tok = tok0; tok < tok1; ++tok) {
+                    const float dt = dt_n, alpha = alpha_n, trap = trap_n;
+                    float delta = 0.0f;
+                    if (tok + 1 < tok1) {
+                        tok_scalars(tok + 1, h, dt_n, alpha_n, trap_n);
+                        delta = (1.0f - trap_n)*dt_n;
+                    }
+                    // the static projection rows are H*(2 D_v + 3) floats apart per
+                    // token and the prep rows 2R D_qk + n_ang: pull the next ones in
+                    // while this token's sweep runs
+                    if (tok + 2 < tok1) {
+                        const char * pn = (const char *) pstat->data + (tok + 2)*pstat->nb[1] + h*(2*D_v + 3)*sizeof(float);
+                        for (size_t off = 0; off < (2*D_v + 3)*sizeof(float); off += 64) {
+                            __builtin_prefetch(pn + off, 0, 1);
+                        }
+                    }
+                    if (tok + 1 < tok1) {
+                        const char * bn = (const char *) (shared + (tok + 1)*prep_stride);
+                        for (size_t off = 0; off < (2*R*D_qk + n_ang)*sizeof(float); off += 64) {
+                            __builtin_prefetch(bn + off, 0, 1);
+                        }
+                    }
+                    const float gamma = trap*dt;
+
+                    const float * bc     = shared + tok*prep_stride;
+                    const float * tanp_t = bc + 2*R*D_qk;
+                    build_kqvw(tok, h, bc, tanp_t, dt, ang, k, q, v, w);
+
+                    m3_prefill_token_dispatch(Ubuf, k, q, v, obuf, alpha, gamma + delta, R, D_qk, D_v);
+
+                    // y = sum_r w_r * (o_r + D v_r - delta sum_r' v_r' (k_r' . q_r))
+                    float * yr = y_d + (tok*H + h)*D_v;
+                    m3_prefill_epilogue(yr, obuf, k, q, v, w, Gbuf, D_h, delta, R, D_qk, D_v);
+                }
+
+                // S_T = U_T (delta_T = 0), k/v of the last token
+                for (int64_t p = 0; p < D_v; ++p) {
+                    float * srow = st + p*D_qk;
+                    for (int64_t d = 0; d < D_qk; ++d) {
+                        srow[d] = Ubuf[d*D_v + p];
+                    }
+                }
+                memcpy(K_st, k, R*D_qk*sizeof(float));
+                memcpy(V_st, v, R*D_v*sizeof(float));
+            }
+            continue;
+        }
+
         for (int64_t tg = seq*T; tg < (seq + 1)*T; tg += M3_TB) {
             const int64_t TB = std::min<int64_t>(M3_TB, (seq + 1)*T - tg);
 
-            // head-independent prep: tanh(ang_raw)*pi, rms-normed B/C * weight
             for (int64_t tt = 0; tt < TB; ++tt) {
-                const float * pd = (const float *) ((const char *) pdyn->data + (tg + tt)*pdyn->nb[1]);
-                for (int64_t i = 0; i < n_ang; ++i) {
-                    tanp[tt*n_ang + i] = tanhf(pd[2*R*D_qk + i])*(float) M_PI;
-                }
-                for (int64_t g = 0; g < 2*R; ++g) {
-                    const float * src = pd + g*D_qk;
-                    const float * w   = norms_d + (g < R ? 0 : D_qk);
-                    float * out = bcn + (tt*2*R + g)*D_qk;
-                    double sum = 0.0;
-                    for (int64_t d = 0; d < D_qk; ++d) {
-                        sum += (double) src[d]*(double) src[d];
-                    }
-                    const float sc = 1.0f/sqrtf((float) (sum/D_qk) + eps);
-                    for (int64_t d = 0; d < D_qk; ++d) {
-                        out[d] = (src[d]*sc)*w[d];
-                    }
-                }
+                prep_token(tg + tt, bcn + tt*2*R*D_qk, tanp + tt*n_ang);
             }
 
             for (int64_t h = h_begin; h < h_end; ++h) {
-                const float * bias_h = bias_d + h*2*R*D_qk;
-                const float * mx_h   = mxz_d + h*2*R*D_v;
-                const float * mz_h   = mx_h + R*D_v;
-                const float * mo_h   = mo_d + h*R*D_v;
-                const float   D_h    = misc_d[H + h];
+                const float D_h = misc_d[H + h];
                 float * ang = row + off_A + h*n_ang;
 
                 float alpha[M3_TB], beta[M3_TB], gamma[M3_TB];
@@ -12884,68 +13266,19 @@ static void ggml_compute_forward_mamba3_mimo_f32(
 
                 for (int64_t tt = 0; tt < TB; ++tt) {
                     const int64_t tok = tg + tt;
-                    const float * ps = (const float *) ((const char *) pstat->data + tok*pstat->nb[1]) + h*(2*D_v + 3);
-
-                    const float dt   = m3_softplus(ps[2*D_v + 0] + misc_d[h]);
-                    const float a    = fminf(-m3_softplus(ps[2*D_v + 1]), -a_floor);
-                    alpha[tt]        = expf(a*dt);
-                    const float trap = 1.0f/(1.0f + expf(-ps[2*D_v + 2]));
-                    beta[tt]         = (1.0f - trap)*dt*alpha[tt];
-                    gamma[tt]        = trap*dt;
-
-                    for (int64_t i = 0; i < n_ang; ++i) {
-                        const float x = ang[i] + tanp[tt*n_ang + i]*dt;
-                        ang[i] = x - (float) (2.0*M_PI)*rintf(x*(float) (0.5/M_PI));
-                    }
-                    m3_sincos_n(ang, ss, cs, n_ang);
+                    float dt, trap;
+                    tok_scalars(tok, h, dt, alpha[tt], trap);
+                    beta[tt]  = (1.0f - trap)*dt*alpha[tt];
+                    gamma[tt] = trap*dt;
 
                     float * k = krt + tt*R*D_qk;
                     float * q = qrt + tt*R*D_qk;
-                    const float * bc = bcn + tt*2*R*D_qk;
-                    for (int64_t j = 0; j < R*D_qk; ++j) {
-                        k[j] = bc[j] + bias_h[j];
-                        q[j] = bc[R*D_qk + j] + bias_h[R*D_qk + j];
-                    }
-                    // rotary on the pairs (i, i + D_qk/2), i < D_qk/4
-                    for (int64_t r = 0; r < R; ++r) {
-                        float * kr = k + r*D_qk;
-                        float * qr = q + r*D_qk;
-                        int64_t i = 0;
-#if defined(__AVX512F__)
-                        for (; i + 16 <= n_ang; i += 16) {
-                            const __m512 c  = _mm512_loadu_ps(cs + i);
-                            const __m512 sn = _mm512_loadu_ps(ss + i);
-                            const __m512 q0 = _mm512_loadu_ps(qr + i), q2 = _mm512_loadu_ps(qr + i + half);
-                            const __m512 k0 = _mm512_loadu_ps(kr + i), k2 = _mm512_loadu_ps(kr + i + half);
-                            _mm512_storeu_ps(qr + i,        _mm512_fnmadd_ps(q2, sn, _mm512_mul_ps(q0, c)));
-                            _mm512_storeu_ps(qr + i + half, _mm512_fmadd_ps (q0, sn, _mm512_mul_ps(q2, c)));
-                            _mm512_storeu_ps(kr + i,        _mm512_fnmadd_ps(k2, sn, _mm512_mul_ps(k0, c)));
-                            _mm512_storeu_ps(kr + i + half, _mm512_fmadd_ps (k0, sn, _mm512_mul_ps(k2, c)));
-                        }
-#endif
-                        for (; i < n_ang; ++i) {
-                            const float c = cs[i], sn = ss[i];
-                            const float q0 = qr[i], q2 = qr[i + half];
-                            qr[i] = q0*c - q2*sn; qr[i + half] = q0*sn + q2*c;
-                            const float k0 = kr[i], k2 = kr[i + half];
-                            kr[i] = k0*c - k2*sn; kr[i + half] = k0*sn + k2*c;
-                        }
-                    }
-
-                    // v = x*mimo_x, w = silu(z*mimo_z)*mimo_o, y seeded with sum_r w*D*v
                     float * v = vlt + tt*R*D_v;
                     float * w = wlt + tt*R*D_v;
+                    build_kqvw(tok, h, bcn + tt*2*R*D_qk, tanp + tt*n_ang, dt, ang, k, q, v, w);
+
+                    // y seeded with sum_r w*D*v
                     float * yr = y_d + (tok*H + h)*D_v;
-                    for (int64_t r = 0; r < R; ++r) {
-                        for (int64_t p = 0; p < D_v; ++p) {
-                            v[r*D_v + p]  = ps[D_v + p]*mx_h[r*D_v + p];
-                            ztmp[p]       = ps[p]*mz_h[r*D_v + p];
-                        }
-                        ggml_vec_silu_f32((int) D_v, w + r*D_v, ztmp);
-                        for (int64_t p = 0; p < D_v; ++p) {
-                            w[r*D_v + p] *= mo_h[r*D_v + p];
-                        }
-                    }
                     for (int64_t p = 0; p < D_v; ++p) {
                         yr[p] = 0.0f;
                     }

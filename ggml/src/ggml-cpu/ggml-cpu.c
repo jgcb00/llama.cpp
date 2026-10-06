@@ -3040,7 +3040,7 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_MAMBA3_MIMO:
                     {
-                        cur = ggml_mamba3_mimo_work_floats(node, n_tasks) * sizeof(float) * n_tasks;
+                        cur = ggml_mamba3_mimo_work_size(node, n_tasks);
                     } break;
                 case GGML_OP_DRAGON_MOE:
                     {
