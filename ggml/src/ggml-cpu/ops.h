@@ -109,7 +109,7 @@ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params
 void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_mamba3_mimo(const struct ggml_compute_params * params, struct ggml_tensor * dst);
-size_t ggml_mamba3_mimo_work_floats(const struct ggml_tensor * op, int n_threads);
+size_t ggml_mamba3_mimo_work_size(const struct ggml_tensor * op, int n_threads);
 void ggml_compute_forward_geodesic(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dragon_moe(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 size_t ggml_dragon_moe_work_size(const struct ggml_tensor * op, int n_threads);
