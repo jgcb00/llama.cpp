@@ -82,21 +82,23 @@ that runs on several CPU generations, add `-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_V
 Check it works:
 
 ```sh
-./build/bin/llama-bench -m olala-q5_k_m.gguf -t 16 -fa 1 -p 512 -n 128
-# reference, EPYC 9334 @ 16 threads: pp512 ≈ 530 t/s, tg128 ≈ 95 t/s
+./build/bin/llama-bench -m olala-q5_k_m.gguf -t 16 -fa 1 --repack 0 -p 512 -n 128
+# reference, EPYC 9334 @ 16 threads: pp512 ≈ 600 t/s, tg128 ≈ 109 t/s (q4_k_m: 615 / 116)
 ```
 
 Serve:
 
 ```sh
-./build/bin/llama-server -m olala-q5_k_m.gguf -t 16 -fa 1 \
+./build/bin/llama-server -m olala-q5_k_m.gguf -t 16 -fa 1 -nr \
     -ctk q8_0 -ctv q8_0 -c 32768 -np 4 --host 0.0.0.0 --port 8080
 ```
 
 - `-t`: number of threads. On a shared machine use half the physical cores; more
   than the physical core count only slows it down.
 - `-fa 1 -ctk q8_0 -ctv q8_0`: always on CPU (faster at long context, half the KV memory).
-- `-np 4`: parallel slots (4 users ≈ 155 t/s total on 16 threads).
+- `-nr` (`--no-repack`): the x86 "repack" GEMM kernels are slower on this model and
+  block the fused MoE op; always pass it on CPU (`--repack 0` for llama-bench).
+- `-np 4`: parallel slots (4 users ≈ 173 t/s total on 16 threads, 8 users ≈ 184).
 
 ## 2b. Mac — Apple Silicon (Metal)
 
@@ -187,5 +189,5 @@ curl -s http://localhost:8080/v1/chat/completions -H 'Content-Type: application/
 | NaN with a quantized GGUF on CPU | file made without the `$SAFE` overrides; re-quantize |
 | `unknown model architecture: 'dragon'` | binary not built from `olala-master` |
 | no `reasoning_content` / raw `<\|channel_start\|>` in output | GGUF converted without `chat_template.jinja`; reconvert |
-| CPU much slower than the table | too many threads (`-t` > physical cores, or machine busy), or `-fa` off |
+| CPU much slower than the table | too many threads (`-t` > physical cores, or machine busy), `-fa` off, or repack on (add `-nr` / `--repack 0`) |
 | Mac: `failed to build 'mamba3' library` | Metal shader compile error — send the log (see Metal checklist) |

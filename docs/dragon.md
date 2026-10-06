@@ -70,26 +70,42 @@ SAFE="--tensor-type ffn_latent_up=bf16 --tensor-type ffn_up_exps=q8_0"
 there too (`--tensor-type ffn_up_exps=iq4_nl`, plus `--output-tensor-type q4_k`):
 -25% file size, same speed — useful for 8 GB machines.
 
-### Measured (DPO-99k checkpoint; EPYC 9334, **16 threads**, `-fa 1`)
+### Measured (DPO-99k checkpoint; EPYC 9334, **16 threads**, `-fa 1 --no-repack`)
 
 | variant | size | KLD vs bf16 | same top-1 | pp512 t/s | tg128 t/s |
 |---|---|---|---|---|---|
-| bf16 | 12.7 GiB | — | — | 475 | 55.6 |
-| q8_0-safe2 | 6.4 GiB | 0.0040 | 96.9% | 453 | 75.1 |
-| q6_k | 5.9 GiB | 0.0106 | 94.6% | 515 | 90.6 |
-| **q5_k_m** | 5.6 GiB | 0.0194 | 92.8% | **533** | **94.6** |
-| q4_k_m | 5.3 GiB | 0.0487 | 88.5% | 485 | 94.4 |
-| q4_k_m + up iq4_nl + out q4_k | 4.0 GiB | 0.0610 | 87.2% | 502 | 94.7 |
+| bf16 | 12.7 GiB | — | — | 530 | 56.8 |
+| q8_0-safe2 | 6.4 GiB | 0.0040 | 96.9% | 501 | 84.8 |
+| q6_k | 5.9 GiB | 0.0106 | 94.6% | 579 | 101.8 |
+| **q5_k_m** | 5.6 GiB | 0.0194 | 92.8% | **598** | **108.9** |
+| q4_k_m | 5.3 GiB | 0.0487 | 88.5% | 614 | 115.8 |
+| q4_k_m + up iq4_nl + out q4_k | 4.0 GiB | 0.0610 | 87.2% | 596 | 113.1 |
 
-KLD over 16 wikitext-2 chunks. **Recommendation: q5_k_m** (as fast as q4_k_m on this
-model — decode is dispatch-bound, not bandwidth-bound, below 6 bits — at 2.5× lower
-divergence); q6_k when quality matters most.
+KLD over 16 wikitext-2 chunks. **Recommendation: q5_k_m** (q4_k_m is 7% faster at
+2.5× the divergence); q6_k when quality matters most. The box delivers ~190 GB/s and
+a token reads ~1.0 GB of weights with q5_k_m, so ~190 t/s is the decode roofline;
+the rest is per-node dispatch (~1100 graph nodes per token).
+
+**`--no-repack` on x86** (`-nr` for llama-server/llama-cli, `--repack 0` for
+llama-bench): ggml's interleaved "repack" GEMM kernels are slower than the plain
+q4_K path on this model (q4_k_m: pp512 483 → 526, tg 94 → 99 before the kernels
+below), and the fused MoE op cannot read repacked weights. q5_K/q6_K/q8_0 files are
+not repacked on x86 anyway.
+
+**CPU kernels** (2026-10-06): the whole MoE block of a layer runs as one ggml-cpu op
+(`GGML_OP_DRAGON_MOE`: latent down, f32 router, top-k, experts, latent up, shared
+expert; 3 thread barriers instead of ~14 nodes) for ubatches of ≤ 8 tokens, i.e.
+decode and up to 8 concurrent slots (tg 92.6 → 109 t/s). The Mamba3-MIMO prefill sweep
+is d-major with the trapezoid term folded into the state (shifted-γ identity of the
+chunked reference); its inner loop runs at the AVX-512 FMA bound, 7.6 → 3.7 ms per
+layer at pp512 (pp512 531 → 598 t/s).
 
 **KV cache: use `-ctk q8_0 -ctv q8_0` on CPU** — half the attention KV memory and
 faster at depth (q5_k_m decode: 52 t/s at 24k context vs 47 with f16; prefill equal).
 
 Long context / multi-user (q5_k_m, 16 threads): pp8192 405 t/s; decode 86 t/s at 1k,
-67 at 8k, 52 at 24k (q8_0 KV); 1/2/4/8 concurrent users 92/118/155/169 t/s total.
+67 at 8k, 52 at 24k (q8_0 KV; before the 2026-10-06 kernels); 1/2/4/8 concurrent users
+103/135/173/184 t/s total.
 
 ## 4. Running
 
@@ -117,6 +133,8 @@ Long context / multi-user (q5_k_m, 16 threads): pp8192 405 t/s; decode 86 t/s at
 | `DRAGON_CPU_CUSTOM_M=1`, `DRAGON_CPU_CUSTOM_GEO=1` | legacy libllama custom-op CPU kernels |
 | `DRAGON_NO_INPLACE_STATE=1` | gather + copy the recurrent state instead of updating it in place |
 | `DRAGON_NO_FUSED_MOE/SHIFT/GEO=1` | ggml-primitive MoE / token shift / geodesic on CPU |
+| `DRAGON_FUSED_MOE_MAX_T=N` | largest ubatch handled by the fused MoE op (default 8, 0 disables) |
+| `GGML_M3_LEGACY=1` | previous (blocked, p-major) Mamba3 CPU kernel for every ubatch size |
 | `DRAGON_BF16_STATE=1` | bf16 K/V state sections |
 | `DRAGON_M_PRIM=1` / `DRAGON_M_CHUNK_SIZE=N` / `DRAGON_M_DECODE_PRIM=1` | closed-form primitive reference paths (single sequence) |
 | `GGML_OP_PROFILE=1` (`GGML_OP_PROFILE_TOP=N`) | per-op CPU time tables at exit |
