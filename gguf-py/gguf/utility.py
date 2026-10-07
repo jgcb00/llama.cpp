@@ -265,8 +265,15 @@ class SafetensorRemote:
     def _get_request_headers(cls) -> dict[str, str]:
         """Prepare common headers for requests."""
         headers = {"User-Agent": "convert_hf_to_gguf"}
-        if os.environ.get("HF_TOKEN"):
-            headers["Authorization"] = f"Bearer {os.environ['HF_TOKEN']}"
+        token = os.environ.get("HF_TOKEN")
+        if not token:
+            try:
+                from huggingface_hub import get_token  # token saved by `hf auth login`
+                token = get_token()
+            except ImportError:
+                token = None
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         return headers
 
 
