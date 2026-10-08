@@ -141,7 +141,7 @@ Long context / multi-user (q5_k_m, 16 threads): pp8192 405 t/s; decode 86 t/s at
 | `DRAGON_FUSED_MOE_MAX_T=N` | largest ubatch handled by the fused MoE op (default 8, 0 disables) |
 | `GGML_M3_LEGACY=1` | previous (blocked, p-major) Mamba3 CPU kernel for every ubatch size |
 | `DRAGON_EXPERT_CACHE_MB=N` | low-RAM mode: keep the N MiB of most recently used experts mapped (default 0) |
-| `DRAGON_EXPERT_DROP_CACHE=1` | low-RAM mode: also drop released experts from the OS page cache (strict, slower) |
+| `DRAGON_EXPERT_DROP_CACHE=1` | low-RAM mode, Linux: also drop released experts from the OS page cache (strict, slower) |
 | `DRAGON_BF16_STATE=1` | bf16 K/V state sections |
 | `DRAGON_M_PRIM=1` / `DRAGON_M_CHUNK_SIZE=N` / `DRAGON_M_DECODE_PRIM=1` | closed-form primitive reference paths (single sequence) |
 | `GGML_OP_PROFILE=1` (`GGML_OP_PROFILE_TOP=N`) | per-op CPU time tables at exit |

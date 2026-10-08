@@ -13,6 +13,11 @@
 #include <unordered_map>
 #include <vector>
 
+// MSVC only defines M_PI with _USE_MATH_DEFINES
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #if defined(__AVX2__) && defined(__FMA__)
 #include <immintrin.h>
 #endif

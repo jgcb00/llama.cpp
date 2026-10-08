@@ -7,7 +7,7 @@ Background, measurements and debug switches: [dragon.md](dragon.md).
 | hardware | weights | status |
 |---|---|---|
 | CPU x86-64 (AVX-512 / AVX2) | **q5_k_m** (q6_k for best quality) | validated |
-| CPU, ≈ 1.2–2 GiB of free RAM | q5_k_m or the 4.0 GiB small file, `--lazy-mode on` | validated on Linux x86 ([low-RAM mode](#low-ram-mode-experts-read-from-disk)) |
+| CPU, ≈ 1.2–2 GiB of free RAM (laptops) | q5_k_m or the 4.0 GiB small file, `--lazy-mode on` | measured on Linux x86; paging test passes on Windows/macOS CI ([low-RAM mode](#low-ram-mode-experts-read-from-disk)) |
 | CPU ARM64 (Linux, macOS without Metal) | q5_k_m | compiles; not benchmarked |
 | Mac, Metal | **bf16** | validated (M5 Pro 24 GB, macOS 26.4): pp512 ≈ 2070 t/s, tg128 ≈ 70 t/s |
 | NVIDIA, CUDA | **bf16** | validated (H100) |
@@ -72,7 +72,7 @@ Sanity check of any file (must print a finite perplexity; bf16 ≈ 13 on 8 wikit
 
 ---
 
-## 2a. CPU — Linux / Windows (WSL) / macOS without Metal
+## 2a. CPU — Linux / Windows / macOS without Metal
 
 Build:
 
@@ -128,9 +128,23 @@ q5_k_m, 0.7 GiB small) plus ≈ 0.3 GiB of buffers stays in RAM.
   under memory pressure, so the mode adapts to the RAM that is free. To keep the page
   cache out of it too (strict footprint, slower), set `DRAGON_EXPERT_DROP_CACHE=1`.
   `DRAGON_EXPERT_CACHE_MB=N` keeps the N MiB of most recently used experts mapped.
-- Linux gets the full mechanism. macOS uses the same read-ahead and release calls
-  without the batched page mapping (slower). On Windows the experts are only read
-  on first use and never released.
+- Linux, Windows and macOS all release the experts after use (Linux `madvise`,
+  Windows `VirtualUnlock` = out of the working set, macOS `madvise`), and all read
+  them ahead in large requests (`madvise` / `PrefetchVirtualMemory`). Linux also maps
+  them in one call per thread; on Windows and macOS this is page faults, a bit slower.
+  The CI test `test-dragon-moe-paging` checks the release on all three.
+- Windows laptop: in a terminal from the "x64 Native Tools" prompt (or any shell
+  with Visual Studio 2022 + CMake),
+
+  ```bat
+  cmake -B build -DLLAMA_CURL=OFF
+  cmake --build build --config Release -j
+  build\bin\Release\llama-server.exe -m olala-q4_k_m-small.gguf -t 6 -fa 1 -nr ^
+      --lazy-mode on -c 8192 --port 8080
+  ```
+
+  `-t` = number of performance cores (not threads). Close the browser tabs you do
+  not need: the model's working set is ≈ 1.1–1.3 GiB, the rest of the RAM is cache.
 
 Measured on EPYC 9334, 16 threads, Micron 7450 NVMe, cold page cache, RAM capped with a
 cgroup (`systemd-run --user --scope -p MemoryMax=… -p MemorySwapMax=0`, page cache

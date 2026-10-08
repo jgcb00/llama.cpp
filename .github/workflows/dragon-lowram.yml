@@ -1,0 +1,46 @@
+name: Dragon low-RAM mode
+
+# Native build of the Olala/Dragon CPU path (MSVC on Windows) and the expert
+# paging test (tests/test-dragon-moe-paging.cpp) on Windows, macOS and Linux.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [olala-master]
+    paths:
+      - '.github/workflows/dragon-lowram.yml'
+      - 'ggml/src/ggml-cpu/**'
+      - 'ggml/src/ggml.c'
+      - 'ggml/include/ggml.h'
+      - 'src/models/dragon.cpp'
+      - 'src/llama-model-loader.cpp'
+      - 'src/llama-mmap.cpp'
+      - 'tests/test-dragon-moe-paging.cpp'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  paging:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF
+
+      - name: Build
+        run: cmake --build build --config Release -j 4 --target test-dragon-moe-paging llama-server llama-cli llama-bench
+
+      - name: Expert paging test (Unix)
+        if: runner.os != 'Windows'
+        run: ./build/bin/test-dragon-moe-paging
+
+      - name: Expert paging test (Windows)
+        if: runner.os == 'Windows'
+        run: .\build\bin\Release\test-dragon-moe-paging.exe
