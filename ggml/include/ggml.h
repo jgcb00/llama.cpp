@@ -2815,7 +2815,13 @@ extern "C" {
             struct ggml_tensor  * w_up_sh,      // (n_embd, n_ff_sh)
             struct ggml_tensor  * w_down_sh,    // (n_ff_sh, n_embd)
             int                   n_expert_used,
-            float                 w_scale);
+            float                 w_scale,
+            int                   expert_cache_mib); // < 0: expert weights are resident.
+                                                     // >= 0 (CPU): they are a file mapping read
+                                                     // on demand; the selected experts are
+                                                     // prefetched after routing and released
+                                                     // after use, keeping at most this many MiB
+                                                     // of recently used experts resident
 
     // custom operators
 

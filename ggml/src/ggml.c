@@ -6769,7 +6769,8 @@ struct ggml_tensor * ggml_dragon_moe(
         struct ggml_tensor  * w_up_sh,
         struct ggml_tensor  * w_down_sh,
         int                   n_expert_used,
-        float                 w_scale) {
+        float                 w_scale,
+        int                   expert_cache_mib) {
     struct ggml_tensor * srcs[9] = { x, w_lat_down, w_router, router_bias, w_up_exps, w_down_exps, w_lat_up, w_up_sh, w_down_sh };
     for (int i = 0; i < 9; ++i) {
         GGML_ASSERT(srcs[i] != NULL);
@@ -6796,9 +6797,10 @@ struct ggml_tensor * ggml_dragon_moe(
 
     struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
 
-    int32_t params[2];
+    int32_t params[3];
     params[0] = n_expert_used;
     memcpy(&params[1], &w_scale, sizeof(float));
+    params[2] = expert_cache_mib;
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op = GGML_OP_DRAGON_MOE;

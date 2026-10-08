@@ -122,6 +122,11 @@ Long context / multi-user (q5_k_m, 16 threads): pp8192 405 t/s; decode 86 t/s at
 - Recurrent state: kept in **f32** (a reduced-precision state degrades long
   generations into repetition loops); the rotary phase is kept wrapped to [-π, π].
   `DRAGON_BF16_STATE=1` stores the K/V sections bf16 (not recommended).
+- Low RAM: `--lazy-mode on` keeps the routed experts and the token embeddings
+  on disk and pages the selected experts in per layer (CPU fused MoE op: read-ahead
+  after routing, release after use). ≈ 1.2 GiB RSS for q5_k_m; 27 t/s decode under a
+  2 GiB cap from NVMe. Details and measurements: [olala-setup.md](olala-setup.md)
+  (low-RAM mode).
 - GPU: `-ngl 99`, **bf16 weights** (see §3). H100 PCIe bf16: pp8192 5313 t/s,
   tg128 163 t/s.
 
@@ -135,12 +140,17 @@ Long context / multi-user (q5_k_m, 16 threads): pp8192 405 t/s; decode 86 t/s at
 | `DRAGON_NO_FUSED_MOE/SHIFT/GEO=1` | ggml-primitive MoE / token shift / geodesic on CPU |
 | `DRAGON_FUSED_MOE_MAX_T=N` | largest ubatch handled by the fused MoE op (default 8, 0 disables) |
 | `GGML_M3_LEGACY=1` | previous (blocked, p-major) Mamba3 CPU kernel for every ubatch size |
+| `DRAGON_EXPERT_CACHE_MB=N` | low-RAM mode: keep the N MiB of most recently used experts mapped (default 0) |
+| `DRAGON_EXPERT_DROP_CACHE=1` | low-RAM mode: also drop released experts from the OS page cache (strict, slower) |
 | `DRAGON_BF16_STATE=1` | bf16 K/V state sections |
 | `DRAGON_M_PRIM=1` / `DRAGON_M_CHUNK_SIZE=N` / `DRAGON_M_DECODE_PRIM=1` | closed-form primitive reference paths (single sequence) |
 | `GGML_OP_PROFILE=1` (`GGML_OP_PROFILE_TOP=N`) | per-op CPU time tables at exit |
 
 ## 6. Known limitations
 
+- Low-RAM mode (`--lazy-mode on`) is CPU-only and untested with GPU offload
+  (`-ngl`): lazy experts always live in host memory and only the CPU MoE op
+  releases them.
 - Quantized weights on GPUs: fp16 activation scales overflow on Dragon's outliers.
 - Recurrent models cannot context-shift; prompts beyond the context fail.
 - Truncated tool calls at `max_tokens` are returned partially (shared llama.cpp
