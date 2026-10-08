@@ -7,6 +7,7 @@ Background, measurements and debug switches: [dragon.md](dragon.md).
 | hardware | weights | status |
 |---|---|---|
 | CPU x86-64 (AVX-512 / AVX2) | **q5_k_m** (q6_k for best quality) | validated |
+| CPU, ≈ 1.2–2 GiB of free RAM | q5_k_m or the 4.0 GiB small file, `--lazy-mode on` | validated on Linux x86 ([low-RAM mode](#low-ram-mode-experts-read-from-disk)) |
 | CPU ARM64 (Linux, macOS without Metal) | q5_k_m | compiles; not benchmarked |
 | Mac, Metal | **bf16** | validated (M5 Pro 24 GB, macOS 26.4): pp512 ≈ 2070 t/s, tg128 ≈ 70 t/s |
 | NVIDIA, CUDA | **bf16** | validated (H100) |
@@ -104,6 +105,53 @@ Serve:
 - `-nr` (`--no-repack`): the x86 "repack" GEMM kernels are slower on this model and
   block the fused MoE op; always pass it on CPU (`--repack 0` for llama-bench).
 - `-np 4`: parallel slots (4 users ≈ 173 t/s total on 16 threads, 8 users ≈ 184).
+
+### Low-RAM mode: experts read from disk
+
+The routed experts are 82% of the file, but a token only uses 6 of the 256 per layer.
+With `--lazy-mode on` they stay in the GGUF on disk: after routing, each layer reads
+the selected experts (≈ 114 MiB per token for q5_k_m, 84 MiB for the small variant)
+and hands them back to the kernel once used. The rest of the model (≈ 0.85 GiB for
+q5_k_m, 0.7 GiB small) plus ≈ 0.3 GiB of buffers stays in RAM.
+
+```sh
+./build/bin/llama-server -m olala-q5_k_m.gguf -t 16 -fa 1 -nr --lazy-mode on \
+    -ctk q8_0 -ctv q8_0 -c 8192 -np 1 --port 8080
+```
+
+- Put the GGUF on an **SSD/NVMe**: every token is a burst of random reads. From a
+  hard-disk RAID decode drops to ≈ 1 t/s.
+- Keep `-c` modest: the KV cache is regular RAM (64k context = 2.7 GiB in f16).
+  Do not lower `-ub`: prefill re-reads the experts once per micro-batch.
+- Output is identical to the normal fused CPU path (greedy, token for token).
+- Experts that were released stay in the OS page cache, which the kernel gives back
+  under memory pressure, so the mode adapts to the RAM that is free. To keep the page
+  cache out of it too (strict footprint, slower), set `DRAGON_EXPERT_DROP_CACHE=1`.
+  `DRAGON_EXPERT_CACHE_MB=N` keeps the N MiB of most recently used experts mapped.
+- Linux gets the full mechanism. macOS uses the same read-ahead and release calls
+  without the batched page mapping (slower). On Windows the experts are only read
+  on first use and never released.
+
+Measured on EPYC 9334, 16 threads, Micron 7450 NVMe, cold page cache, RAM capped with a
+cgroup (`systemd-run --user --scope -p MemoryMax=… -p MemorySwapMax=0`, page cache
+included in the cap):
+
+| file | mode | RAM cap | pp512 t/s | tg128 t/s |
+|---|---|---|---|---|
+| q5_k_m (5.6 GiB) | normal | none (5.9 GiB RSS) | 592 | 109 |
+| q5_k_m | normal | 2 GiB | 104 | 10.6 |
+| q5_k_m | low-RAM | 2 GiB | 174 | 27.5 |
+| q5_k_m | low-RAM | 1.5 GiB | 128 | 21.1 |
+| q5_k_m | low-RAM | 1.2 GiB | 143 | 11.7 |
+| small (4.0 GiB) | normal | 2 GiB | 124 | 18.5 |
+| small | low-RAM | 2 GiB | 298 | 41.2 |
+| small | low-RAM | 1.5 GiB | 296 | 30.6 |
+| small | low-RAM | 1.2 GiB | 199 | 26.3 |
+| small | low-RAM | 1 GiB | 198 | 15.9 |
+
+Below ≈ 1.2 GiB (q5_k_m) / 1 GiB (small) the always-used weights no longer fit and
+decode collapses (≈ 2.7 t/s). Without a cap the process stays at ≈ 1.2–1.3 GiB RSS and
+runs at 65–70 t/s once the file sits in the page cache.
 
 ## 2b. Mac — Apple Silicon (Metal)
 

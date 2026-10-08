@@ -704,7 +704,7 @@ void llama_model_dragon::load_arch_hparams(llama_model_loader & ml) {
     type = LLM_TYPE_UNKNOWN;
 }
 
-void llama_model_dragon::load_arch_tensors(llama_model_loader &) {
+void llama_model_dragon::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     auto is_M = [&](int il) { return hparams.is_recr(il); };
@@ -732,7 +732,12 @@ void llama_model_dragon::load_arch_tensors(llama_model_loader &) {
     const int64_t ff_shexp   = (int64_t) hparams.n_ff_shexp;
 
     // ---- embeddings + LM head (no final norm: dragon.final_norm == false) ----
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // Low-memory mode (--lazy-mode on): the routed experts (~82% of the file) and the
+    // token embeddings stay on disk and are paged in on demand; the fused MoE op then
+    // prefetches the selected experts after routing and releases them after use
+    // (DRAGON_EXPERT_CACHE_MB bounds what stays resident). Off by default (auto only
+    // marks tensors > 4 GiB).
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_READ_LAZY);
     output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
     if (output == nullptr) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
@@ -793,8 +798,12 @@ void llama_model_dragon::load_arch_tensors(llama_model_loader &) {
         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B,           i), { n_expert }, 0);
         layer.ffn_latent_down = create_tensor(tn(LLM_TENSOR_FFN_LATENT_DOWN, "weight", i), { n_embd, moe_n_embd }, 0);
         layer.ffn_latent_up   = create_tensor(tn(LLM_TENSOR_FFN_LATENT_UP,   "weight", i), { moe_n_embd, n_embd }, 0);
-        layer.ffn_up_exps     = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,     "weight", i), { moe_n_embd, ff_exp, n_expert }, 0);
-        layer.ffn_down_exps   = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,   "weight", i), { ff_exp, moe_n_embd, n_expert }, 0);
+        layer.ffn_up_exps     = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,     "weight", i), { moe_n_embd, ff_exp, n_expert }, TENSOR_READ_LAZY);
+        layer.ffn_down_exps   = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS,   "weight", i), { ff_exp, moe_n_embd, n_expert }, TENSOR_READ_LAZY);
+        if (ml.lazy.has(layer.ffn_up_exps) && ml.lazy.has(layer.ffn_down_exps)) {
+            can_prefetch.insert(layer.ffn_up_exps);
+            can_prefetch.insert(layer.ffn_down_exps);
+        }
         layer.ffn_up_shexp    = create_tensor(tn(LLM_TENSOR_FFN_UP_SHEXP,    "weight", i), { n_embd, ff_shexp }, 0);
         layer.ffn_down_shexp  = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP,  "weight", i), { ff_shexp, n_embd }, 0);
     }
@@ -1354,6 +1363,17 @@ static void dragon_m_mega_reduce_kernel(ggml_tensor * dst, int ith, int nth, voi
 static bool dragon_tensor_repacked(const ggml_tensor * w) {
     return w != nullptr && w->buffer != nullptr &&
         std::strcmp(ggml_backend_buffer_name(w->buffer), "CPU_REPACK") == 0;
+}
+
+// Low-memory mode (--lazy-mode on): resident budget for recently used expert
+// slabs, in MiB (DRAGON_EXPERT_CACHE_MB, default 0 = release every expert
+// right after use).
+static int dragon_expert_cache_mib() {
+    static const int v = [] {
+        const char * e = std::getenv("DRAGON_EXPERT_CACHE_MB");
+        return e ? std::max(0, std::atoi(e)) : 0;
+    }();
+    return v;
 }
 
 static int64_t dragon_fused_moe_max_tokens() {
@@ -3642,8 +3662,13 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
 
         static const bool force_no_fused_moe = std::getenv("DRAGON_NO_FUSED_MOE") != nullptr;
         ggml_tensor * y_mlp = nullptr;
+        // low-memory mode: the experts are a lazily read file mapping; the fused op
+        // is the only path that prefetches and releases them, so use it for every
+        // ubatch size (it processes pairs grouped by expert, fine for prefill too)
+        const bool lazy_experts = model.can_prefetch.count(model.layers[il].ffn_up_exps) > 0 &&
+                                  model.can_prefetch.count(model.layers[il].ffn_down_exps) > 0;
         const bool use_moe_op = dragon_layer_cpu && !force_no_fused_moe && !dragon_dump_dir() &&
-            cur->ne[1] <= dragon_fused_moe_max_tokens() &&
+            (cur->ne[1] <= dragon_fused_moe_max_tokens() || lazy_experts) &&
             !dragon_tensor_repacked(model.layers[il].ffn_latent_down) &&
             !dragon_tensor_repacked(model.layers[il].ffn_up_exps) &&
             !dragon_tensor_repacked(model.layers[il].ffn_down_exps) &&
@@ -3662,7 +3687,8 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
                     model.layers[il].ffn_latent_up,
                     model.layers[il].ffn_up_shexp,
                     model.layers[il].ffn_down_shexp,
-                    (int) n_expert_used, hparams.expert_weights_scale);
+                    (int) n_expert_used, hparams.expert_weights_scale,
+                    lazy_experts ? dragon_expert_cache_mib() : -1);
             cb(y_mlp, "mlp_out", il);
         } else {
             // n_embd → moe_latent_size bottleneck before the routed experts.

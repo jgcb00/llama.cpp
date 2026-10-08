@@ -12,6 +12,19 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <atomic>
+#include <cerrno>
+#include <list>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#if defined(__linux__) || defined(__APPLE__)
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 // ggml_compute_forward_dup
 
@@ -13396,7 +13409,18 @@ void ggml_compute_forward_geodesic(
 // Every thread quantizes the f32 operands it needs into its own scratch (no
 // extra barrier); the f32 matmul outputs live in a shared region of the work
 // buffer. The per-row vec_dot is the same one ggml's mul_mat uses, so the
-// numerics match the unfused graph.
+// numerics match the unfused graph. The (token, expert) pairs are processed
+// grouped by expert so a slab is reused from cache across the tokens routed to it.
+//
+// Low-memory mode (op_params[2] = expert cache budget in MiB, >= 0): the expert
+// tensors are a file mapping read on demand (llama --lazy-mode on). Right after
+// routing every thread asks the kernel to read the expert rows it will compute
+// (MADV_WILLNEED: large parallel reads; the lazy ranges are MADV_RANDOM so plain
+// faults would read 4 KiB at a time), then maps them in one call before use
+// (Linux MADV_POPULATE_READ instead of one fault per page). After the last stage
+// that reads them, the slabs are unmapped from the process except the most
+// recently used ones that fit in the budget (see dragon_moe_release for what
+// happens to the page cache). Only non-destructive advices are used.
 
 struct dragon_moe_dims {
     int64_t n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k;
@@ -13422,9 +13446,9 @@ static inline size_t dragon_moe_qrow(enum ggml_type wtype, int64_t n) {
 
 struct dragon_moe_ws {
     // shared (bytes from the start of the work buffer)
-    size_t lat, logits, ush, up, dsh, down, shared;
+    size_t lat, logits, ush, up, dsh, down, ev_ptr, ev_size, ev_n, shared;
     // per-thread (bytes from the start of the thread's scratch)
-    size_t xq_ld, xq_r, xq_sh, latq, upq, ushq, routedq, routed, tmp, sel, wsel, scores, taken, per_thread;
+    size_t xq_ld, xq_r, xq_sh, latq, upq, ushq, routedq, routed, tmp, sel, wsel, scores, taken, order, cnt, per_thread;
 };
 
 static dragon_moe_ws dragon_moe_layout(const ggml_tensor * op) {
@@ -13439,6 +13463,9 @@ static dragon_moe_ws dragon_moe_layout(const ggml_tensor * op) {
     w.up     = take(T*k*d.n_ff*sizeof(float));
     w.dsh    = take(T*d.n_ff_sh*sizeof(float));
     w.down   = take(T*k*d.n_lat*sizeof(float));
+    w.ev_ptr  = take(4*d.n_expert*sizeof(const char *));
+    w.ev_size = take(4*d.n_expert*sizeof(size_t));
+    w.ev_n    = take(sizeof(int32_t));
     w.shared = off;
     off = 0;
     w.xq_ld   = take(T*dragon_moe_qrow(op->src[1]->type, d.n_embd));
@@ -13454,6 +13481,8 @@ static dragon_moe_ws dragon_moe_layout(const ggml_tensor * op) {
     w.wsel    = take(T*k*sizeof(float));
     w.scores  = take(d.n_expert*sizeof(float));
     w.taken   = take(d.n_expert);
+    w.order   = take(T*k*sizeof(int32_t));
+    w.cnt     = take((d.n_expert + 1)*sizeof(int32_t));
     w.per_thread = off;
     return w;
 }
@@ -13528,6 +13557,267 @@ static inline void dragon_moe_split(int64_t n, int ith, int nth, int64_t * a, in
     *b = n*(ith + 1)/nth;
 }
 
+// ---- low-memory mode: expert slab paging
+
+static size_t dragon_moe_page_size() {
+#if defined(__linux__) || defined(__APPLE__)
+    static const size_t ps = (size_t) sysconf(_SC_PAGESIZE);
+    return ps;
+#else
+    return 4096;
+#endif
+}
+
+// ask the kernel to start reading [p, p+n) (rounded outward to pages)
+static void dragon_moe_prefetch(const char * p, size_t n) {
+#if defined(__linux__) || defined(__APPLE__)
+    const uintptr_t ps = dragon_moe_page_size();
+    const uintptr_t a  = (uintptr_t) p & ~(ps - 1);
+    const uintptr_t b  = ((uintptr_t) p + n + ps - 1) & ~(ps - 1);
+    madvise((void *) a, b - a, MADV_WILLNEED);
+#else
+    GGML_UNUSED(p);
+    GGML_UNUSED(n);
+#endif
+}
+
+// map [p, p+n) into the page tables in one call (Linux >= 5.14), waiting for
+// the reads: avoids one page fault per 4 KiB page (fault-around is off on the
+// lazy ranges, which are MADV_RANDOM). Falls back to plain faults elsewhere.
+static void dragon_moe_populate(const char * p, size_t n) {
+#if defined(__linux__)
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+    static std::atomic<bool> unsupported { false };
+    if (unsupported.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const uintptr_t ps = dragon_moe_page_size();
+    const uintptr_t a  = (uintptr_t) p & ~(ps - 1);
+    const uintptr_t b  = ((uintptr_t) p + n + ps - 1) & ~(ps - 1);
+    if (madvise((void *) a, b - a, MADV_POPULATE_READ) != 0 && errno == EINVAL) {
+        unsupported.store(true, std::memory_order_relaxed);
+    }
+#else
+    GGML_UNUSED(p);
+    GGML_UNUSED(n);
+#endif
+}
+
+// populate the rows [r0, r1) of expert e of W unless the previous call of this
+// thread already covered them
+struct dragon_moe_populated {
+    int64_t e = -1, r0 = 0, r1 = 0;
+
+    void rows(const ggml_tensor * W, int64_t e_, int64_t r0_, int64_t r1_) {
+        if (e_ == e && r0_ >= r0 && r1_ <= r1) {
+            return;
+        }
+        dragon_moe_populate((const char *) W->data + (size_t) e_*W->nb[2] + (size_t) r0_*W->nb[1], (size_t) (r1_ - r0_)*W->nb[1]);
+        e = e_; r0 = r0_; r1 = r1_;
+    }
+};
+
+#if defined(__linux__)
+// file behind an address, from /proc/self/maps: the release path checks that a
+// slab really lies in a shared file mapping before MADV_DONTNEED (destructive on
+// anonymous memory), and can drop its pages from the page cache via the file
+// (fadvise), much cheaper than MADV_PAGEOUT (TLB shootdowns page by page)
+struct dragon_moe_file_map {
+    struct region {
+        uintptr_t beg, end;
+        uint64_t  off;   // file offset of beg
+        int       fd;    // -1: not a shared file mapping
+    };
+    std::mutex          mtx;
+    std::vector<region> regions;
+    std::unordered_map<std::string, int> fds; // path -> fd
+
+    static dragon_moe_file_map & get() {
+        static dragon_moe_file_map m;
+        return m;
+    }
+
+    void reload() {
+        regions.clear();
+        FILE * f = fopen("/proc/self/maps", "r");
+        if (!f) {
+            return;
+        }
+        char line[4096];
+        while (fgets(line, sizeof(line), f)) {
+            unsigned long long beg, end, off;
+            char perms[8], dev[32];
+            unsigned long long inode;
+            int n_read = 0;
+            if (sscanf(line, "%llx-%llx %7s %llx %31s %llu %n", &beg, &end, perms, &off, dev, &inode, &n_read) < 6) {
+                continue;
+            }
+            std::string path = line + n_read;
+            while (!path.empty() && (path.back() == '\n' || path.back() == ' ')) {
+                path.pop_back();
+            }
+            int fd = -1;
+            if (perms[3] == 's' && inode != 0 && !path.empty() && path[0] == '/') {
+                auto it = fds.find(path);
+                if (it == fds.end()) {
+                    it = fds.emplace(path, open(path.c_str(), O_RDONLY | O_CLOEXEC)).first;
+                }
+                fd = it->second;
+            }
+            regions.push_back({ (uintptr_t) beg, (uintptr_t) end, (uint64_t) off, fd });
+        }
+        fclose(f);
+    }
+
+    // fd and file offset of [a, b) if it lies in one shared file mapping
+    bool find(uintptr_t a, uintptr_t b, int * fd, uint64_t * off) {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (int pass = 0; pass < 2; ++pass) {
+            for (const region & r : regions) {
+                if (a >= r.beg && a < r.end) {
+                    // the range may run into the next VMA of the same mapping
+                    // (madvise splits VMAs); require the same file, contiguous
+                    uintptr_t   cur  = r.end;
+                    const region * last = &r;
+                    while (cur < b) {
+                        const region * nx = nullptr;
+                        for (const region & q : regions) {
+                            if (q.beg == cur) { nx = &q; break; }
+                        }
+                        if (!nx || nx->fd != r.fd || nx->off != last->off + (last->end - last->beg)) {
+                            break;
+                        }
+                        last = nx;
+                        cur  = nx->end;
+                    }
+                    if (r.fd >= 0 && cur >= b) {
+                        *fd  = r.fd;
+                        *off = r.off + (a - r.beg);
+                        return true;
+                    }
+                    break;
+                }
+            }
+            if (pass == 0) {
+                reload();
+            }
+        }
+        return false;
+    }
+};
+#endif
+
+// drop the pages of [p, p+n), rounded outward to 64 KiB: a fault (or
+// MADV_POPULATE_READ) also maps the neighbouring pages that are in the page
+// cache within the aligned fault-around window (Linux fault_around_bytes, 64 KiB
+// by default), i.e. the edges of the adjacent slabs; releasing only the slab's
+// own pages leaves ~1/3 of the experts mapped after a while. A page of a cached
+// neighbour released here is simply re-read later. Only non-destructive
+// operations: the pages are re-read from the file on the next access.
+static void dragon_moe_release(const char * p, size_t n) {
+#if defined(__linux__) || defined(__APPLE__)
+    const uintptr_t ps = std::max<uintptr_t>(dragon_moe_page_size(), 64*1024);
+    const uintptr_t a  = (uintptr_t) p & ~(ps - 1);
+    const uintptr_t b  = ((uintptr_t) p + n + ps - 1) & ~(ps - 1);
+#if defined(__linux__)
+#ifndef MADV_PAGEOUT
+#define MADV_PAGEOUT 21
+#endif
+    // Linux: unmap from this process (MADV_DONTNEED, non-destructive on a shared
+    // file mapping, which is checked first). The pages stay in the page cache,
+    // which the kernel reclaims under pressure (or at a cgroup limit) and which
+    // serves the experts that come back soon; DRAGON_EXPERT_DROP_CACHE=1 also
+    // drops them from the page cache right away (strict footprint, ~25% slower:
+    // the kernel drains the per-CPU page lists of every core). Unknown mappings:
+    // MADV_PAGEOUT (slow, also non-destructive).
+    static const bool drop_cache = [] {
+        const char * e = getenv("DRAGON_EXPERT_DROP_CACHE");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    int fd; uint64_t off;
+    if (dragon_moe_file_map::get().find(a, b, &fd, &off)) {
+        madvise((void *) a, b - a, MADV_DONTNEED);
+        if (drop_cache) {
+            posix_fadvise(fd, (off_t) off, (off_t) (b - a), POSIX_FADV_DONTNEED);
+        }
+    } else {
+        madvise((void *) a, b - a, MADV_PAGEOUT);
+    }
+#else
+    madvise((void *) a, b - a, MADV_DONTNEED);
+#endif
+#else
+    GGML_UNUSED(p);
+    GGML_UNUSED(n);
+#endif
+}
+
+// process-wide LRU of resident expert slabs (keyed by address)
+struct dragon_moe_pager {
+    using slab = std::pair<const char *, size_t>;
+    std::mutex mtx;
+    std::list<slab> lru; // front = most recently used
+    std::unordered_map<const char *, std::list<slab>::iterator> pos;
+    size_t bytes = 0;
+
+    static dragon_moe_pager & get() {
+        static dragon_moe_pager p;
+        return p;
+    }
+
+    // mark the slabs as most recently used, then drop the least recently used
+    // ones until the resident set fits in budget bytes; the dropped slabs are
+    // returned in out_ptrs/out_sizes (at most max_out, the rest is released here)
+    int used(const char * const * ptrs, const size_t * sizes, int n, size_t budget,
+             const char ** out_ptrs, size_t * out_sizes, int max_out) {
+        std::lock_guard<std::mutex> lock(mtx);
+        for (int i = 0; i < n; ++i) {
+            auto it = pos.find(ptrs[i]);
+            if (it != pos.end()) {
+                lru.splice(lru.begin(), lru, it->second);
+            } else {
+                lru.emplace_front(ptrs[i], sizes[i]);
+                pos[ptrs[i]] = lru.begin();
+                bytes += sizes[i];
+            }
+        }
+        int n_out = 0;
+        while (bytes > budget && !lru.empty()) {
+            const slab s = lru.back();
+            lru.pop_back();
+            pos.erase(s.first);
+            bytes -= s.second;
+            if (n_out < max_out) {
+                out_ptrs[n_out]  = s.first;
+                out_sizes[n_out] = s.second;
+                ++n_out;
+            } else {
+                dragon_moe_release(s.first, s.second);
+            }
+        }
+        return n_out;
+    }
+};
+
+// the up and down slabs of the experts flagged in used[] (expert order, so the
+// reads are in file order)
+static int dragon_moe_slabs(const ggml_tensor * W_up, const ggml_tensor * W_down, const uint8_t * used,
+                            int64_t n_expert, const char ** ptrs, size_t * sizes) {
+    int n = 0;
+    for (const ggml_tensor * W : { W_up, W_down }) {
+        for (int64_t e = 0; e < n_expert; ++e) {
+            if (used[e]) {
+                ptrs[n]  = (const char *) W->data + (size_t) e*W->nb[2];
+                sizes[n] = W->nb[2];
+                ++n;
+            }
+        }
+    }
+    return n;
+}
+
 static void ggml_compute_forward_dragon_moe_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -13574,6 +13864,11 @@ static void ggml_compute_forward_dragon_moe_f32(
     float   * wsel    = (float *)   (mine + ws.wsel);
     float   * scores  = (float *)   (mine + ws.scores);
     uint8_t * taken   = (uint8_t *) (mine + ws.taken);
+    int32_t * order   = (int32_t *) (mine + ws.order);
+    int32_t * cnt     = (int32_t *) (mine + ws.cnt);
+
+    // low-memory mode: >= 0 = expert weights paged from disk, budget in MiB
+    const int32_t cache_mib = ggml_get_op_params_i32(dst, 2);
 
     const size_t qs_ld = dragon_moe_qrow(W_ld->type,   d.n_embd);
     const size_t qs_r  = dragon_moe_qrow(W_r->type,    d.n_embd);
@@ -13629,7 +13924,7 @@ static void ggml_compute_forward_dragon_moe_f32(
     }
     ggml_barrier(params->threadpool);
 
-    // ---- stage B: selection + weights (redundant per thread), expert up, shared down
+    // ---- stage B: selection + weights (redundant per thread), shared down, expert up
     {
         for (int64_t t = 0; t < T; ++t) {
             const float * lt = logits + t*d.n_expert;
@@ -13647,28 +13942,45 @@ static void ggml_compute_forward_dragon_moe_f32(
             for (int64_t i = 0; i < k; ++i) {
                 wt[i] = (wt[i]/sum)*w_scale;
             }
-            dragon_moe_quantize(W_up->type, lat + t*d.n_lat, latq + t*qs_up, d.n_lat);
         }
 
-        // expert up rows, flattened over (t, kk, row)
-        {
-            ggml_vec_dot_t const vec_dot = ggml_get_type_traits_cpu(W_up->type)->vec_dot;
-            const int64_t n_rows = T*k*d.n_ff;
-            dragon_moe_split(n_rows, ith, nth, &a, &b);
-            for (int64_t i = a; i < b; ) {
-                const int64_t t  = i/(k*d.n_ff);
-                const int64_t kk = (i/d.n_ff) % k;
-                const int64_t r0 = i % d.n_ff;
-                const int64_t r1 = std::min<int64_t>(d.n_ff, r0 + (b - i));
-                const int32_t e  = sel[t*k + kk];
-                GGML_ASSERT(e >= 0 && e < d.n_expert);
-                const char * wbase = (const char *) W_up->data + (size_t) e*W_up->nb[2];
-                const char * xq    = latq + t*qs_up;
-                float * out = up + (t*k + kk)*d.n_ff;
-                for (int64_t r = r0; r < r1; ++r) {
-                    vec_dot((int) d.n_lat, out + r, 0, wbase + r*W_up->nb[1], 0, xq, 0, 1);
+        // (token, expert) pairs grouped by expert (counting sort, stable), so the
+        // tokens routed to one expert reuse its slab while it is in cache
+        for (int64_t e = 0; e <= d.n_expert; ++e) {
+            cnt[e] = 0;
+        }
+        for (int64_t p = 0; p < T*k; ++p) {
+            GGML_ASSERT(sel[p] >= 0 && sel[p] < d.n_expert);
+            cnt[sel[p] + 1]++;
+        }
+        for (int64_t e = 0; e < d.n_expert; ++e) {
+            cnt[e + 1] += cnt[e];
+        }
+        for (int64_t p = 0; p < T*k; ++p) {
+            order[cnt[sel[p]]++] = (int32_t) p;
+        }
+
+        // low-memory mode: every thread starts the reads of the expert rows it
+        // will compute (up now, down in stage C), so the requests go out in
+        // parallel and the shared expert below runs while they are in flight
+        if (cache_mib >= 0) {
+            for (int w = 0; w < 2; ++w) {
+                const ggml_tensor * Wx = w == 0 ? W_up : W_down;
+                const int64_t n_r = w == 0 ? d.n_ff : d.n_lat;
+                int64_t a2, b2;
+                dragon_moe_split(T*k*n_r, ith, nth, &a2, &b2);
+                int64_t le = -1, l0 = 0, l1 = 0;
+                for (int64_t i = a2; i < b2; ) {
+                    const int64_t pair = order[i/n_r];
+                    const int64_t r0   = i % n_r;
+                    const int64_t r1   = std::min<int64_t>(n_r, r0 + (b2 - i));
+                    const int64_t e    = sel[pair];
+                    if (!(e == le && r0 >= l0 && r1 <= l1)) {
+                        dragon_moe_prefetch((const char *) Wx->data + (size_t) e*Wx->nb[2] + (size_t) r0*Wx->nb[1], (size_t) (r1 - r0)*Wx->nb[1]);
+                        le = e; l0 = r0; l1 = r1;
+                    }
+                    i += r1 - r0;
                 }
-                i += r1 - r0;
             }
         }
 
@@ -13681,21 +13993,52 @@ static void ggml_compute_forward_dragon_moe_f32(
             }
             dragon_moe_gemv(W_ds, (const char *) W_ds->data, d.n_ff_sh, a, b, ushq, qs_ds, T, dsh, d.n_embd);
         }
+
+        for (int64_t t = 0; t < T; ++t) {
+            dragon_moe_quantize(W_up->type, lat + t*d.n_lat, latq + t*qs_up, d.n_lat);
+        }
+
+        // expert up rows, flattened over (pair in expert order, row)
+        {
+            ggml_vec_dot_t const vec_dot = ggml_get_type_traits_cpu(W_up->type)->vec_dot;
+            const int64_t n_rows = T*k*d.n_ff;
+            dragon_moe_split(n_rows, ith, nth, &a, &b);
+            dragon_moe_populated pop;
+            for (int64_t i = a; i < b; ) {
+                const int64_t pair = order[i/d.n_ff];
+                const int64_t t    = pair/k;
+                const int64_t r0   = i % d.n_ff;
+                const int64_t r1   = std::min<int64_t>(d.n_ff, r0 + (b - i));
+                const int32_t e    = sel[pair];
+                if (cache_mib >= 0) {
+                    pop.rows(W_up, e, r0, r1);
+                }
+                const char * wbase = (const char *) W_up->data + (size_t) e*W_up->nb[2];
+                const char * xq    = latq + t*qs_up;
+                float * out = up + pair*d.n_ff;
+                for (int64_t r = r0; r < r1; ++r) {
+                    vec_dot((int) d.n_lat, out + r, 0, wbase + r*W_up->nb[1], 0, xq, 0, 1);
+                }
+                i += r1 - r0;
+            }
+        }
     }
     ggml_barrier(params->threadpool);
 
-    // ---- stage C: expert down rows, flattened over (t, kk, row)
+    // ---- stage C: expert down rows, flattened over (pair in expert order, row)
     {
         ggml_vec_dot_t const vec_dot = ggml_get_type_traits_cpu(W_down->type)->vec_dot;
         const int64_t n_rows = T*k*d.n_lat;
         dragon_moe_split(n_rows, ith, nth, &a, &b);
         int64_t last_pair = -1;
+        dragon_moe_populated pop;
         for (int64_t i = a; i < b; ) {
-            const int64_t t  = i/(k*d.n_lat);
-            const int64_t kk = (i/d.n_lat) % k;
+            const int64_t pair = order[i/d.n_lat];
             const int64_t r0 = i % d.n_lat;
             const int64_t r1 = std::min<int64_t>(d.n_lat, r0 + (b - i));
-            const int64_t pair = t*k + kk;
+            if (cache_mib >= 0) {
+                pop.rows(W_down, sel[pair], r0, r1);
+            }
             if (pair != last_pair) {
                 dragon_moe_relu2(tmp, up + pair*d.n_ff, d.n_ff);
                 dragon_moe_quantize(W_down->type, tmp, upq + pair*qs_dn, d.n_ff);
@@ -13740,6 +14083,33 @@ static void ggml_compute_forward_dragon_moe_f32(
                     out[t*d.n_embd + r] += dsh[t*d.n_embd + r];
                 }
             }
+        }
+    }
+
+    // low-memory mode: no thread reads the expert weights past the stage C
+    // barrier. Thread 0 updates the LRU of resident slabs (taken[] still holds
+    // the experts of this call, see stage B) and publishes the slabs to drop;
+    // all threads then release a share of them.
+    if (cache_mib >= 0) {
+        const char ** ev_ptr  = (const char **) (shared + ws.ev_ptr);
+        size_t      * ev_size = (size_t *)      (shared + ws.ev_size);
+        int32_t     * ev_n    = (int32_t *)     (shared + ws.ev_n);
+        if (ith == 0) {
+            for (int64_t e = 0; e < d.n_expert; ++e) {
+                taken[e] = 0;
+            }
+            for (int64_t p = 0; p < T*k; ++p) {
+                taken[sel[p]] = 1;
+            }
+            std::vector<const char *> ptrs(2*d.n_expert);
+            std::vector<size_t>       sizes(2*d.n_expert);
+            const int n = dragon_moe_slabs(W_up, W_down, taken, d.n_expert, ptrs.data(), sizes.data());
+            *ev_n = dragon_moe_pager::get().used(ptrs.data(), sizes.data(), n, (size_t) cache_mib*1024*1024,
+                                                 ev_ptr, ev_size, (int) (4*d.n_expert));
+        }
+        ggml_barrier(params->threadpool);
+        for (int32_t j = ith; j < *ev_n; j += nth) {
+            dragon_moe_release(ev_ptr[j], ev_size[j]);
         }
     }
 }
