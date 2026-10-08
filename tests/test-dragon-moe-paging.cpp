@@ -7,7 +7,8 @@
 //   3. control: the same mapped weights without paging (expert_cache_mib = -1)
 //      do grow the resident set, so the measurement in 2 is meaningful
 //   4. a cache budget keeps roughly that much resident
-// Runs on Linux (MADV_DONTNEED), macOS (MADV_DONTNEED) and Windows (VirtualUnlock).
+// Runs on Linux (MADV_DONTNEED) and Windows (VirtualUnlock); on macOS the resident
+// size excludes file-backed pages, so only the numerics are checked there.
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -247,8 +248,20 @@ int main() {
         printf("2. resident growth with paging (T=64 + 16 decode steps): %+.1f MiB\n", r1 - r0);
         printf("3. resident growth without paging (control):             %+.1f MiB (experts: %.1f MiB)\n", r2 - r1, touched);
         printf("4. resident growth with a 32 MiB expert budget:          %+.1f MiB\n", r4 - r3);
-        if (r0 < 0) {
-            printf("cannot read the resident set size: memory checks skipped\n");
+        bool measurable = r0 >= 0;
+#if defined(__APPLE__)
+        // the macOS task resident size / footprint does not include clean
+        // file-backed pages (they count as reclaimable file cache), so mapped
+        // experts never show up in it: only the numerics can be checked here
+        if (measurable && r2 - r1 < 0.3*touched) {
+            printf("the resident size of this OS does not count file-backed pages: memory checks skipped\n");
+            measurable = false;
+        }
+#endif
+        if (!measurable) {
+            if (r0 < 0) {
+                printf("cannot read the resident set size: memory checks skipped\n");
+            }
         } else {
             const bool control_ok = r2 - r1 > 0.3*touched;
             const bool paged_ok   = r1 - r0 < 16.0;

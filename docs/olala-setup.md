@@ -132,7 +132,8 @@ q5_k_m, 0.7 GiB small) plus ≈ 0.3 GiB of buffers stays in RAM.
   Windows `VirtualUnlock` = out of the working set, macOS `madvise`), and all read
   them ahead in large requests (`madvise` / `PrefetchVirtualMemory`). Linux also maps
   them in one call per thread; on Windows and macOS this is page faults, a bit slower.
-  The CI test `test-dragon-moe-paging` checks the release on all three.
+  The CI test `test-dragon-moe-paging` checks the release on Linux and Windows
+  (macOS does not count clean file-backed pages in a process's memory anyway).
 - Windows laptop: in a terminal from the "x64 Native Tools" prompt (or any shell
   with Visual Studio 2022 + CMake),
 
