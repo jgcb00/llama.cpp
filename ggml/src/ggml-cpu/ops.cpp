@@ -12529,6 +12529,15 @@ void ggml_compute_forward_dsv4_hc_post(
     }
 }
 
+// read prefetch hint, low temporal locality (MSVC has no __builtin_prefetch)
+#if defined(__GNUC__) || defined(__clang__)
+#define DRAGON_PREFETCH_L2(p) __builtin_prefetch((p), 0, 1)
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#define DRAGON_PREFETCH_L2(p) _mm_prefetch((const char *) (p), _MM_HINT_T1)
+#else
+#define DRAGON_PREFETCH_L2(p) ((void) (p))
+#endif
+
 // ggml_compute_forward_mamba3_mimo
 //
 // fused Dragon Mamba3-MIMO mixer core (see ggml.h). Work unit = one head; a
@@ -13216,13 +13225,13 @@ static void ggml_compute_forward_mamba3_mimo_f32(
                     if (tok + 2 < tok1) {
                         const char * pn = (const char *) pstat->data + (tok + 2)*pstat->nb[1] + h*(2*D_v + 3)*sizeof(float);
                         for (size_t off = 0; off < (2*D_v + 3)*sizeof(float); off += 64) {
-                            __builtin_prefetch(pn + off, 0, 1);
+                            DRAGON_PREFETCH_L2(pn + off);
                         }
                     }
                     if (tok + 1 < tok1) {
                         const char * bn = (const char *) (shared + (tok + 1)*prep_stride);
                         for (size_t off = 0; off < (2*R*D_qk + n_ang)*sizeof(float); off += 64) {
-                            __builtin_prefetch(bn + off, 0, 1);
+                            DRAGON_PREFETCH_L2(bn + off);
                         }
                     }
                     const float gamma = trap*dt;

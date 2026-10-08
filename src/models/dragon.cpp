@@ -80,8 +80,8 @@ static bool dragon_env_on(const char * name) {
 }
 
 static inline void dragon_simd_fma_inplace_dual(
-        float * __restrict__ out1, const float * __restrict__ in1, float a1,
-        float * __restrict__ out2, const float * __restrict__ in2, float a2,
+        float * GGML_RESTRICT out1, const float * GGML_RESTRICT in1, float a1,
+        float * GGML_RESTRICT out2, const float * GGML_RESTRICT in2, float a2,
         int64_t n) {
     int64_t i = 0;
 #if defined(__AVX512F__)
@@ -119,9 +119,9 @@ static inline void dragon_simd_fma_inplace_dual(
 }
 
 // state[i] = alpha * state[i] + beta * prev[i] + gamma * curr[i]
-static inline void dragon_simd_state_update(float * __restrict__ state,
-                                            const float * __restrict__ prev,
-                                            const float * __restrict__ curr,
+static inline void dragon_simd_state_update(float * GGML_RESTRICT state,
+                                            const float * GGML_RESTRICT prev,
+                                            const float * GGML_RESTRICT curr,
                                             float alpha, float beta, float gamma,
                                             int64_t n) {
     int64_t i = 0;
@@ -171,16 +171,16 @@ static inline void dragon_simd_state_update(float * __restrict__ state,
 // bit-identical on the AVX-512 path.
 template <int RC>
 static inline void dragon_simd_fused_step_r(
-        float * __restrict__ st,           // (Dv_sl, D_qk)
-        const float * __restrict__ K_st,   // (RC, D_qk)  previous-step k_rot
-        const float * __restrict__ V_st,   // (RC, Dv_sl) previous-step v
-        const float * __restrict__ k_rot,  // (RC, D_qk)
-        const float * __restrict__ q_rot,  // (RC, D_qk)
-        const float * __restrict__ v_loc,  // (RC, Dv_sl)
-        const float * __restrict__ z_loc,  // (RC, Dv_sl)
-        const float * __restrict__ mo,     // mimo_o at (p0, ·, h): stride m_s1 per r
+        float * GGML_RESTRICT st,           // (Dv_sl, D_qk)
+        const float * GGML_RESTRICT K_st,   // (RC, D_qk)  previous-step k_rot
+        const float * GGML_RESTRICT V_st,   // (RC, Dv_sl) previous-step v
+        const float * GGML_RESTRICT k_rot,  // (RC, D_qk)
+        const float * GGML_RESTRICT q_rot,  // (RC, D_qk)
+        const float * GGML_RESTRICT v_loc,  // (RC, Dv_sl)
+        const float * GGML_RESTRICT z_loc,  // (RC, Dv_sl)
+        const float * GGML_RESTRICT mo,     // mimo_o at (p0, ·, h): stride m_s1 per r
         int64_t m_s1,
-        float * __restrict__ y_row,        // (Dv_sl)
+        float * GGML_RESTRICT y_row,        // (Dv_sl)
         float alpha, float beta, float gamma, float D_h,
         int64_t D_qk, int64_t Dv_sl) {
 #if defined(__AVX512F__)
@@ -277,7 +277,7 @@ static inline void dragon_simd_fused_step(
 // from K_st/V_st for tt==0 and from token tt-1's k/v buffers otherwise.
 template <int RC, int TB>
 static inline void dragon_simd_fused_step_tb(
-        float * __restrict__ st,
+        float * GGML_RESTRICT st,
         const float * K_st, const float * V_st,
         const float * const * k_rot,   // TB pointers, each (RC, D_qk)
         const float * const * q_rot,
@@ -466,7 +466,7 @@ static inline void dragon_silu_mul_n(const float * a, const float * b, const flo
 // in the sweep. Within a token group, token tt's kv is token tt+1's kv_prev.
 template <int RC, int TB>
 static inline void dragon_step_v2(
-        float * __restrict__ st,
+        float * GGML_RESTRICT st,
         const float * K_st, const float * V_st,
         const float * const * k_rot, const float * const * q_rot,
         const float * const * v_loc, const float * const * w_loc,
@@ -568,8 +568,8 @@ static inline void dragon_step_v2_dispatch(
 }
 
 // dot product
-static inline float dragon_simd_dot(const float * __restrict__ a,
-                                    const float * __restrict__ b,
+static inline float dragon_simd_dot(const float * GGML_RESTRICT a,
+                                    const float * GGML_RESTRICT b,
                                     int64_t n) {
     int64_t i = 0;
     float acc = 0.0f;
