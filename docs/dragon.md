@@ -19,7 +19,7 @@ Branch: **`olala-master`** (rebased on upstream master of 2026-10-02).
 | target | command | notes |
 |---|---|---|
 | CPU (x86 / ARM) | `cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j` | fast kernels are ggml-cpu ops: AVX-512, AVX2 and NEON paths, runtime ISA dispatch in multi-variant builds |
-| Apple (Metal) | `cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j` | see [dragon-metal-testing.md](dragon-metal-testing.md) — Metal kernels not yet validated on hardware |
+| Apple (Metal) | `cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j` | validated on an M5 Pro (see [olala-setup.md](olala-setup.md) §2b); checklist in [dragon-metal-testing.md](dragon-metal-testing.md) |
 | NVIDIA (CUDA) | `cmake -B build-cuda -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build-cuda -j` | on boxes with several CUDA toolkits pin `-DCMAKE_CUDA_COMPILER=… -DCMAKE_CUDA_HOST_COMPILER=…` |
 
 No environment variables are needed: layers whose weights sit on a GPU automatically

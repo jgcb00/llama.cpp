@@ -8,7 +8,7 @@ Background, measurements and debug switches: [dragon.md](dragon.md).
 |---|---|---|
 | CPU x86-64 (AVX-512 / AVX2) | **q5_k_m** (q6_k for best quality) | validated |
 | CPU ARM64 (Linux, macOS without Metal) | q5_k_m | compiles; not benchmarked |
-| Mac, Metal | **bf16** | written, **not yet run on a Mac** — follow [dragon-metal-testing.md](dragon-metal-testing.md) first |
+| Mac, Metal | **bf16** | validated (M5 Pro 24 GB, macOS 26.4): pp512 ≈ 2070 t/s, tg128 ≈ 70 t/s |
 | NVIDIA, CUDA | **bf16** | validated (H100) |
 
 Quantized weights on GPUs (CUDA, Metal) can produce NaN/garbage: Dragon's outlier
@@ -37,6 +37,11 @@ pip install -r requirements/requirements-convert_hf_to_gguf.txt
 CKPT=/path/to/dpo-checkpoint-99k-newRLHF
 python3 convert_hf_to_gguf.py $CKPT --outtype bf16 --outfile olala-bf16.gguf
 ```
+
+Converting straight from a private HF repo (`convert_hf_to_gguf.py OVHaiLLM/olala-7a1b-dpo99k --remote …`)
+uses the token saved by `hf auth login` (or `HF_TOKEN`). Two caveats: `--remote` does not fetch
+`chat_template.jinja`, so download the checkpoint instead if you want the template in the GGUF
+(see the troubleshooting table); and if the Xet downloads keep failing, set `HF_HUB_DISABLE_XET=1`.
 
 `olala-bf16.gguf` (12.7 GiB) is the GPU file. For CPU, quantize it — **always with the
 safe overrides** (plain llama-quantize recipes silently produce NaN-prone files on this
@@ -110,11 +115,14 @@ cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-**First run the validation checklist** in [dragon-metal-testing.md](dragon-metal-testing.md)
-(shader compile, `test-backend-ops -b MTL0`, CPU-vs-Metal greedy diff). The Metal kernels
-have not been run on Apple hardware yet; send back the outputs listed in its section 6.
+Validated on an Apple M5 Pro (24 GB, macOS 26.4.1, PR #1): op tests 18/18, CPU-vs-Metal
+greedy output identical on 15- and 481-token prompts, pp512 ≈ 2070 t/s, pp2048 ≈ 2250 t/s,
+tg128 ≈ 70 t/s (49 t/s at 32k context), 8 users × 128 tokens ≈ 290 t/s total. On a new
+machine or macOS version it is still worth running the checklist in
+[dragon-metal-testing.md](dragon-metal-testing.md) (`test-backend-ops -b MTL0`,
+CPU-vs-Metal greedy diff) before relying on the output.
 
-Once validated:
+Then:
 
 ```sh
 ./build/bin/llama-bench  -m olala-bf16.gguf -ngl 99 -fa 1 -p 512 -n 128
