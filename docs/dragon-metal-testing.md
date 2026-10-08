@@ -3,9 +3,10 @@
 The Metal kernels for `GGML_OP_MAMBA3_MIMO` and `GGML_OP_GEODESIC`
 (`ggml/src/ggml-metal/kernels/mamba3.metal`) were written on Linux without a Metal
 compiler. They passed a clang syntax/address-space check and a functional emulation
-against the CPU reference, but **they have never been compiled by Apple's Metal
-compiler or run on a Mac**. Run the steps below in order and send back the outputs
-listed in section 6.
+against the CPU reference, and were first validated on real hardware in PR #1
+(Apple M5 Pro, macOS 26.4.1: op tests 18/18, CPU-vs-Metal greedy identical, pp512 ≈ 2070 t/s,
+tg128 ≈ 70 t/s). On a different chip or macOS version, run the steps below in order and
+send back the outputs listed in section 6 if anything differs.
 
 Model used below: `olala-dpo99k-bf16.gguf` (use **bf16** on the GPU, see section 5).
 
