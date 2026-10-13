@@ -119,12 +119,26 @@ size_t ggml_metal_op_dragon_moe_smem(const struct ggml_tensor * op, int which) {
     const int64_t tb      = std::min<int64_t>(4, n_tok); // DMOE_TB
     size_t n = 0;
     switch (which) {
-        case 0: n = tb*n_embd;              break; // a : x of the pass
+        case 0: n = tb*n_embd + 16;         break; // a : x of the pass | red (fused input geodesic)
         case 1: n = n_lat + 16 + 2*k;       break; // b1: lat | red | redi | selv | sele
         case 2: n = n_ff;                   break; // b2: h
         default: n = std::min<int64_t>(2, n_tok)*(n_lat + n_ff_sh); break; // c : routed | ush of the pass
     }
+    if (ggml_metal_op_dragon_moe_sh_split(op)) {
+        // the shared expert runs in extra threadgroups of b1 (up, as kernel a) and b2 (down, as kernel c)
+        switch (which) {
+            case 1: n = std::max<int64_t>(n, tb*n_embd); break;
+            case 2: n = std::max<int64_t>(n, std::min<int64_t>(2, n_tok)*n_ff_sh); break;
+            case 3: n = std::min<int64_t>(2, n_tok)*n_lat; break;
+            default: break;
+        }
+    }
     return GGML_PAD(n*sizeof(float), 16);
+}
+
+bool ggml_metal_op_dragon_moe_sh_split(const struct ggml_tensor * op) {
+    static const int max_t = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_SH_SPLIT_T"); return e ? atoi(e) : 2; }();
+    return op->src[0]->ne[1] <= max_t;
 }
 
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {

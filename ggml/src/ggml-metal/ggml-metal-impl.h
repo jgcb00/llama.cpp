@@ -122,6 +122,7 @@
 #define FC_DSV4_HC                     2000
 #define FC_PAD                         2100
 #define FC_FLASH_ATTN_EXT_TENSOR       2200
+#define FC_DRAGON_MOE                  2300
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -1079,8 +1080,13 @@ typedef struct {
     int64_t off_h;      // (n_ff, k, n_tok) relu^2 of the expert up projections
     int64_t off_o;      // (n_lat, k, n_tok) weighted expert outputs
     int64_t off_cnt;    // uint counter of the finished threadgroups of kernel c (reset by kernel a)
+    int64_t off_dsh;    // (n_embd, n_tok) shared-expert down projection (sh_split)
     int32_t geo;        // 1: the last threadgroup of kernel c applies the following GEODESIC (fused)
     float   geo_inv_depth;
+    int32_t sh_split;   // 1: shared-expert up in extra threadgroups of b1, down in extra threadgroups of b2
+    int32_t pre_geo;    // 1: the input is GEODESIC(x, g), computed by every threadgroup of kernel a (fused)
+    float   pre_geo_inv_depth;
+    int32_t pad1;
 } ggml_metal_kargs_dragon_moe;
 
 // Dragon V-layer helpers (kernels/mamba3.metal)

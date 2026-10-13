@@ -65,6 +65,8 @@ bool ggml_metal_op_dragon_mmv_staged(const struct ggml_tensor * op);
 int ggml_metal_op_dragon_moe_nsplit2(const struct ggml_tensor * op);
 // threadgroup memory of kernel `which` (0: a, 1: b1, 2: b2, 3: c), keep in sync with kernels/mamba3.metal
 size_t ggml_metal_op_dragon_moe_smem(const struct ggml_tensor * op, int which);
+// shared expert off the critical path (in b1/b2) for batches up to GGML_METAL_DRAGON_MOE_SH_SPLIT_T tokens (default 2)
+bool ggml_metal_op_dragon_moe_sh_split(const struct ggml_tensor * op);
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
 
 #ifdef __cplusplus

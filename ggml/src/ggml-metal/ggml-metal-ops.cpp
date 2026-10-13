@@ -2277,8 +2277,25 @@ int ggml_metal_op_mamba3_mimo(ggml_metal_op_t ctx, int idx) {
     return n_fuse;
 }
 
+static int ggml_metal_op_dragon_moe_impl(ggml_metal_op_t ctx, int idx, ggml_tensor * pre);
+
 int ggml_metal_op_geodesic(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
+
+    // GEODESIC -> DRAGON_MOE(input = it): computed inside the MoE (kernel a), GGML_METAL_DRAGON_PRE_GEO_FUSE=0 disables
+    {
+        static const bool    fuse_env = [] { const char * e = getenv("GGML_METAL_DRAGON_PRE_GEO_FUSE"); return !(e && e[0] == '0'); }();
+        static const int64_t max_t    = [] { const char * e = getenv("GGML_METAL_DRAGON_PRE_GEO_FUSE_MAX_T"); return e ? (int64_t) atoll(e) : (int64_t) 2; }();
+        if (fuse_env && ctx->use_fusion() && idx + 1 < ctx->n_nodes()) {
+            ggml_tensor * m = ctx->node(idx + 1);
+            if (m->op == GGML_OP_DRAGON_MOE && m->src[0] == op && op->ne[1] <= max_t && op->ne[2] == 1 && op->ne[3] == 1 &&
+                ggml_is_contiguous(op) && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                ggml_are_same_shape(op->src[0], op) && ggml_are_same_shape(op->src[1], op) &&
+                (m->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                return 1 + ggml_metal_op_dragon_moe_impl(ctx, idx + 1, op);
+            }
+        }
+    }
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
@@ -2352,13 +2369,20 @@ size_t ggml_metal_op_dragon_moe_extra_ws(const ggml_tensor * op) {
 
     const ggml_metal_dragon_moe_dims d = ggml_metal_dragon_moe_get_dims(op);
 
-    // [lat | logits | ush | sel | wk | h | o | counter (4 floats)]
-    const int64_t n = d.n_tok*(d.n_lat + d.n_expert + d.n_ff_sh + 2*d.k + d.k*d.n_ff + d.k*d.n_lat) + 4;
+    // [lat | logits | ush | sel | wk | h | o | counter (4 floats) | dsh]
+    const int64_t n = d.n_tok*(d.n_lat + d.n_expert + d.n_ff_sh + 2*d.k + d.k*d.n_ff + d.k*d.n_lat) + 4 + d.n_tok*d.n_embd;
 
     return GGML_PAD(n*sizeof(float), 16);
 }
 
+static int ggml_metal_op_dragon_moe_impl(ggml_metal_op_t ctx, int idx, ggml_tensor * pre);
+
 int ggml_metal_op_dragon_moe(ggml_metal_op_t ctx, int idx) {
+    return ggml_metal_op_dragon_moe_impl(ctx, idx, nullptr);
+}
+
+// pre: the GEODESIC that produces the MoE input, computed by kernel a (encoded from ggml_metal_op_geodesic)
+static int ggml_metal_op_dragon_moe_impl(ggml_metal_op_t ctx, int idx, ggml_tensor * pre) {
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -2408,8 +2432,13 @@ int ggml_metal_op_dragon_moe(ggml_metal_op_t ctx, int idx) {
         /*.off_h      =*/ off_h,
         /*.off_o      =*/ off_o,
         /*.off_cnt    =*/ off_o + T*d.k*d.n_lat,
+        /*.off_dsh    =*/ off_o + T*d.k*d.n_lat + 4,
         /*.geo        =*/ 0,
         /*.geo_inv_depth =*/ 0.0f,
+        /*.sh_split   =*/ ggml_metal_op_dragon_moe_sh_split(op) ? 1 : 0,
+        /*.pre_geo    =*/ pre ? 1 : 0,
+        /*.pre_geo_inv_depth =*/ pre ? ggml_get_op_params_f32(pre, 0) : 0.0f,
+        /*.pad1       =*/ 0,
     };
 
     // fuse the following GEODESIC(x, mlp_out) into kernel c (last threadgroup), GGML_METAL_DRAGON_GEO_FUSE=0 disables
@@ -2459,20 +2488,31 @@ int ggml_metal_op_dragon_moe(ggml_metal_op_t ctx, int idx) {
     const ggml_metal_buffer_id b_ds = ggml_metal_get_buffer_id(op->src[8]);
 
     // a: input projections (lat, router logits, shared-expert up), one row per simdgroup
+    // (sh_split: the shared expert is not on the critical path of the routed one: its up projection runs in extra
+    // threadgroups of b1, its down projection in extra threadgroups of b2)
+    const bool sh = args.sh_split != 0;
+    GGML_ASSERT(!sh || (d.n_lat + d.n_expert) % 8 == 0);
     if (!skip_a) {
-        encode(0, { b_x, b_ld, b_r, b_us, bid_ws }, (d.n_lat + d.n_expert + d.n_ff_sh + 7)/8, 1);
+        if (pre) {
+            encode(0, { ggml_metal_get_buffer_id(pre->src[0]), b_ld, b_r, b_us, bid_ws, ggml_metal_get_buffer_id(pre->src[1]),
+                        ggml_metal_get_buffer_id(pre->src[2]), ggml_metal_get_buffer_id(pre->src[3]), b_x },
+                   (d.n_lat + d.n_expert + (sh ? 0 : d.n_ff_sh) + 7)/8, 1);
+        } else {
+            // unused geodesic slots bound to x (never read)
+            encode(0, { b_x, b_ld, b_r, b_us, bid_ws, b_x, b_x, b_x, b_x }, (d.n_lat + d.n_expert + (sh ? 0 : d.n_ff_sh) + 7)/8, 1);
+        }
     }
     ggml_metal_op_concurrency_reset(ctx);
 
     // b1: routing + expert up, one threadgroup per (token, expert slot, FF slice)
     if (!skip_1) {
-        encode(1, { bid_ws, b_rb, b_up, bid_ws }, d.k*d.nsplit, T);
+        encode(1, { bid_ws, b_rb, b_up, bid_ws, b_x, b_us }, d.k*d.nsplit + (sh ? (d.n_ff_sh + 7)/8 : 0), T);
     }
     ggml_metal_op_concurrency_reset(ctx);
 
     // b2: expert down, one threadgroup per (token, expert slot, n_lat row slice)
     if (!skip_2) {
-        encode(2, { bid_ws, b_dn, bid_ws }, d.k*d.nsplit, T);
+        encode(2, { bid_ws, b_dn, bid_ws, b_ds }, d.k*d.nsplit + (sh ? (d.n_embd + 7)/8 : 0), T);
     }
     ggml_metal_op_concurrency_reset(ctx);
 
@@ -2487,11 +2527,7 @@ int ggml_metal_op_dragon_moe(ggml_metal_op_t ctx, int idx) {
         }
     }
 
-    if (geo) {
-        return 2;
-    }
-
-    return 1;
+    return geo ? 2 : 1;
 }
 
 int ggml_metal_op_dragon_mmv(ggml_metal_op_t ctx, int idx) {

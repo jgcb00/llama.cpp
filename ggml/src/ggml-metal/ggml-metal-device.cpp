@@ -802,17 +802,30 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_moe(ggml_
     GGML_ASSERT(op->op == GGML_OP_DRAGON_MOE);
 
     const ggml_tensor * w = which == 0 ? op->src[1] : which == 1 ? op->src[4] : which == 2 ? op->src[5] : op->src[6];
-    const char * kname   = which == 0 ? "a" : which == 1 ? "b1" : which == 2 ? "b2" : "c";
+    const char * kname   = which == 0 ? "a" : which == 1 ? "b1" : which == 2 ? "b2" : which == 3 ? "c" : "f";
 
     char base[256];
     char name[256];
 
+    const int32_t nch_e = (int32_t) (op->src[0]->ne[0]/128);
+    const int32_t nch_l = (int32_t) (op->src[1]->ne[1]/128);
+    const int32_t nch_f = (int32_t) (op->src[4]->ne[1]/128);
+    const int32_t nch_s = (int32_t) (op->src[7]->ne[1]/128);
+
     snprintf(base, 256, "kernel_dragon_moe_%s_%s", kname, ggml_type_name(w->type));
-    snprintf(name, 256, "%s", base);
+    snprintf(name, 256, "%s_e%d_l%d_f%d_s%d", base, nch_e, nch_l, nch_f, nch_s);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
-        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int32(cv, nch_e, FC_DRAGON_MOE + 0);
+        ggml_metal_cv_set_int32(cv, nch_l, FC_DRAGON_MOE + 1);
+        ggml_metal_cv_set_int32(cv, nch_f, FC_DRAGON_MOE + 2);
+        ggml_metal_cv_set_int32(cv, nch_s, FC_DRAGON_MOE + 3);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
     }
 
     res.nsg  = 8;
