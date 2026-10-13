@@ -57,6 +57,12 @@ int ggml_metal_op_mul_mat_mv_ext_max(void);
 
 // GGML_OP_DRAGON_MOE: FF slices per expert (GGML_METAL_DRAGON_MOE_NSPLIT, default 16), each slice a multiple of 8 columns
 int ggml_metal_op_dragon_moe_nsplit(const struct ggml_tensor * op);
+int ggml_metal_op_dragon_mmv_nr(void);
+int ggml_metal_op_dragon_mmv_nsg(void);
+int ggml_metal_op_dragon_mmv_u(void);
+int ggml_metal_op_dragon_mmv_ks(void);
+bool ggml_metal_op_dragon_mmv_staged(const struct ggml_tensor * op);
+int ggml_metal_op_dragon_moe_nsplit2(const struct ggml_tensor * op);
 // threadgroup memory of kernel `which` (0: a, 1: b1, 2: b2, 3: c), keep in sync with kernels/mamba3.metal
 size_t ggml_metal_op_dragon_moe_smem(const struct ggml_tensor * op, int which);
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);

@@ -53,16 +53,60 @@ int ggml_metal_op_mul_mat_mv_ext_max(void) {
     return v;
 }
 
+// DRAGON_MMV: rows per simdgroup (1 or 2) and simdgroups per threadgroup
+int ggml_metal_op_dragon_mmv_nr(void) {
+    static const int e = ggml_metal_env_int("GGML_METAL_DRAGON_MMV_NR", 1);
+    static const int v = e >= 4 ? 4 : e >= 2 ? 2 : 1;
+    return v;
+}
+
+// DRAGON_MMV: x staged in threadgroup memory (original kernel, 8 simdgroups, one row each) above this many tokens
+bool ggml_metal_op_dragon_mmv_staged(const struct ggml_tensor * op) {
+    static const int max_t = ggml_metal_env_int("GGML_METAL_DRAGON_MMV_STAGED_T", 4);
+    return op->src[0]->ne[1] > max_t;
+}
+
+// DRAGON_MMV: K split across the simdgroups of a threadgroup (1) or one row per simdgroup (0)
+int ggml_metal_op_dragon_mmv_ks(void) {
+    static const int v = ggml_metal_env_int("GGML_METAL_DRAGON_MMV_KS", 0) != 0;
+    return v;
+}
+
+// DRAGON_MMV: 4-wide chunks per lane loaded per group (2, 4, 6 or 12)
+int ggml_metal_op_dragon_mmv_u(void) {
+    static const int e = ggml_metal_env_int("GGML_METAL_DRAGON_MMV_U", 2);
+    static const int v = e >= 12 ? 12 : e >= 6 ? 6 : e >= 4 ? 4 : 2;
+    return v;
+}
+
+int ggml_metal_op_dragon_mmv_nsg(void) {
+    static const int v = std::max(1, std::min(32, ggml_metal_env_int("GGML_METAL_DRAGON_MMV_NSG", 4)));
+    return v;
+}
+
 int ggml_metal_op_dragon_moe_nsplit(const struct ggml_tensor * op) {
     const int64_t n_ff  = op->src[4]->ne[1];
     const int64_t n_lat = op->src[1]->ne[1];
-    static const int want = ggml_metal_env_int("GGML_METAL_DRAGON_MOE_NSPLIT", 16);
+    static const int want = ggml_metal_env_int("GGML_METAL_DRAGON_MOE_NSPLIT", 32);
     for (int ns = (int) std::min<int64_t>(want, n_ff/8); ns >= 1; --ns) {
         if (n_ff % ns == 0 && (n_ff/ns) % 8 == 0 && n_lat % ns == 0) {
             return ns;
         }
     }
     return 1;
+}
+
+// n_lat row slices of kernel b2: rows per threadgroup RS = n_lat/nsplit2 with k*RS <= 8*DMOE_B2_MAXI (= 32) items
+int ggml_metal_op_dragon_moe_nsplit2(const struct ggml_tensor * op) {
+    const int64_t n_lat = op->src[1]->ne[1];
+    const int64_t k     = ggml_get_op_params_i32(op, 0);
+    static const int want_rs = ggml_metal_env_int("GGML_METAL_DRAGON_MOE_RS", 4);
+    for (int64_t rs = std::min<int64_t>(want_rs, 32/std::max<int64_t>(k, 1)); rs >= 1; --rs) {
+        if (n_lat % rs == 0) {
+            return (int) (n_lat/rs);
+        }
+    }
+    return (int) n_lat;
 }
 
 size_t ggml_metal_op_dragon_moe_smem(const struct ggml_tensor * op, int which) {

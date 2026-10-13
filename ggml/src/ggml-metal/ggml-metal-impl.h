@@ -1070,7 +1070,7 @@ typedef struct {
     float   w_scale;
     int32_t tb;         // tokens per pass in the input projections (<= DMOE_TB)
     int32_t tbc;        // tokens per threadgroup in the output projections (<= 2)
-    int32_t pad0;
+    int32_t nsplit2;    // n_lat row slices of kernel b2 (each threadgroup sums the k experts of its rows)
     int64_t off_lat;    // (n_lat, n_tok)
     int64_t off_logits; // (n_expert, n_tok)
     int64_t off_ush;    // (n_ff_sh, n_tok)  relu^2 of the shared-expert up projection
@@ -1078,6 +1078,9 @@ typedef struct {
     int64_t off_wk;     // (k, n_tok) expert weights
     int64_t off_h;      // (n_ff, k, n_tok) relu^2 of the expert up projections
     int64_t off_o;      // (n_lat, k, n_tok) weighted expert outputs
+    int64_t off_cnt;    // uint counter of the finished threadgroups of kernel c (reset by kernel a)
+    int32_t geo;        // 1: the last threadgroup of kernel c applies the following GEODESIC (fused)
+    float   geo_inv_depth;
 } ggml_metal_kargs_dragon_moe;
 
 // Dragon V-layer helpers (kernels/mamba3.metal)
@@ -1089,7 +1092,7 @@ typedef struct {
     int32_t rows[9];    // rows of each weight matrix
     int32_t off[9];     // first output row of each matrix
     int32_t rows_total;
-    int32_t pad0;
+    int32_t nsg;        // simdgroups per threadgroup
 } ggml_metal_kargs_dragon_mmv;
 
 typedef struct {

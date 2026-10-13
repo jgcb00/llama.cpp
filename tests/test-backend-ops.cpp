@@ -5044,9 +5044,10 @@ struct test_dragon_moe : public test_case {
     const int64_t n_ff_sh;
     const int     k;
     const float   w_scale;
+    const bool    geo; // followed by GGML_OP_GEODESIC(x2, moe) (the Metal backend fuses the pair for one token)
 
     std::string vars() override {
-        return VARS_TO_STR9(type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale);
+        return VARS_TO_STR9(type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale) + (geo ? ",geo=1" : "");
     }
 
     double max_nmse_err() override {
@@ -5054,8 +5055,8 @@ struct test_dragon_moe : public test_case {
     }
 
     test_dragon_moe(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 1536, int64_t n_tok = 1, int64_t n_lat = 384,
-            int64_t n_expert = 256, int64_t n_ff = 768, int64_t n_ff_sh = 1536, int k = 6, float w_scale = 2.45f)
-        : type_w(type_w), n_embd(n_embd), n_tok(n_tok), n_lat(n_lat), n_expert(n_expert), n_ff(n_ff), n_ff_sh(n_ff_sh), k(k), w_scale(w_scale) {}
+            int64_t n_expert = 256, int64_t n_ff = 768, int64_t n_ff_sh = 1536, int k = 6, float w_scale = 2.45f, bool geo = false)
+        : type_w(type_w), n_embd(n_embd), n_tok(n_tok), n_lat(n_lat), n_expert(n_expert), n_ff(n_ff), n_ff_sh(n_ff_sh), k(k), w_scale(w_scale), geo(geo) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
@@ -5067,7 +5068,14 @@ struct test_dragon_moe : public test_case {
         ggml_tensor * w_lu   = ggml_new_tensor_2d(ctx, type_w,        n_lat, n_embd);
         ggml_tensor * w_us   = ggml_new_tensor_2d(ctx, type_w,        n_embd, n_ff_sh);
         ggml_tensor * w_ds   = ggml_new_tensor_2d(ctx, type_w,        n_ff_sh, n_embd);
-        return ggml_dragon_moe(ctx, x, w_ld, w_r, bias, w_up, w_down, w_lu, w_us, w_ds, k, w_scale, -1);
+        ggml_tensor * out    = ggml_dragon_moe(ctx, x, w_ld, w_r, bias, w_up, w_down, w_lu, w_us, w_ds, k, w_scale, -1);
+        if (geo) {
+            ggml_tensor * x2    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+            ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_tensor * gbias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            out = ggml_geodesic(ctx, x2, out, scale, gbias, 0.5f);
+        }
+        return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -11689,6 +11697,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dragon_diff_gate(128, 48, 12, 3));
     test_cases.emplace_back(new test_dragon_diff_gate(64, 8, 2, 1));
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384, 256, 768, 1536, 6, 2.45f)); // decode
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384, 256, 768, 1536, 6, 2.45f, true)); // decode + fused geodesic
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  4, 384, 256, 768, 1536, 6, 2.45f, true)); // batched + geodesic
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  4, 384, 256, 768, 1536, 6, 2.45f)); // batched decode
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536, 19, 384, 256, 768, 1536, 6, 2.45f)); // odd batch (> 8 tokens per pass)
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F16,   256,  3, 128,  32, 128,  256, 4, 1.0f));  // small dims, f16

@@ -835,9 +835,26 @@ static ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_simple(gg
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_mmv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_ASSERT(op->op == GGML_OP_DRAGON_MMV);
     char base[256];
-    snprintf(base, 256, "kernel_dragon_mmv_%s", ggml_type_name(op->src[1]->type));
+    if (ggml_metal_op_dragon_mmv_staged(op)) {
+        snprintf(base, 256, "kernel_dragon_mmv_st_%s", ggml_type_name(op->src[1]->type));
+        ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline_simple(lib, base);
+        res.smem = GGML_PAD(std::min<int64_t>(4, op->src[0]->ne[1])*op->src[0]->ne[0]*sizeof(float), 16);
+        return res;
+    }
+    if (ggml_metal_op_dragon_mmv_ks()) {
+        // chunks per lane per row = ceil(n/128 / nsg), template sizes 2, 3, 4, 6
+        const int64_t nch = op->src[0]->ne[0]/128;
+        const int64_t cpl = (nch + ggml_metal_op_dragon_mmv_nsg() - 1)/ggml_metal_op_dragon_mmv_nsg();
+        GGML_ASSERT(cpl <= 6);
+        const int mc = cpl <= 2 ? 2 : cpl <= 3 ? 3 : cpl <= 4 ? 4 : 6;
+        snprintf(base, 256, "kernel_dragon_mmv_ks_%s_nr%d_c%d", ggml_type_name(op->src[1]->type), ggml_metal_op_dragon_mmv_nr(), mc);
+        ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline_simple(lib, base);
+        res.smem = GGML_PAD(ggml_metal_op_dragon_mmv_nr()*ggml_metal_op_dragon_mmv_nsg()*sizeof(float), 16);
+        return res;
+    }
+    snprintf(base, 256, "kernel_dragon_mmv_%s_nr%d_u%d", ggml_type_name(op->src[1]->type), ggml_metal_op_dragon_mmv_nr(), ggml_metal_op_dragon_mmv_u());
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline_simple(lib, base);
-    res.smem = GGML_PAD(std::min<int64_t>(4, op->src[0]->ne[1])*op->src[0]->ne[0]*sizeof(float), 16);
+    res.smem = 0;
     return res;
 }
 
