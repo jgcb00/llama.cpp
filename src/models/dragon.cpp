@@ -3452,7 +3452,17 @@ static ggml_tensor * build_dragon_v_mixer(
         ggml_set_name(pr, "v_proj_fused");
 
         ggml_tensor * states_all = mctx_recr->get_r_l(il);
-        ggml_tensor * shift_view = gctx.build_rs(inp_rs, states_all, hparams.n_embd_r(), n_seqs);   // (n_embd_r, n_seqs)
+        // decode with every sequence on its own cache row: read the rows in place (the prep reads them before the
+        // cpy below overwrites them), no gather - as the M layers' state view
+        static const bool state_view_env = !dragon_env_on("DRAGON_GPU_NO_STATE_VIEW");
+        const bool shift_in_place = state_view_env && n_tokens == n_seqs && inp_rs->s_copy_ident;
+        ggml_tensor * shift_view = shift_in_place
+            ? gctx.build_rs(inp_rs, states_all, hparams.n_embd_r(), n_seqs,
+                  [&](ggml_context * c, ggml_tensor * states, ggml_tensor * ids) {
+                      GGML_UNUSED(ids);
+                      return ggml_view_2d(c, states, states->ne[0], n_seqs, states->nb[1], (size_t) inp_rs->head*states->nb[1]);
+                  })
+            : gctx.build_rs(inp_rs, states_all, hparams.n_embd_r(), n_seqs);                       // (n_embd_r, n_seqs)
 
         const float slw_wsize_f = (float) std::max<uint32_t>(hparams.dragon_slw_wsize, 1u);
         ggml_tensor * prep = ggml_dragon_tpa_prep(ctx, pr, shift_view, gctx.build_inp_pos(),
