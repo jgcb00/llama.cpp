@@ -2117,6 +2117,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dragon_moe(params, tensor);
             } break;
+        case GGML_OP_DRAGON_MMV:
+            {
+                ggml_compute_forward_dragon_mmv(params, tensor);
+            } break;
+        case GGML_OP_DRAGON_TPA_PREP:
+            {
+                ggml_compute_forward_dragon_tpa_prep(params, tensor);
+            } break;
+        case GGML_OP_DRAGON_DIFF_GATE:
+            {
+                ggml_compute_forward_dragon_diff_gate(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2303,6 +2315,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MAMBA3_MIMO:
         case GGML_OP_GEODESIC:
         case GGML_OP_DRAGON_MOE:
+        case GGML_OP_DRAGON_MMV:
+        case GGML_OP_DRAGON_TPA_PREP:
+        case GGML_OP_DRAGON_DIFF_GATE:
             {
                 n_tasks = n_threads;
             } break;

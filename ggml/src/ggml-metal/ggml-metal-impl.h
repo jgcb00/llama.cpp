@@ -1057,6 +1057,73 @@ typedef struct {
     float    inv_depth;
 } ggml_metal_kargs_geodesic;
 
+// Dragon latent MoE block (kernels/mamba3.metal); workspace offsets in floats, after dst
+typedef struct {
+    int32_t n_embd;
+    int32_t n_tok;
+    int32_t n_lat;
+    int32_t n_expert;
+    int32_t n_ff;
+    int32_t n_ff_sh;
+    int32_t k;
+    int32_t nsplit;     // threadgroups per (token, expert slot): FF row slices (up) / n_lat row slices (down)
+    float   w_scale;
+    int32_t tb;         // tokens per pass in the input projections (<= DMOE_TB)
+    int32_t tbc;        // tokens per threadgroup in the output projections (<= 2)
+    int32_t pad0;
+    int64_t off_lat;    // (n_lat, n_tok)
+    int64_t off_logits; // (n_expert, n_tok)
+    int64_t off_ush;    // (n_ff_sh, n_tok)  relu^2 of the shared-expert up projection
+    int64_t off_sel;    // (k, n_tok) selected experts (as float)
+    int64_t off_wk;     // (k, n_tok) expert weights
+    int64_t off_h;      // (n_ff, k, n_tok) relu^2 of the expert up projections
+    int64_t off_o;      // (n_lat, k, n_tok) weighted expert outputs
+} ggml_metal_kargs_dragon_moe;
+
+// Dragon V-layer helpers (kernels/mamba3.metal)
+typedef struct {
+    int32_t n_embd;
+    int32_t n_tok;
+    int32_t n_ws;
+    int32_t tb;         // tokens per pass (<= 4)
+    int32_t rows[9];    // rows of each weight matrix
+    int32_t off[9];     // first output row of each matrix
+    int32_t rows_total;
+    int32_t pad0;
+} ggml_metal_kargs_dragon_mmv;
+
+typedef struct {
+    int32_t H;
+    int32_t Hn;
+    int32_t R;
+    int32_t Dh;
+    int32_t Hs;
+    int32_t n_seqs;
+    int32_t n_tok;
+    int32_t ROW;
+    int32_t GS;         // gate elements written per (head, token) threadgroup (0: head 0 writes all)
+    int32_t pad0;
+    float   eps;
+    float   wsize;
+    float   gate_b;
+    int32_t pad1;
+    int64_t prev_s;     // seq stride of prev (floats)
+    int64_t o_k;        // output offsets (floats)
+    int64_t o_v;
+    int64_t o_lam;
+    int64_t o_g;
+    int64_t o_last;
+} ggml_metal_kargs_dragon_tpa_prep;
+
+typedef struct {
+    int32_t Dh;
+    int32_t H;
+    int32_t Hn;
+    int32_t T;
+    int64_t lam_s;      // token stride of lam (floats)
+    int64_t gs_s;       // token stride of gs (floats)
+} ggml_metal_kargs_dragon_diff_gate;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne01;

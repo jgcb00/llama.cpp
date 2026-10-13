@@ -13460,7 +13460,7 @@ static dragon_moe_ws dragon_moe_layout(const ggml_tensor * op) {
     w.logits = take(T*d.n_expert*sizeof(float));
     w.ush    = take(T*d.n_ff_sh*sizeof(float));
     w.up     = take(T*k*d.n_ff*sizeof(float));
-    w.dsh    = take(T*d.n_ff_sh*sizeof(float));
+    w.dsh    = take(T*d.n_embd*sizeof(float)); // shared-expert down output (was n_ff_sh: overflowed into `down` when n_ff_sh < n_embd)
     w.down   = take(T*k*d.n_lat*sizeof(float));
     w.ev_ptr  = take(4*d.n_expert*sizeof(const char *));
     w.ev_size = take(4*d.n_expert*sizeof(size_t));
@@ -14685,5 +14685,206 @@ void ggml_compute_forward_lightning_indexer(
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
         }
+    }
+}
+
+
+// ---- Dragon V-layer helpers (reference implementations; the production CPU path keeps the author's graph) ----
+
+static inline void dragon_row_to_f32(const ggml_tensor * W, int64_t r, float * dst) {
+    const char * p = (const char *) W->data + (size_t) r*W->nb[1];
+    if (W->type == GGML_TYPE_F32) {
+        memcpy(dst, p, (size_t) W->ne[0]*sizeof(float));
+        return;
+    }
+    ggml_to_float_t to_float = ggml_get_type_traits(W->type)->to_float;
+    GGML_ASSERT(to_float != nullptr);
+    to_float(p, dst, W->ne[0]);
+}
+
+// y = concat_i(W_i^T x): rows split across the threads
+void ggml_compute_forward_dragon_mmv(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const int64_t n = x->ne[0];
+    const int64_t T = x->ne[1];
+    const int64_t rows = dst->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t r0 = rows*ith/nth;
+    const int64_t r1 = rows*(ith + 1)/nth;
+
+    std::vector<float> w(n);
+    const float * xd = (const float *) x->data;
+    float * y = (float *) dst->data;
+
+    int64_t base = 0;
+    for (int i = 1; i < GGML_MAX_SRC && dst->src[i] != nullptr; ++i) {
+        const ggml_tensor * W = dst->src[i];
+        const int64_t nr = W->ne[1];
+        const int64_t a = std::max<int64_t>(r0, base);
+        const int64_t b = std::min<int64_t>(r1, base + nr);
+        for (int64_t r = a; r < b; ++r) {
+            dragon_row_to_f32(W, r - base, w.data());
+            for (int64_t t = 0; t < T; ++t) {
+                const float * xt = xd + t*n;
+                float s = 0.0f;
+                for (int64_t c = 0; c < n; ++c) {
+                    s += w[c]*xt[c];
+                }
+                y[t*rows + r] = s;
+            }
+        }
+        base += nr;
+    }
+}
+
+static inline float dragon_sigmoid_f32(float x) { return 1.0f/(1.0f + expf(-x)); }
+
+// see ggml_dragon_tpa_prep (ggml.h) for the layouts; the math follows build_dragon_v_mixer (llama.cpp src/models/dragon.cpp)
+void ggml_compute_forward_dragon_tpa_prep(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * pr   = dst->src[0];
+    const ggml_tensor * prev = dst->src[1];
+    const ggml_tensor * pos  = dst->src[2];
+    const float * qn = (const float *) dst->src[3]->data;
+    const float * kn = (const float *) dst->src[4]->data;
+    const float * sc = (const float *) dst->src[5]->data;
+
+    const int H  = ggml_get_op_params_i32(dst, 0);
+    const int Hn = ggml_get_op_params_i32(dst, 1);
+    const int R  = ggml_get_op_params_i32(dst, 2);
+    const int Dh = ggml_get_op_params_i32(dst, 3);
+    const int Hs = ggml_get_op_params_i32(dst, 4);
+    const int n_seqs = ggml_get_op_params_i32(dst, 5);
+    const float eps    = ggml_get_op_params_f32(dst, 6);
+    const float wsize  = ggml_get_op_params_f32(dst, 7);
+    const float gate_b = ggml_get_op_params_f32(dst, 8);
+
+    const int64_t T = pr->ne[1];
+    const int64_t n_seq_t = T/n_seqs;
+    const int64_t ROW = pr->ne[0];
+    const int64_t OAK = (int64_t) H*Dh, OAV = OAK + Hn*R, OBK = OAV + Hn*R, OBV = OBK + R*Dh, OSK = OBV + R*Dh, OSV = OSK + Hn, OLAM = OSV + Hn, OG = OLAM + Hn;
+    const int64_t o_k = T*H*Dh, o_v = o_k + T*Hn*Dh, o_lam = o_v + T*Hn*Dh, o_g = o_lam + T*Hn, o_last = o_g + (int64_t) T*Hs*Dh;
+
+    const float   * prd  = (const float *) pr->data;
+    const int32_t * posd = (const int32_t *) pos->data;
+    const float   * pvd  = (const float *) prev->data;
+    const int64_t   pv_s = prev->nb[1]/sizeof(float);
+    float * out = (float *) dst->data;
+
+    // raw TPA k/v of token t, kv head hn (1/R scale as the graph)
+    auto raw = [&](int64_t t, int hn, bool is_v, float * o) {
+        const float * p = prd + t*ROW;
+        const float * A = p + (is_v ? OAV : OAK) + hn*R;
+        const float * B = p + (is_v ? OBV : OBK);
+        for (int d = 0; d < Dh; ++d) {
+            float s = 0.0f;
+            for (int r = 0; r < R; ++r) {
+                s += B[r*Dh + d]*A[r];
+            }
+            o[d] = s*(1.0f/(float) R);
+        }
+    };
+
+    std::vector<float> kr(Dh), vr(Dh), kp(Dh), vp(Dh), kx(Dh);
+
+    // (token, q head) pairs across the threads; the kv-head work is done by the pair whose head is the first of its group
+    const int64_t n_pairs = T*H;
+    for (int64_t pi = params->ith; pi < n_pairs; pi += params->nth) {
+        const int64_t t = pi/H;
+        const int     h = (int) (pi - t*H);
+        const int     G = H/Hn;
+        const int     hn = h/G;
+        const int64_t s  = t/n_seq_t;
+        const int64_t tt = t - s*n_seq_t;
+        const float * p  = prd + t*ROW;
+        float pmask = (float) posd[t];
+        pmask = pmask < 0.0f ? 0.0f : (pmask > 1.0f ? 1.0f : pmask);
+        const float lp = logf(std::min(std::max((float) posd[t] + 1.0f, 1.0f), wsize));
+
+        if (h % G == 0) {
+            raw(t, hn, false, kr.data());
+            raw(t, hn, true,  vr.data());
+            if (tt == 0) {
+                memcpy(kp.data(), pvd + s*pv_s + hn*Dh,         Dh*sizeof(float));
+                memcpy(vp.data(), pvd + s*pv_s + Hn*Dh + hn*Dh, Dh*sizeof(float));
+            } else {
+                raw(t - 1, hn, false, kp.data());
+                raw(t - 1, hn, true,  vp.data());
+            }
+            if (tt == n_seq_t - 1) {
+                memcpy(out + o_last + s*2*Hn*Dh + hn*Dh,         kr.data(), Dh*sizeof(float));
+                memcpy(out + o_last + s*2*Hn*Dh + Hn*Dh + hn*Dh, vr.data(), Dh*sizeof(float));
+            }
+            const float ak = dragon_sigmoid_f32(p[OSK + hn])*pmask;
+            const float av = dragon_sigmoid_f32(p[OSV + hn])*pmask;
+            const float bk = ak*-1.0f + 1.0f;
+            const float bv = av*-1.0f + 1.0f;
+            float ss = 0.0f;
+            for (int d = 0; d < Dh; ++d) {
+                kx[d] = kp[d]*ak + kr[d]*bk;
+                ss += kx[d]*kx[d];
+                out[o_v + (t*Hn + hn)*Dh + d] = vp[d]*av + vr[d]*bv;
+            }
+            const float rs = 1.0f/sqrtf(ss/(float) Dh + eps);
+            for (int d = 0; d < Dh; ++d) {
+                out[o_k + (t*Hn + hn)*Dh + d] = (kx[d]*rs)*kn[d];
+            }
+        }
+        {
+            const float * q = p + h*Dh;
+            float ss = 0.0f;
+            for (int d = 0; d < Dh; ++d) {
+                ss += q[d]*q[d];
+            }
+            const float rs = 1.0f/sqrtf(ss/(float) Dh + eps);
+            for (int d = 0; d < Dh; ++d) {
+                out[(t*H + h)*Dh + d] = (((q[d]*rs)*qn[d])*lp)*sc[h];
+            }
+        }
+        if (h == 0) {
+            for (int i = 0; i < Hn; ++i) {
+                out[o_lam + t*Hn + i] = dragon_sigmoid_f32(p[OLAM + i]);
+            }
+            for (int64_t i = 0; i < (int64_t) Hs*Dh; ++i) {
+                const float g = p[OG + i] + gate_b;
+                out[o_g + t*Hs*Dh + i] = g/(1.0f + expf(-g));
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_dragon_diff_gate(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * attn = dst->src[0];
+    const ggml_tensor * lam  = dst->src[1];
+    const ggml_tensor * gs   = dst->src[2];
+
+    const int64_t Dh = attn->ne[0];
+    const int64_t H  = attn->ne[1];
+    const int64_t T  = attn->ne[2];
+    const int64_t Hn = lam->ne[0];
+    const int64_t Hs = H - Hn;
+    const int64_t snr = Hs/Hn;
+
+    const float * a = (const float *) attn->data;
+    const int64_t lam_s = lam->nb[1]/sizeof(float);
+    const int64_t gs_s  = gs->nb[1]/sizeof(float);
+    float * y = (float *) dst->data;
+
+    const int64_t n = T*Hs*Dh;
+    const int64_t i0 = n*params->ith/params->nth;
+    const int64_t i1 = n*(params->ith + 1)/params->nth;
+    for (int64_t i = i0; i < i1; ++i) {
+        const int64_t t  = i/(Hs*Dh);
+        const int64_t j  = i - t*Hs*Dh;      // (hn*snr + k)*Dh + d
+        const int64_t hs = j/Dh;
+        const int64_t d  = j - hs*Dh;
+        const int64_t hn = hs/snr;
+        const int64_t k  = hs - hn*snr;
+        const float sig = a[(t*H + hn*(snr + 1) + k)*Dh + d];
+        const float noi = a[(t*H + hn*(snr + 1) + snr)*Dh + d];
+        const float l   = ((const float *) lam->data)[t*lam_s + hn];
+        const float g   = ((const float *) gs->data)[t*gs_s + j];
+        y[i] = (sig - noi*l)*g;
     }
 }

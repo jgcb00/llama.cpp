@@ -5,6 +5,8 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <algorithm>
+#include <cstdlib>
 #include <vector>
 
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
@@ -32,13 +34,62 @@ bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op, size_t max_tg
            ggml_metal_fwht_supported_size(op->src[1]->ne[0], max_tg_mem);
 }
 
+// The break-even between the small-batch mat-vec kernels (mul_mv_ext) and the simdgroup-matrix kernel (mul_mm, tiles of
+// 32 src1 rows) depends on the matrix size: for small, memory-bound dense matrices (e.g. Dragon 7A1B: 9 rows cost the same
+// as 32 on the mm path, decode step x1.8 from 8 to 9 sequences) the mat-vec path wins up to ~16-32 rows. Tunable via env.
+static int ggml_metal_env_int(const char * name, int def) {
+    const char * s = getenv(name);
+    const int v = s ? atoi(s) : def;
+    return v > 0 ? v : def;
+}
+
+int ggml_metal_op_mul_mat_mm_min(void) {
+    static const int v = ggml_metal_env_int("GGML_METAL_MM_MIN", 8);
+    return v;
+}
+
+int ggml_metal_op_mul_mat_mv_ext_max(void) {
+    static const int v = ggml_metal_env_int("GGML_METAL_MV_EXT_MAX", 8);
+    return v;
+}
+
+int ggml_metal_op_dragon_moe_nsplit(const struct ggml_tensor * op) {
+    const int64_t n_ff  = op->src[4]->ne[1];
+    const int64_t n_lat = op->src[1]->ne[1];
+    static const int want = ggml_metal_env_int("GGML_METAL_DRAGON_MOE_NSPLIT", 16);
+    for (int ns = (int) std::min<int64_t>(want, n_ff/8); ns >= 1; --ns) {
+        if (n_ff % ns == 0 && (n_ff/ns) % 8 == 0 && n_lat % ns == 0) {
+            return ns;
+        }
+    }
+    return 1;
+}
+
+size_t ggml_metal_op_dragon_moe_smem(const struct ggml_tensor * op, int which) {
+    const int64_t n_embd  = op->src[0]->ne[0];
+    const int64_t n_tok   = op->src[0]->ne[1];
+    const int64_t n_lat   = op->src[1]->ne[1];
+    const int64_t n_ff    = op->src[4]->ne[1];
+    const int64_t n_ff_sh = op->src[7]->ne[1];
+    const int64_t k       = ggml_get_op_params_i32(op, 0);
+    const int64_t tb      = std::min<int64_t>(4, n_tok); // DMOE_TB
+    size_t n = 0;
+    switch (which) {
+        case 0: n = tb*n_embd;              break; // a : x of the pass
+        case 1: n = n_lat + 16 + 2*k;       break; // b1: lat | red | redi | selv | sele
+        case 2: n = n_ff;                   break; // b2: h
+        default: n = std::min<int64_t>(2, n_tok)*(n_lat + n_ff_sh); break; // c : routed | ush of the pass
+    }
+    return GGML_PAD(n*sizeof(float), 16);
+}
+
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne11 = op->src[1]->ne[1];
 
     return !ggml_is_transposed(op->src[0]) &&
            !ggml_is_transposed(op->src[1]) &&
-           has_simdgroup_mm && ne00 >= 64 && ne11 > 8;
+           has_simdgroup_mm && ne00 >= 64 && ne11 > ggml_metal_op_mul_mat_mm_min();
 }
 
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {

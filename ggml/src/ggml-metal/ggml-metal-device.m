@@ -1864,6 +1864,95 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                        ggml_is_contiguous_rows(op->src[7]) &&
                        smem <= dev->props.max_theadgroup_memory_size;
             }
+        case GGML_OP_DRAGON_MOE:
+            {
+                if (!has_simdgroup_reduction || op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                if (ggml_get_op_params_i32(op, 2) >= 0) { // paged experts: CPU only
+                    return false;
+                }
+                for (int i = 0; i < 9; ++i) {
+                    if (op->src[i] == NULL || !ggml_is_contiguous(op->src[i])) {
+                        return false;
+                    }
+                }
+                if (op->src[0]->type != GGML_TYPE_F32 || op->src[2]->type != GGML_TYPE_F32 || op->src[3]->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                // one weight type per kernel: (W_ld, W_us), (W_up, W_down), (W_lu, W_ds)
+                if (op->src[1]->type != op->src[7]->type || op->src[4]->type != op->src[5]->type || op->src[6]->type != op->src[8]->type) {
+                    return false;
+                }
+                for (int i = 1; i < 9; ++i) {
+                    if (i == 2 || i == 3) {
+                        continue;
+                    }
+                    switch (op->src[i]->type) {
+                        case GGML_TYPE_F32:
+                        case GGML_TYPE_F16:
+                            break;
+                        case GGML_TYPE_BF16:
+                            if (!dev->props.has_bfloat) {
+                                return false;
+                            }
+                            break;
+                        default:
+                            return false;
+                    }
+                }
+                const int64_t n_embd   = op->src[0]->ne[0];
+                const int64_t n_lat    = op->src[1]->ne[1];
+                const int64_t n_expert = op->src[2]->ne[1];
+                const int64_t n_ff     = op->src[4]->ne[1];
+                const int64_t n_ff_sh  = op->src[7]->ne[1];
+                const int64_t k        = ggml_get_op_params_i32(op, 0);
+                const int     nsplit   = ggml_metal_op_dragon_moe_nsplit(op);
+                // rows are read 128 columns per simdgroup pass, up to DMOE_MAXCH (16) passes for n_embd / n_ff_sh and 8 for n_lat / n_ff
+                if (n_embd % 128 != 0 || n_ff_sh % 128 != 0 || n_lat % 128 != 0 || n_ff % 128 != 0 ||
+                    n_embd > 2048 || n_ff_sh > 2048 || n_lat > 1024 || n_ff > 1024) {
+                    return false;
+                }
+                for (int which = 0; which < 4; ++which) {
+                    if (ggml_metal_op_dragon_moe_smem(op, which) > dev->props.max_theadgroup_memory_size) {
+                        return false;
+                    }
+                }
+                return n_expert >= 1 && n_expert <= 256 && k >= 1 && k <= n_expert &&
+                       n_ff % nsplit == 0 && n_lat % nsplit == 0 && (n_ff/nsplit) % 8 == 0;
+            }
+        case GGML_OP_DRAGON_MMV:
+            {
+                if (!has_simdgroup_reduction || op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                const int64_t n = op->src[0]->ne[0];
+                if (n % 128 != 0 || n > 2048 || !ggml_is_contiguous(op->src[0])) {
+                    return false;
+                }
+                const enum ggml_type wt = op->src[1]->type;
+                if (wt != GGML_TYPE_F32 && wt != GGML_TYPE_F16 && !(wt == GGML_TYPE_BF16 && dev->props.has_bfloat)) {
+                    return false;
+                }
+                for (int i = 1; i < GGML_MAX_SRC && op->src[i] != NULL; ++i) {
+                    if (op->src[i]->type != wt || !ggml_is_contiguous(op->src[i])) {
+                        return false;
+                    }
+                }
+                return 4*n*sizeof(float) <= dev->props.max_theadgroup_memory_size;
+            }
+        case GGML_OP_DRAGON_TPA_PREP:
+            {
+                if (!has_simdgroup_reduction || op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                const int64_t Dh = ggml_get_op_params_i32(op, 3);
+                return Dh <= 256 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) &&
+                       (2*Dh + 8)*sizeof(float) <= dev->props.max_theadgroup_memory_size;
+            }
+        case GGML_OP_DRAGON_DIFF_GATE:
+            return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous_rows(op->src[1]) && ggml_is_contiguous_rows(op->src[2]);
         case GGML_OP_GEODESIC:
             return has_simdgroup_reduction &&
                 op->type         == GGML_TYPE_F32 &&

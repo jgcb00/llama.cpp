@@ -144,6 +144,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv     
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mamba3_mimo       (ggml_metal_library_t lib, const struct ggml_tensor * op, enum ggml_metal_mamba3_mimo_kernel kernel, bool allow_fast);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_geodesic          (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_moe        (ggml_metal_library_t lib, const struct ggml_tensor * op, int which); // 0: a, 1: b1, 2: b2, 3: c
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_mmv        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_tpa_prep   (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_diff_gate  (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);

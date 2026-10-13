@@ -1,4 +1,5 @@
 #include "ggml-metal-device.h"
+#include "ggml-metal-common.h"
 
 #include "ggml-metal-impl.h"
 #include "ggml-metal-tuning.h"
@@ -795,6 +796,62 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_geodesic(ggml_me
     res.smem = GGML_PAD(2*32*sizeof(float), 16);
 
     return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_moe(ggml_metal_library_t lib, const ggml_tensor * op, int which) {
+    GGML_ASSERT(op->op == GGML_OP_DRAGON_MOE);
+
+    const ggml_tensor * w = which == 0 ? op->src[1] : which == 1 ? op->src[4] : which == 2 ? op->src[5] : op->src[6];
+    const char * kname   = which == 0 ? "a" : which == 1 ? "b1" : which == 2 ? "b2" : "c";
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_dragon_moe_%s_%s", kname, ggml_type_name(w->type));
+    snprintf(name, 256, "%s", base);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+
+    res.nsg  = 8;
+    res.smem = ggml_metal_op_dragon_moe_smem(op, which);
+
+    return res;
+}
+
+static ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_simple(ggml_metal_library_t lib, const char * base) {
+    char name[256];
+    snprintf(name, 256, "%s", base);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+    res.nsg = 8;
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_mmv(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_DRAGON_MMV);
+    char base[256];
+    snprintf(base, 256, "kernel_dragon_mmv_%s", ggml_type_name(op->src[1]->type));
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline_simple(lib, base);
+    res.smem = GGML_PAD(std::min<int64_t>(4, op->src[0]->ne[1])*op->src[0]->ne[0]*sizeof(float), 16);
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_tpa_prep(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_DRAGON_TPA_PREP);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline_simple(lib, "kernel_dragon_tpa_prep_f32");
+    const int64_t Dh = ggml_get_op_params_i32(op, 3);
+    res.smem = GGML_PAD((2*Dh + 8)*sizeof(float), 16);
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_diff_gate(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_DRAGON_DIFF_GATE);
+    return ggml_metal_library_get_pipeline_simple(lib, "kernel_dragon_diff_gate_f32");
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri(ggml_metal_library_t lib, const ggml_tensor * op) {

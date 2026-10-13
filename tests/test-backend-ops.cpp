@@ -5033,6 +5033,143 @@ struct test_geodesic : public test_case {
     }
 };
 
+// GGML_OP_DRAGON_MOE (the Dragon latent MoE block; CPU reference vs the Metal 3-dispatch implementation)
+struct test_dragon_moe : public test_case {
+    const ggml_type type_w;
+    const int64_t n_embd;
+    const int64_t n_tok;
+    const int64_t n_lat;
+    const int64_t n_expert;
+    const int64_t n_ff;
+    const int64_t n_ff_sh;
+    const int     k;
+    const float   w_scale;
+
+    std::string vars() override {
+        return VARS_TO_STR9(type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4; // the CPU reference rounds the activations to the weight type before its dot products
+    }
+
+    test_dragon_moe(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 1536, int64_t n_tok = 1, int64_t n_lat = 384,
+            int64_t n_expert = 256, int64_t n_ff = 768, int64_t n_ff_sh = 1536, int k = 6, float w_scale = 2.45f)
+        : type_w(type_w), n_embd(n_embd), n_tok(n_tok), n_lat(n_lat), n_expert(n_expert), n_ff(n_ff), n_ff_sh(n_ff_sh), k(k), w_scale(w_scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+        ggml_tensor * w_ld   = ggml_new_tensor_2d(ctx, type_w,        n_embd, n_lat);
+        ggml_tensor * w_r    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_expert);
+        ggml_tensor * bias   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_tensor * w_up   = ggml_new_tensor_3d(ctx, type_w,        n_lat, n_ff, n_expert);
+        ggml_tensor * w_down = ggml_new_tensor_3d(ctx, type_w,        n_ff, n_lat, n_expert);
+        ggml_tensor * w_lu   = ggml_new_tensor_2d(ctx, type_w,        n_lat, n_embd);
+        ggml_tensor * w_us   = ggml_new_tensor_2d(ctx, type_w,        n_embd, n_ff_sh);
+        ggml_tensor * w_ds   = ggml_new_tensor_2d(ctx, type_w,        n_ff_sh, n_embd);
+        return ggml_dragon_moe(ctx, x, w_ld, w_r, bias, w_up, w_down, w_lu, w_us, w_ds, k, w_scale, -1);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -0.2f, 0.2f);
+        }
+    }
+};
+
+// GGML_OP_DRAGON_MMV
+struct test_dragon_mmv : public test_case {
+    const ggml_type type_w;
+    const int64_t n_embd;
+    const int64_t n_tok;
+    const std::vector<int64_t> rows;
+
+    std::string vars() override {
+        return VARS_TO_STR3(type_w, n_embd, n_tok) + ",n_ws=" + std::to_string(rows.size()) + ",rows0=" + std::to_string(rows[0]);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_dragon_mmv(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 1536, int64_t n_tok = 1,
+            std::vector<int64_t> rows = { 6144, 48, 48, 512, 512, 12, 12, 12, 4608 })
+        : type_w(type_w), n_embd(n_embd), n_tok(n_tok), rows(rows) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+        ggml_tensor * ws[9];
+        for (size_t i = 0; i < rows.size(); ++i) {
+            ws[i] = ggml_new_tensor_2d(ctx, type_w, n_embd, rows[i]);
+        }
+        return ggml_dragon_mmv(ctx, x, ws, (int) rows.size());
+    }
+};
+
+// GGML_OP_DRAGON_TPA_PREP
+struct test_dragon_tpa_prep : public test_case {
+    const int H, Hn, R, Dh, n_tok, n_seqs;
+
+    std::string vars() override {
+        return VARS_TO_STR6(H, Hn, R, Dh, n_tok, n_seqs);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_dragon_tpa_prep(int H = 48, int Hn = 12, int R = 4, int Dh = 128, int n_tok = 1, int n_seqs = 1)
+        : H(H), Hn(Hn), R(R), Dh(Dh), n_tok(n_tok), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int Hs = H - Hn;
+        const int64_t ROW = (int64_t) H*Dh + 2*Hn*R + 2*R*Dh + 3*Hn + (int64_t) Hs*Dh;
+        ggml_tensor * pr     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ROW, n_tok);
+        ggml_tensor * prev   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*Hn*Dh, n_seqs);
+        ggml_tensor * pos    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok);
+        ggml_set_name(pos, "pos");
+        ggml_tensor * q_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, Dh);
+        ggml_tensor * k_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, Dh);
+        ggml_tensor * scaler = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        return ggml_dragon_tpa_prep(ctx, pr, prev, pos, q_norm, k_norm, scaler, H, Hn, R, Dh, Hs, n_seqs, 1e-6f, 4096.0f, 0.5f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "pos") == 0) {
+                // seq-major tokens: the first token of the first sequence is at position 0 (alpha masked), the others not
+                std::vector<int32_t> v(n_tok);
+                const int n_seq_t = n_tok/n_seqs;
+                for (int i = 0; i < n_tok; ++i) {
+                    v[i] = (i/n_seq_t == 0) ? i % n_seq_t : 100 + i % n_seq_t;
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, n_tok*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
+// GGML_OP_DRAGON_DIFF_GATE
+struct test_dragon_diff_gate : public test_case {
+    const int64_t Dh, H, Hn, n_tok;
+
+    std::string vars() override {
+        return VARS_TO_STR4(Dh, H, Hn, n_tok);
+    }
+
+    test_dragon_diff_gate(int64_t Dh = 128, int64_t H = 48, int64_t Hn = 12, int64_t n_tok = 3)
+        : Dh(Dh), H(H), Hn(Hn), n_tok(n_tok) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * attn = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, Dh, H, n_tok);
+        ggml_tensor * lam  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Hn, n_tok);
+        ggml_tensor * gs   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (H - Hn)*Dh, n_tok);
+        return ggml_dragon_diff_gate(ctx, attn, lam, gs);
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -11541,6 +11678,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_geodesic(1536, 7, 0.25f));
     test_cases.emplace_back(new test_geodesic(1536, 512, 1.0f/36));
     test_cases.emplace_back(new test_geodesic(100, 3, 0.5f));
+    // (type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale); Dragon 7A1B: bf16, 1536, 384, 256, 768, 1536, 6, 2.45
+    test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_BF16, 1536, 1));
+    test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_BF16, 1536, 5));
+    test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_F32,   256, 3, { 64, 8, 200 }));
+    test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 1, 1));   // decode
+    test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 4, 4));   // batched decode
+    test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 6, 2));   // 3 tokens per sequence (in-batch shift)
+    test_cases.emplace_back(new test_dragon_tpa_prep(8, 2, 3, 64, 5, 1));      // small dims, gate not divisible by H
+    test_cases.emplace_back(new test_dragon_diff_gate(128, 48, 12, 3));
+    test_cases.emplace_back(new test_dragon_diff_gate(64, 8, 2, 1));
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384, 256, 768, 1536, 6, 2.45f)); // decode
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  4, 384, 256, 768, 1536, 6, 2.45f)); // batched decode
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536, 19, 384, 256, 768, 1536, 6, 2.45f)); // odd batch (> 8 tokens per pass)
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F16,   256,  3, 128,  32, 128,  256, 4, 1.0f));  // small dims, f16
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F32,   128,  2, 128,  16, 128,  128, 2, 1.5f));  // f32, n_ff_sh < n_embd (CPU reference dsh fix)
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F32,   256,  5, 128,  16, 256,  128, 3, 1.5f));  // f32, 5 tokens (2 passes of kernel a)
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

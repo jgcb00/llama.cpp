@@ -69,6 +69,19 @@ static bool dragon_state_bf16() { return dragon_state_mode() != DRAGON_STATE_F32
 // env vars still force parts of the portable path on CPU; DRAGON_PORTABLE=1
 // forces all of it (validates the GPU graph against the CPU one).
 static thread_local bool dragon_layer_cpu = true;
+// the layer runs on the Metal backend, which implements GGML_OP_DRAGON_MOE (3 dispatches)
+static thread_local bool dragon_layer_metal = false;
+
+// DRAGON_METAL_FUSED_MOE=0 keeps the graph path (build_moe_ffn) on Metal; the fused op is
+// a decode kernel, so ubatches above DRAGON_METAL_MOE_MAX_T tokens (default 32) use the graph path
+static bool dragon_metal_fused_moe_enabled() {
+    static const bool v = [] { const char * e = std::getenv("DRAGON_METAL_FUSED_MOE"); return !(e && e[0] == '0'); }();
+    return v;
+}
+static int64_t dragon_metal_moe_max_tokens() {
+    static const int64_t v = [] { const char * e = std::getenv("DRAGON_METAL_MOE_MAX_T"); return e ? std::max<int64_t>(0, std::atoll(e)) : (int64_t) 32; }();
+    return v;
+}
 
 static ggml_tensor * f32c_static(ggml_context * ctx, ggml_tensor * t) {
     return t->type == GGML_TYPE_F32 ? t : ggml_cast(ctx, t, GGML_TYPE_F32);
@@ -3411,6 +3424,59 @@ static ggml_tensor * build_dragon_v_mixer(
     const float   gate_b   = hparams.dragon_gate_bias;
     const auto  & layer    = model.layers[il];
 
+    // Metal: the whole preparation in 3 ops (9 projections in one GEMV, TPA expand + token shift + norms + scalable softmax
+    // + lambda + gate in one kernel, differential combine x gate in one kernel); the attention itself stays in build_attn.
+    // DRAGON_METAL_FUSED_TPA=0 restores the graph path.
+    static const bool metal_tpa = [] { const char * e = std::getenv("DRAGON_METAL_FUSED_TPA"); return !(e && e[0] == '0'); }();
+    if (dragon_layer_metal && metal_tpa && layer.attn_shift_k != nullptr && n_tokens <= dragon_metal_moe_max_tokens()) {
+        const int64_t n_seqs = gctx.ubatch.n_seqs;
+        GGML_ASSERT(n_tokens % n_seqs == 0);
+
+        ggml_tensor * wlist[9] = { layer.wq, layer.attn_wa_k, layer.attn_wa_v, layer.attn_wb_k, layer.attn_wb_v,
+                                   layer.attn_shift_k, layer.attn_shift_v, layer.attn_lambda, layer.attn_gate };
+        ggml_tensor * pr = ggml_dragon_mmv(ctx, cur, wlist, 9);
+        ggml_set_name(pr, "v_proj_fused");
+
+        ggml_tensor * states_all = mctx_recr->get_r_l(il);
+        ggml_tensor * shift_view = gctx.build_rs(inp_rs, states_all, hparams.n_embd_r(), n_seqs);   // (n_embd_r, n_seqs)
+
+        const float slw_wsize_f = (float) std::max<uint32_t>(hparams.dragon_slw_wsize, 1u);
+        ggml_tensor * prep = ggml_dragon_tpa_prep(ctx, pr, shift_view, gctx.build_inp_pos(),
+                layer.attn_q_norm, layer.attn_k_norm, layer.attn_softmax_scaler,
+                (int) n_head, (int) n_kv, (int) rank, (int) head_dim, (int) n_signal, (int) n_seqs,
+                hparams.f_norm_rms_eps, slw_wsize_f, gate_b);
+        ggml_set_name(prep, "v_tpa_prep");
+
+        const size_t  f      = sizeof(float);
+        const int64_t o_k    = n_tokens*n_head*head_dim;
+        const int64_t o_v    = o_k + n_tokens*n_kv*head_dim;
+        const int64_t o_lam  = o_v + n_tokens*n_kv*head_dim;
+        const int64_t o_g    = o_lam + n_tokens*n_kv;
+        const int64_t o_last = o_g + n_tokens*n_signal*head_dim;
+
+        ggml_tensor * Qf  = ggml_view_3d(ctx, prep, head_dim, n_head, n_tokens, head_dim*f, head_dim*n_head*f, 0);
+        ggml_tensor * Kf  = ggml_view_3d(ctx, prep, head_dim, n_kv,   n_tokens, head_dim*f, head_dim*n_kv*f,   o_k*f);
+        ggml_tensor * Vf  = ggml_view_3d(ctx, prep, head_dim, n_kv,   n_tokens, head_dim*f, head_dim*n_kv*f,   o_v*f);
+        ggml_tensor * lam = ggml_view_2d(ctx, prep, n_kv, n_tokens, n_kv*f, o_lam*f);
+        ggml_tensor * gs  = ggml_view_2d(ctx, prep, n_signal*head_dim, n_tokens, n_signal*head_dim*f, o_g*f);
+        ggml_tensor * last = ggml_view_2d(ctx, prep, hparams.n_embd_r(), n_seqs, hparams.n_embd_r()*f, o_last*f);
+
+        // pre-shift K/V of each sequence's last token -> recurrent cache
+        const auto kv_head = mctx_recr->get_head();
+        const size_t row_size = hparams.n_embd_r() * ggml_element_size(states_all);
+        ggml_build_forward_expand(gctx.gf, ggml_cpy(ctx, last,
+                ggml_view_2d(ctx, states_all, hparams.n_embd_r(), n_seqs, states_all->nb[1], kv_head * row_size)));
+
+        const float kq_scale = 1.0f / (float) head_dim;
+        ggml_tensor * attn_out = gctx.build_attn(inp_attn, nullptr, nullptr, nullptr, Qf, Kf, Vf, nullptr, nullptr, nullptr, kq_scale, il);
+        attn_out = ggml_reshape_3d(ctx, attn_out, head_dim, n_head, n_tokens);
+
+        ggml_tensor * y_attn = ggml_dragon_diff_gate(ctx, attn_out, lam, gs);
+        ggml_tensor * v_out  = ggml_mul_mat(ctx, layer.wo, y_attn);
+        ggml_set_name(v_out, "v_out_proj");
+        return v_out;
+    }
+
     // Q projection: (n_head · head_dim, L) → (head_dim, n_head, L).
     ggml_tensor * Qcur = ggml_mul_mat(ctx, layer.wq, cur);
     ggml_set_name(Qcur, "v_q_proj");
@@ -3638,6 +3704,9 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
             static const bool force_portable = dragon_env_on("DRAGON_PORTABLE");
             dragon_layer_cpu = !force_portable &&
                 (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
+            dragon_layer_metal = !force_portable && dev != nullptr &&
+                ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "MTL") == 0;
         }
 
         // Optional per-block dump for HF↔llama.cpp comparison, gated on DRAGON_DUMP_DIR.
@@ -3672,8 +3741,10 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
         // ubatch size (it processes pairs grouped by expert, fine for prefill too)
         const bool lazy_experts = model.can_prefetch.count(model.layers[il].ffn_up_exps) > 0 &&
                                   model.can_prefetch.count(model.layers[il].ffn_down_exps) > 0;
-        const bool use_moe_op = dragon_layer_cpu && !force_no_fused_moe && !dragon_dump_dir() &&
-            (cur->ne[1] <= dragon_fused_moe_max_tokens() || lazy_experts) &&
+        const bool metal_moe = dragon_layer_metal && dragon_metal_fused_moe_enabled() && !lazy_experts &&
+            cur->ne[1] <= dragon_metal_moe_max_tokens();
+        const bool use_moe_op = (dragon_layer_cpu || metal_moe) && !force_no_fused_moe && !dragon_dump_dir() &&
+            (cur->ne[1] <= dragon_fused_moe_max_tokens() || lazy_experts || metal_moe) &&
             !dragon_tensor_repacked(model.layers[il].ffn_latent_down) &&
             !dragon_tensor_repacked(model.layers[il].ffn_up_exps) &&
             !dragon_tensor_repacked(model.layers[il].ffn_down_exps) &&

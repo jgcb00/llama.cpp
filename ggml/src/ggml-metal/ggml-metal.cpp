@@ -240,6 +240,10 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             {
                 res += ggml_metal_op_mamba3_mimo_extra_ws(tensor);
             } break;
+        case GGML_OP_DRAGON_MOE:
+            {
+                res += ggml_metal_op_dragon_moe_extra_ws(tensor);
+            } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
             {

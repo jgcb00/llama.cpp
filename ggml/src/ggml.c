@@ -1087,6 +1087,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MAMBA3_MIMO",
     "GEODESIC",
     "DRAGON_MOE",
+    "DRAGON_MMV",
+    "DRAGON_TPA_PREP",
+    "DRAGON_DIFF_GATE",
 
     "UNARY",
 
@@ -1104,7 +1107,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1205,6 +1208,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "mamba3_mimo(pdyn, pstat, ..., s)",
     "geodesic(x, g)",
     "dragon_moe(x, ...)",
+    "dragon_mmv(x, w...)",
+    "dragon_tpa_prep(pr, ...)",
+    "dragon_diff_gate(attn, lam, gs)",
 
     "unary(x)",
 
@@ -1222,7 +1228,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6754,6 +6760,108 @@ struct ggml_tensor * ggml_geodesic(
     return result;
 }
 
+
+// ggml_dragon_mmv
+
+struct ggml_tensor * ggml_dragon_mmv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor ** ws,
+        int                   n_ws) {
+    GGML_ASSERT(n_ws >= 1 && n_ws <= GGML_MAX_SRC - 1);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x));
+    GGML_ASSERT(x->ne[2] == 1 && x->ne[3] == 1);
+
+    int64_t rows = 0;
+    for (int i = 0; i < n_ws; ++i) {
+        GGML_ASSERT(ws[i] != NULL && ggml_is_contiguous(ws[i]));
+        GGML_ASSERT(ws[i]->ne[0] == x->ne[0] && ws[i]->ne[2] == 1 && ws[i]->ne[3] == 1);
+        rows += ws[i]->ne[1];
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rows, x->ne[1]);
+
+    result->op     = GGML_OP_DRAGON_MMV;
+    result->src[0] = x;
+    for (int i = 0; i < n_ws; ++i) {
+        result->src[1 + i] = ws[i];
+    }
+
+    return result;
+}
+
+// ggml_dragon_tpa_prep
+
+struct ggml_tensor * ggml_dragon_tpa_prep(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * pr,
+        struct ggml_tensor  * prev,
+        struct ggml_tensor  * pos,
+        struct ggml_tensor  * q_norm,
+        struct ggml_tensor  * k_norm,
+        struct ggml_tensor  * scaler,
+        int H, int Hn, int R, int Dh, int Hs, int n_seqs,
+        float eps, float wsize, float gate_b) {
+    GGML_ASSERT(pr->type == GGML_TYPE_F32 && prev->type == GGML_TYPE_F32 && pos->type == GGML_TYPE_I32);
+    GGML_ASSERT(q_norm->type == GGML_TYPE_F32 && k_norm->type == GGML_TYPE_F32 && scaler->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(pr) && ggml_is_contiguous_rows(prev) && ggml_is_contiguous(pos));
+    GGML_ASSERT(H > 0 && Hn > 0 && H % Hn == 0 && R > 0 && Dh > 0 && Hs == H - Hn && n_seqs > 0);
+
+    const int64_t T   = pr->ne[1];
+    const int64_t ROW = (int64_t) H*Dh + 2*Hn*R + 2*R*Dh + 3*Hn + (int64_t) Hs*Dh;
+    GGML_ASSERT(pr->ne[0] == ROW);
+    GGML_ASSERT(prev->ne[0] == 2*Hn*Dh && prev->ne[1] == n_seqs);
+    GGML_ASSERT(pos->ne[0] == T && T % n_seqs == 0);
+    GGML_ASSERT(q_norm->ne[0] == Dh && k_norm->ne[0] == Dh && scaler->ne[0] == H);
+
+    const int64_t n = T*((int64_t) H*Dh + 2*Hn*Dh + Hn + (int64_t) Hs*Dh) + (int64_t) n_seqs*2*Hn*Dh;
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
+
+    int32_t params[9] = { H, Hn, R, Dh, Hs, n_seqs, 0, 0, 0 };
+    memcpy(&params[6], &eps,    sizeof(float));
+    memcpy(&params[7], &wsize,  sizeof(float));
+    memcpy(&params[8], &gate_b, sizeof(float));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_DRAGON_TPA_PREP;
+    result->src[0] = pr;
+    result->src[1] = prev;
+    result->src[2] = pos;
+    result->src[3] = q_norm;
+    result->src[4] = k_norm;
+    result->src[5] = scaler;
+
+    return result;
+}
+
+// ggml_dragon_diff_gate
+
+struct ggml_tensor * ggml_dragon_diff_gate(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * attn,
+        struct ggml_tensor  * lam,
+        struct ggml_tensor  * gs) {
+    GGML_ASSERT(attn->type == GGML_TYPE_F32 && lam->type == GGML_TYPE_F32 && gs->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(attn) && ggml_is_contiguous_rows(lam) && ggml_is_contiguous_rows(gs));
+
+    const int64_t Dh = attn->ne[0];
+    const int64_t H  = attn->ne[1];
+    const int64_t T  = attn->ne[2];
+    const int64_t Hn = lam->ne[0];
+    GGML_ASSERT(Hn > 0 && H % Hn == 0 && H/Hn >= 2);
+    const int64_t Hs = H - Hn;
+    GGML_ASSERT(lam->ne[1] == T && gs->ne[0] == Hs*Dh && gs->ne[1] == T);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Hs*Dh, T);
+
+    result->op     = GGML_OP_DRAGON_DIFF_GATE;
+    result->src[0] = attn;
+    result->src[1] = lam;
+    result->src[2] = gs;
+
+    return result;
+}
 
 // ggml_dragon_moe
 
