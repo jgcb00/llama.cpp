@@ -2949,6 +2949,13 @@ static ggml_tensor * build_dragon_m_mixer_real(
                                        !std::getenv("DRAGON_M_CHUNK_SIZE") && !dragon_env_on("DRAGON_MEGA_DECODE") &&
                                        !dragon_env_on("DRAGON_M_COLSPLIT") && !dragon_env_on("DRAGON_NO_INPLACE_STATE");
     const bool state_inplace = inplace_env_ok && !dragon_use_ggml_op() && dragon_state_mode() == DRAGON_STATE_F32;
+    // GPU decode (one token per sequence) when every sequence reads its own cache row: the ggml op reads the state
+    // straight from the cache rows it then overwrites (the Metal serial kernel loads the whole state of a (head,
+    // sequence) before writing it), no gather copy. DRAGON_GPU_NO_STATE_VIEW=1 restores the gather.
+    static const bool state_view_env = !dragon_env_on("DRAGON_GPU_NO_STATE_VIEW");
+    const bool state_view = !state_inplace && state_view_env && inplace_env_ok && dragon_use_ggml_op() && dragon_layer_metal &&
+                            dragon_state_mode() == DRAGON_STATE_F32 && n_tokens == (int64_t) gctx.ubatch.n_seqs &&
+                            inp_rs->s_copy_ident;
     ggml_tensor * rs_states = nullptr, * rs_ids = nullptr;
     ggml_tensor * rs_view = state_inplace
         ? gctx.build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), gctx.ubatch.n_seqs,
@@ -2956,6 +2963,13 @@ static ggml_tensor * build_dragon_m_mixer_real(
                   rs_states = states;
                   rs_ids    = ids;
                   return ggml_view_1d(c, states, 1, 0);
+              })
+        : state_view
+        ? gctx.build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), gctx.ubatch.n_seqs,
+              [&](ggml_context * c, ggml_tensor * states, ggml_tensor * ids) {
+                  GGML_UNUSED(ids);
+                  return ggml_view_2d(c, states, states->ne[0], gctx.ubatch.n_seqs, states->nb[1],
+                                      (size_t) inp_rs->head*states->nb[1]);
               })
         : gctx.build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), gctx.ubatch.n_seqs);
 

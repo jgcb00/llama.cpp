@@ -356,6 +356,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= s_copy_ident == mctx->s_copy_is_identity(params.ubatch.n_seqs);
 
     return res;
 }
@@ -1137,6 +1138,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->s_copy_ident == mctx->get_recr()->s_copy_is_identity(params.ubatch.n_seqs);
 
     return res;
 }
@@ -1180,6 +1182,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->s_copy_ident == mctx->get_recr()->s_copy_is_identity(params.ubatch.n_seqs);
 
     return res;
 }
@@ -1268,6 +1271,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->s_copy_ident == mctx->get_recr()->s_copy_is_identity(params.ubatch.n_seqs);
 
     return res;
 }
@@ -3572,6 +3576,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+    inp->s_copy_ident = mctx_cur->s_copy_is_identity(n_seqs);
 
     return inp;
 }
