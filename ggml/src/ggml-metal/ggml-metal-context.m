@@ -332,6 +332,14 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
                 }
             }
             __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            // the flag only covers the last copy: command buffers without a dependency between them can complete
+            // out of order, so the other pending copies (several outputs or ubatches per graph) are waited for
+            for (NSUInteger i = 0; i < ctx->cmd_bufs_ext.count; ++i) {
+                id<MTLCommandBuffer> cb = ctx->cmd_bufs_ext[i];
+                if (cb != ctx->flag_cb && [cb status] < MTLCommandBufferStatusCompleted) {
+                    [cb waitUntilCompleted];
+                }
+            }
             spun = true;
         } else if (ctx->spin && ctx->spin_cb == ctx->cmd_buf_last) {
             while ([ctx->spin_ev signaledValue] < ctx->spin_val) {
@@ -360,6 +368,11 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
         }
         ctx->cmd_buf_last = nil;
     }
+    // flag_cb / spin_cb are weak references compared by address: once their command buffer is released (below, or
+    // with the next graph), a new command buffer can get the same address and would pass the check with a stale
+    // flag value, so they are only valid until this synchronization
+    ctx->flag_cb = nil;
+    ctx->spin_cb = nil;
 
     // check status of all command buffers
     {
