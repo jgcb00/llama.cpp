@@ -70,6 +70,7 @@ bool ggml_metal_op_dragon_moe_sh_split(const struct ggml_tensor * op);
 int  ggml_metal_op_dragon_moe_msplit (const struct ggml_tensor * op);
 int  ggml_metal_op_dragon_moe_sh_rows(const struct ggml_tensor * op);
 bool ggml_metal_op_dragon_moe_merged (const struct ggml_tensor * op);
+int  ggml_metal_op_dragon_moe_fused_ntg(const struct ggml_tensor * op, int gpu_cores);
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
 
 #ifdef __cplusplus

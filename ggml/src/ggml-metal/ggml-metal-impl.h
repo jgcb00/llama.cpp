@@ -1090,6 +1090,8 @@ typedef struct {
     int32_t sh_rows;    // merged: shared-expert FF rows per threadgroup
     int32_t a_ks;       // 2: kernel a splits every row across two simdgroups (4 rows per threadgroup)
     int64_t off_acc;    // merged: (n_lat, n_tok) weighted sum of the expert outputs (zeroed by kernel a, as dsh)
+    int32_t pad3;
+    int32_t pad4;
 } ggml_metal_kargs_dragon_moe;
 
 // Dragon V-layer helpers (kernels/mamba3.metal)

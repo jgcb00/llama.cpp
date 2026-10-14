@@ -2455,6 +2455,8 @@ static int ggml_metal_op_dragon_moe_impl(ggml_metal_op_t ctx, int idx, ggml_tens
         /*.sh_rows    =*/ 0,
         /*.a_ks       =*/ 1,
         /*.off_acc    =*/ off_o + T*d.k*d.n_lat + 4 + T*d.n_embd,
+        /*.pad3       =*/ 0,
+        /*.pad4       =*/ 0,
     };
 
     // kernel m: routed up + down and shared up + down in one dispatch (atomic sums into acc and dsh)
@@ -2511,6 +2513,51 @@ static int ggml_metal_op_dragon_moe_impl(ggml_metal_op_t ctx, int idx, ggml_tens
     const ggml_metal_buffer_id b_lu = ggml_metal_get_buffer_id(op->src[6]);
     const ggml_metal_buffer_id b_us = ggml_metal_get_buffer_id(op->src[7]);
     const ggml_metal_buffer_id b_ds = ggml_metal_get_buffer_id(op->src[8]);
+
+    // decode: the whole block in one persistent dispatch (kernel f), when the following geodesic (if fused) is applied
+    // to the MoE input
+    {
+        // a wait that timed out in an earlier dispatch (threadgroups not all resident) disables the fused kernel
+        static bool fused_failed = false;
+        if (!fused_failed && ggml_metal_device_sync_buffer_word(ctx->dev, 224) != 0) { // DMOE_F_ERR
+            GGML_LOG_WARN("%s: fused Dragon MoE kernel: threadgroups not all resident, falling back to 3 dispatches\n", __func__);
+            fused_failed = true;
+        }
+        const int P = fused_failed ? 0 : ggml_metal_op_dragon_moe_fused_ntg(op, ggml_metal_device_get_props(ctx->dev)->gpu_core_count);
+        if (P > 0 && (!geo || geo->src[0] == op->src[0]) && !skip_a && !skip_1 && !skip_c) {
+            auto pipeline = ggml_metal_library_get_pipeline_dragon_moe(lib, op, 5);
+            GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+            const ggml_metal_buffer_id b_sync = ggml_metal_device_get_sync_buffer(ctx->dev);
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, pre ? ggml_metal_get_buffer_id(pre->src[0]) : b_x, 1);
+            ggml_metal_encoder_set_buffer  (enc, b_ld,  2);
+            ggml_metal_encoder_set_buffer  (enc, b_r,   3);
+            ggml_metal_encoder_set_buffer  (enc, b_rb,  4);
+            ggml_metal_encoder_set_buffer  (enc, b_up,  5);
+            ggml_metal_encoder_set_buffer  (enc, b_dn,  6);
+            ggml_metal_encoder_set_buffer  (enc, b_lu,  7);
+            ggml_metal_encoder_set_buffer  (enc, b_us,  8);
+            ggml_metal_encoder_set_buffer  (enc, b_ds,  9);
+            ggml_metal_encoder_set_buffer  (enc, bid_ws, 10);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst, 11);
+            ggml_metal_encoder_set_buffer  (enc, b_sync, 12);
+            // unused slots bound to x (never read)
+            ggml_metal_encoder_set_buffer  (enc, pre ? ggml_metal_get_buffer_id(pre->src[1]) : b_x, 13);
+            ggml_metal_encoder_set_buffer  (enc, pre ? ggml_metal_get_buffer_id(pre->src[2]) : b_x, 14);
+            ggml_metal_encoder_set_buffer  (enc, pre ? ggml_metal_get_buffer_id(pre->src[3]) : b_x, 15);
+            ggml_metal_encoder_set_buffer  (enc, b_x, 16);
+            ggml_metal_encoder_set_buffer  (enc, geo ? ggml_metal_get_buffer_id(geo->src[2]) : b_x, 17);
+            ggml_metal_encoder_set_buffer  (enc, geo ? ggml_metal_get_buffer_id(geo->src[3]) : b_x, 18);
+            ggml_metal_encoder_set_buffer  (enc, geo ? ggml_metal_get_buffer_id(geo) : bid_dst, 19);
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+            ggml_metal_encoder_dispatch_threadgroups(enc, P, 1, 1, nth, 1, 1);
+
+            return geo ? 2 : 1;
+        }
+    }
 
     // a: input projections (lat, router logits, shared-expert up), one row per simdgroup
     // (sh_split: the shared expert is not on the critical path of the routed one: its up projection runs in extra

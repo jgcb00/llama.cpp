@@ -5075,6 +5075,12 @@ struct test_dragon_moe : public test_case {
         ggml_tensor * w_us   = ggml_new_tensor_2d(ctx, type_w,        n_embd, n_ff_sh);
         ggml_tensor * w_ds   = ggml_new_tensor_2d(ctx, type_w,        n_ff_sh, n_embd);
         ggml_tensor * out    = ggml_dragon_moe(ctx, x, w_ld, w_r, bias, w_up, w_down, w_lu, w_us, w_ds, k, w_scale, -1);
+        if (geo & 4) {
+            // as in the model: l_out = GEODESIC(moe input, moe output)
+            ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_tensor * gbias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            out = ggml_geodesic(ctx, x, out, scale, gbias, 0.5f);
+        }
         if (geo & 1) {
             ggml_tensor * x2    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
             ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
@@ -11716,6 +11722,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F32,   128,  2, 128,  16, 128,  128, 2, 1.5f));  // f32, n_ff_sh < n_embd (CPU reference dsh fix)
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F32,   256,  5, 128,  16, 256,  128, 3, 1.5f));  // f32, 5 tokens (2 passes of kernel a)
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  1, 384, 256, 768, 1536, 6, 2.45f, 3)); // Q8_0 decode, geodesic in and out
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384, 256, 768, 1536, 6, 2.45f, 4)); // decode, output geodesic on the input (model)
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384, 256, 768, 1536, 6, 2.45f, 6)); // decode, both geodesics as in the model
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  1, 384, 256, 768, 1536, 6, 2.45f, 6)); // Q8_0, both geodesics as in the model
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  2, 384, 256, 768, 1536, 6, 2.45f, 2)); // Q8_0, 2 tokens
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  4, 384, 256, 768, 1536, 6, 2.45f));    // Q8_0, b1/b2 path
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536, 19, 384, 256, 768, 1536, 6, 2.45f));    // Q8_0, odd batch

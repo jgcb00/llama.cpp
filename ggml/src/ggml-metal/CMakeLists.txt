@@ -1,6 +1,7 @@
 find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
 find_library(METAL_FRAMEWORK    Metal      REQUIRED)
 find_library(METALKIT_FRAMEWORK MetalKit   REQUIRED)
+find_library(IOKIT_FRAMEWORK    IOKit      REQUIRED)
 
 message(STATUS "Metal framework found")
 
@@ -17,6 +18,7 @@ ggml_add_backend_library(ggml-metal
 
 target_link_libraries(ggml-metal PRIVATE
                       ${FOUNDATION_LIBRARY}
+                      ${IOKIT_FRAMEWORK}
                       ${METAL_FRAMEWORK}
                       ${METALKIT_FRAMEWORK}
                       )

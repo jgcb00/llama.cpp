@@ -9,6 +9,7 @@
 #include <Foundation/Foundation.h>
 
 #include <Metal/Metal.h>
+#include <IOKit/IOKitLib.h>
 
 #include <stdatomic.h>
 
@@ -917,6 +918,9 @@ struct ggml_metal_device {
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
+
+    // zero-initialized scratch of the fused Dragon MoE kernel (barrier counters and atomic sums, reset by the kernel)
+    id<MTLBuffer> sync_buf;
 };
 
 //
@@ -1137,6 +1141,21 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 dev->props.has_simdgroup_mm = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
                 dev->props.has_unified_memory = dev->mtl_device.hasUnifiedMemory;
 
+                dev->props.gpu_core_count = 0;
+                {
+                    // GPU core count (the fused Dragon MoE kernel needs all its threadgroups resident)
+                    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AGXAccelerator"));
+                    if (svc) {
+                        CFTypeRef v = IORegistryEntryCreateCFProperty(svc, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
+                        if (v) {
+                            if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+                                CFNumberGetValue((CFNumberRef) v, kCFNumberIntType, &dev->props.gpu_core_count);
+                            }
+                            CFRelease(v);
+                        }
+                        IOObjectRelease(svc);
+                    }
+                }
                 dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
                 dev->props.has_bfloat |= [dev->mtl_device supportsFamily:MTLGPUFamilyApple6];
                 if (getenv("GGML_METAL_BF16_DISABLE") != NULL) {
@@ -1372,10 +1391,30 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
     return dev;
 }
 
+struct ggml_metal_buffer_id ggml_metal_device_get_sync_buffer(ggml_metal_device_t dev) {
+    @synchronized (dev->mtl_device) {
+        if (dev->sync_buf == nil) {
+            dev->sync_buf = [dev->mtl_device newBufferWithLength:GGML_METAL_SYNC_BUF_SIZE options:MTLResourceStorageModeShared];
+            memset([dev->sync_buf contents], 0, GGML_METAL_SYNC_BUF_SIZE);
+        }
+    }
+    struct ggml_metal_buffer_id res = { (__bridge void *) dev->sync_buf, 0 };
+    return res;
+}
+
+uint32_t ggml_metal_device_sync_buffer_word(ggml_metal_device_t dev, int i) {
+    return dev->sync_buf ? ((volatile const uint32_t *) [dev->sync_buf contents])[i] : 0u;
+}
+
 void ggml_metal_device_free(ggml_metal_device_t dev) {
     assert(dev != NULL);
 
     @autoreleasepool {
+        if (dev->sync_buf) {
+            [dev->sync_buf release];
+            dev->sync_buf = nil;
+        }
+
         ggml_metal_fusion_info_free(dev->finfo);
 
         ggml_metal_rsets_free(dev->rsets);

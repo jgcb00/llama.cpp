@@ -13,6 +13,11 @@ struct ggml_metal_buffer_id {
 
 typedef struct ggml_metal_device * ggml_metal_device_t;
 
+// fused Dragon MoE: zero-initialized device scratch (barriers, atomic sums), reset by the kernel itself
+#define GGML_METAL_SYNC_BUF_SIZE (64*1024)
+struct ggml_metal_buffer_id ggml_metal_device_get_sync_buffer(ggml_metal_device_t dev);
+uint32_t ggml_metal_device_sync_buffer_word(ggml_metal_device_t dev, int i); // host read (error flag)
+
 //
 // MTLFunctionConstantValues wrapper
 //
@@ -323,6 +328,8 @@ struct ggml_metal_device_props {
     int gpu_family;
 
     int op_offload_min_batch_size;
+
+    int gpu_core_count; // 0 when unknown (IORegistry "gpu-core-count")
 };
 
 typedef struct ggml_metal_event * ggml_metal_event_t;

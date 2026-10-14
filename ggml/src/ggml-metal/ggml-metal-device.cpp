@@ -802,7 +802,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_moe(ggml_
     GGML_ASSERT(op->op == GGML_OP_DRAGON_MOE);
 
     const ggml_tensor * w = which == 0 ? op->src[1] : which == 1 || which == 4 ? op->src[4] : which == 2 ? op->src[5] : op->src[6];
-    const char * kname   = which == 0 ? "a" : which == 1 ? "b1" : which == 2 ? "b2" : which == 3 ? "c" : "m";
+    const char * kname   = which == 0 ? "a" : which == 1 ? "b1" : which == 2 ? "b2" : which == 3 ? "c" : which == 4 ? "m" : "f";
 
     char base[256];
     char name[256];
