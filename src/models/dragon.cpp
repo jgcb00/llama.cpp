@@ -3909,4 +3909,14 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    // the activations of Dragon reach ~1e8 (Mamba outputs) and the relu^2 expert hidden states also leave the half
+    // range: the products with quantized weights must not convert their activations below bf16 [TAG_GGML_PREC]
+    // (Metal: bfloat instead of half operands in the matrix-matrix kernels)
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        ggml_tensor * t = ggml_graph_node(gf, i);
+        if ((t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) && ggml_is_quantized(t->src[0]->type)) {
+            ggml_prec_set_src(t, GGML_PREC_BF16, 1);
+        }
+    }
 }
