@@ -13502,6 +13502,29 @@ static void dragon_moe_quantize(enum ggml_type wtype, const float * src, void * 
     from_float(src, dst, n);
 }
 
+// the Dragon activations can leave the range of the f16 block scales of the quantized dot operands (Q8_0: block
+// max > ~8e6 -> inf scale): a row whose max exceeds 2^22 is divided by a power of two before the quantization
+// (exact), the dot products are multiplied back by the returned factor (1 for the usual rows)
+static inline float dragon_moe_row_mul(const float * src, int64_t n) {
+    float amax = 0.0f;
+    for (int64_t i = 0; i < n; ++i) {
+        amax = fmaxf(amax, fabsf(src[i]));
+    }
+    if (!(amax > 4194304.0f)) {
+        return 1.0f;
+    }
+    return exp2f(ceilf(log2f(amax/4194304.0f)));
+}
+
+static inline void dragon_moe_scale(float * x, int64_t n, float mul) {
+    if (mul != 1.0f) {
+        const float inv = 1.0f/mul;
+        for (int64_t i = 0; i < n; ++i) {
+            x[i] *= inv;
+        }
+    }
+}
+
 static inline void dragon_moe_relu2(float * dst, const float * src, int64_t n) {
     for (int64_t i = 0; i < n; ++i) {
         const float r = src[i] > 0.0f ? src[i] : 0.0f;
@@ -13758,11 +13781,24 @@ static void ggml_compute_forward_dragon_moe_f32(
         // shared expert down: relu2 of ush, then W_ds rows
         dragon_moe_split(d.n_embd, ith, nth, &a, &b);
         if (a < b) {
+            bool scaled = false;
             for (int64_t t = 0; t < T; ++t) {
                 dragon_moe_relu2(tmp, ush + t*d.n_ff_sh, d.n_ff_sh);
+                const float mul = dragon_moe_row_mul(tmp, d.n_ff_sh);
+                scaled |= mul != 1.0f;
+                dragon_moe_scale(tmp, d.n_ff_sh, mul);
                 dragon_moe_quantize(W_ds->type, tmp, ushq + t*qs_ds, d.n_ff_sh);
             }
             dragon_moe_gemv(W_ds, (const char *) W_ds->data, d.n_ff_sh, a, b, ushq, qs_ds, T, dsh, d.n_embd);
+            if (scaled) {
+                for (int64_t t = 0; t < T; ++t) {
+                    dragon_moe_relu2(tmp, ush + t*d.n_ff_sh, d.n_ff_sh);
+                    const float mul = dragon_moe_row_mul(tmp, d.n_ff_sh);
+                    for (int64_t r = a; r < b && mul != 1.0f; ++r) {
+                        dsh[t*d.n_embd + r] *= mul;
+                    }
+                }
+            }
         }
 
         for (int64_t t = 0; t < T; ++t) {
@@ -13802,6 +13838,7 @@ static void ggml_compute_forward_dragon_moe_f32(
         const int64_t n_rows = T*k*d.n_lat;
         dragon_moe_split(n_rows, ith, nth, &a, &b);
         int64_t last_pair = -1;
+        float   mul_dn    = 1.0f;
         dragon_moe_populated pop;
         for (int64_t i = a; i < b; ) {
             const int64_t pair = order[i/d.n_lat];
@@ -13812,6 +13849,8 @@ static void ggml_compute_forward_dragon_moe_f32(
             }
             if (pair != last_pair) {
                 dragon_moe_relu2(tmp, up + pair*d.n_ff, d.n_ff);
+                mul_dn = dragon_moe_row_mul(tmp, d.n_ff);
+                dragon_moe_scale(tmp, d.n_ff, mul_dn);
                 dragon_moe_quantize(W_down->type, tmp, upq + pair*qs_dn, d.n_ff);
                 last_pair = pair;
             }
@@ -13821,6 +13860,7 @@ static void ggml_compute_forward_dragon_moe_f32(
             float * out = down + pair*d.n_lat;
             for (int64_t r = r0; r < r1; ++r) {
                 vec_dot((int) d.n_ff, out + r, 0, wbase + r*W_down->nb[1], 0, xq, 0, 1);
+                out[r] *= mul_dn;
             }
             i += r1 - r0;
         }
@@ -13845,13 +13885,17 @@ static void ggml_compute_forward_dragon_moe_f32(
                         ot[i] += ei[i]*wi;
                     }
                 }
-                dragon_moe_quantize(W_lu->type, ot, routedq + t*qs_lu, d.n_lat);
+                const float mul = dragon_moe_row_mul(ot, d.n_lat);
+                memcpy(tmp, ot, d.n_lat*sizeof(float));
+                dragon_moe_scale(tmp, d.n_lat, mul);
+                dragon_moe_quantize(W_lu->type, tmp, routedq + t*qs_lu, d.n_lat);
             }
             float * out = (float *) dst->data;
             dragon_moe_gemv(W_lu, (const char *) W_lu->data, d.n_lat, a, b, routedq, qs_lu, T, out, d.n_embd);
             for (int64_t t = 0; t < T; ++t) {
+                const float mul = dragon_moe_row_mul(routed + t*d.n_lat, d.n_lat);
                 for (int64_t r = a; r < b; ++r) {
-                    out[t*d.n_embd + r] += dsh[t*d.n_embd + r];
+                    out[t*d.n_embd + r] = out[t*d.n_embd + r]*mul + dsh[t*d.n_embd + r];
                 }
             }
         }

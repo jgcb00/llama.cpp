@@ -3767,7 +3767,8 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
                                   model.can_prefetch.count(model.layers[il].ffn_down_exps) > 0;
         const bool metal_moe = dragon_layer_metal && dragon_metal_fused_moe_enabled() && !lazy_experts &&
             cur->ne[1] <= dragon_metal_moe_max_tokens();
-        const bool use_moe_op = (dragon_layer_cpu || metal_moe) && !force_no_fused_moe && !dragon_dump_dir() &&
+        // (lazy experts on a GPU layer: the CPU fused op too - the only path that pages the experts in and out)
+        const bool use_moe_op = (dragon_layer_cpu || metal_moe || lazy_experts) && !force_no_fused_moe && !dragon_dump_dir() &&
             (cur->ne[1] <= dragon_fused_moe_max_tokens() || lazy_experts || metal_moe) &&
             !dragon_tensor_repacked(model.layers[il].ffn_latent_down) &&
             !dragon_tensor_repacked(model.layers[il].ffn_up_exps) &&
