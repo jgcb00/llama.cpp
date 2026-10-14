@@ -119,7 +119,7 @@ size_t ggml_metal_op_dragon_moe_smem(const struct ggml_tensor * op, int which) {
     const int64_t tb      = std::min<int64_t>(4, n_tok); // DMOE_TB
     size_t n = 0;
     switch (which) {
-        case 0: n = tb*n_embd + 16;         break; // a : x of the pass | red (fused input geodesic)
+        case 0: n = tb*n_embd + 16 + 4*8;   break; // a : x of the pass | red (fused input geodesic) | K-split partial sums
         case 1: n = n_lat + 16 + 2*k;       break; // b1: lat | red | redi | selv | sele
         case 2: n = n_ff;                   break; // b2: h
         default: n = std::min<int64_t>(2, n_tok)*(n_lat + n_ff_sh); break; // c : routed | ush of the pass

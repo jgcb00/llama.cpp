@@ -2453,7 +2453,7 @@ static int ggml_metal_op_dragon_moe_impl(ggml_metal_op_t ctx, int idx, ggml_tens
         /*.pre_geo_inv_depth =*/ pre ? ggml_get_op_params_f32(pre, 0) : 0.0f,
         /*.merged     =*/ 0,
         /*.sh_rows    =*/ 0,
-        /*.pad2       =*/ 0,
+        /*.a_ks       =*/ 1,
         /*.off_acc    =*/ off_o + T*d.k*d.n_lat + 4 + T*d.n_embd,
     };
 
@@ -2516,15 +2516,25 @@ static int ggml_metal_op_dragon_moe_impl(ggml_metal_op_t ctx, int idx, ggml_tens
     // (sh_split: the shared expert is not on the critical path of the routed one: its up projection runs in extra
     // threadgroups of b1, its down projection in extra threadgroups of b2)
     const bool sh = args.sh_split != 0;
+
+    // kernel a: rows split across 2 (or 4) simdgroups (GGML_METAL_DRAGON_MOE_A_KS=1 disables)
+    {
+        static const int a_ks_env = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_A_KS"); return e ? atoi(e) : 2; }();
+        const int64_t nch_e = d.n_embd/128;
+        if ((a_ks_env == 2 || a_ks_env == 4) && nch_e % a_ks_env == 0) {
+            args.a_ks = a_ks_env;
+        }
+    }
+    const int64_t a_rpt = 8/args.a_ks; // rows per threadgroup of kernel a
     GGML_ASSERT(!sh || (d.n_lat + d.n_expert) % 8 == 0);
     if (!skip_a) {
         if (pre) {
             encode(0, { ggml_metal_get_buffer_id(pre->src[0]), b_ld, b_r, b_us, bid_ws, ggml_metal_get_buffer_id(pre->src[1]),
                         ggml_metal_get_buffer_id(pre->src[2]), ggml_metal_get_buffer_id(pre->src[3]), b_x },
-                   (d.n_lat + d.n_expert + (sh ? 0 : d.n_ff_sh) + 7)/8, 1);
+                   (d.n_lat + d.n_expert + (sh ? 0 : d.n_ff_sh) + a_rpt - 1)/a_rpt, 1);
         } else {
             // unused geodesic slots bound to x (never read)
-            encode(0, { b_x, b_ld, b_r, b_us, bid_ws, b_x, b_x, b_x, b_x }, (d.n_lat + d.n_expert + (sh ? 0 : d.n_ff_sh) + 7)/8, 1);
+            encode(0, { b_x, b_ld, b_r, b_us, bid_ws, b_x, b_x, b_x, b_x }, (d.n_lat + d.n_expert + (sh ? 0 : d.n_ff_sh) + a_rpt - 1)/a_rpt, 1);
         }
     }
     ggml_metal_op_concurrency_reset(ctx);

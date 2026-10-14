@@ -939,8 +939,9 @@ static inline void dmoe_geodesic_row_tg(
     }
 }
 
-// stage a, threadgroup tgx: rows tgx*8 + sgitg of [W_ld | W_r | W_us]
-template<typename T4, typename WSP>
+// stage a, threadgroup tgx: rows tgx*8 + sgitg of [W_ld | W_r | W_us]; KS = 2: rows tgx*4 + sgitg%4, simdgroup sgitg/4
+// takes the second half of the row (K split, the halves summed through threadgroup memory)
+template<typename T4, typename WSP, int KS = 1>
 static inline void dmoe_stage_a(
         constant ggml_metal_kargs_dragon_moe & args,
         device const float * x,
@@ -959,8 +960,11 @@ static inline void dmoe_stage_a(
     const int n   = args.n_embd;
     const int T   = args.n_tok;
     const int TB  = args.tb;
-    const int nch = FC_dmoe_nch_e;
-    const int row = row0 + tgx*DMOE_NSG + sgitg;
+    constexpr int RPT = DMOE_NSG/KS; // rows per threadgroup
+    const int nch = FC_dmoe_nch_e/KS;  // 4-wide chunks per lane of the simdgroup's part of the row
+    const int row = row0 + tgx*RPT + sgitg%RPT;
+    const int kh  = sgitg/RPT;         // part of the row
+    const int ko  = kh*nch*4*N_SIMDWIDTH; // its first element
 
     const int nA = args.n_lat;
     const int nB = nA + args.n_expert;
@@ -992,14 +996,15 @@ static inline void dmoe_stage_a(
     threadgroup float4 * xs4 = (threadgroup float4 *) shm; // TB x n
 
     // the weight row is issued first: its latency overlaps the staging of x (and the fused geodesic)
-    float4 w[DMOE_MAXCH];
+    float4 w[DMOE_MAXCH/KS];
     if (row < nC) {
         if (is_f32) {
-            dmoe_load_row<float4, DMOE_MAXCH>(w, (device const char *) wf, nch, tiisg);
+            dmoe_load_row<float4, DMOE_MAXCH/KS>(w, (device const char *) (wf + ko), nch, tiisg);
         } else {
-            dmoe_load_row<T4, DMOE_MAXCH>(w, wt, nch, tiisg);
+            dmoe_load_row<T4, DMOE_MAXCH/KS>(w, wt + (size_t) ko*esz, nch, tiisg);
         }
     }
+    threadgroup float * part = shm + TB*n + 2*DMOE_NSG; // KS > 1: DMOE_TB x DMOE_NSG partial sums
 
     for (int t0 = 0; t0 < T; t0 += TB) {
         const int nt = min(TB, T - t0);
@@ -1020,19 +1025,46 @@ static inline void dmoe_stage_a(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (row < nC) {
+        if (KS == 1) {
+            if (row < nC) {
 #pragma unroll
-            for (int j = 0; j < DMOE_TB; ++j) {
-                if (j < nt) {
-                    float s = dmoe_dot_tg<DMOE_MAXCH>(w, xs4 + (size_t) j*(n/4), nch, tiisg);
-                    if (tiisg == 0) {
-                        if (relu2) {
-                            s = max(s, 0.0f);
-                            s = s*s;
+                for (int j = 0; j < DMOE_TB; ++j) {
+                    if (j < nt) {
+                        float s = dmoe_dot_tg<DMOE_MAXCH/KS>(w, xs4 + (size_t) j*(n/4), nch, tiisg);
+                        if (tiisg == 0) {
+                            if (relu2) {
+                                s = max(s, 0.0f);
+                                s = s*s;
+                            }
+                            out[(size_t) (t0 + j)*stride] = s;
                         }
-                        out[(size_t) (t0 + j)*stride] = s;
                     }
                 }
+            }
+        } else {
+            if (row < nC) {
+#pragma unroll
+                for (int j = 0; j < DMOE_TB; ++j) {
+                    if (j < nt) {
+                        const float s = dmoe_dot_tg<DMOE_MAXCH/KS>(w, xs4 + (size_t) j*(n/4) + ko/4, nch, tiisg);
+                        if (tiisg == 0) {
+                            part[j*DMOE_NSG + sgitg] = s;
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (row < nC && kh == 0 && tiisg < nt) {
+                const int j = tiisg;
+                float s = 0.0f;
+                for (int q = 0; q < KS; ++q) {
+                    s += part[j*DMOE_NSG + sgitg + q*RPT];
+                }
+                if (relu2) {
+                    s = max(s, 0.0f);
+                    s = s*s;
+                }
+                out[(size_t) (t0 + j)*stride] = s;
             }
         }
     }
@@ -1066,6 +1098,22 @@ kernel void kernel_dragon_moe_a(
         }
     }
 
+    if (args.a_ks == 4) {
+        if (args.pre_geo) {
+            dmoe_stage_a<T4, device float *, 4>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg, pg, pg_scale, pg_bias, pg_out);
+        } else {
+            dmoe_stage_a<T4, device float *, 4>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg);
+        }
+        return;
+    }
+    if (args.a_ks == 2) {
+        if (args.pre_geo) {
+            dmoe_stage_a<T4, device float *, 2>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg, pg, pg_scale, pg_bias, pg_out);
+        } else {
+            dmoe_stage_a<T4, device float *, 2>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg);
+        }
+        return;
+    }
     if (args.pre_geo) {
         dmoe_stage_a<T4>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg, pg, pg_scale, pg_bias, pg_out);
     } else {

@@ -1088,7 +1088,7 @@ typedef struct {
     float   pre_geo_inv_depth;
     int32_t merged;     // 1: kernel m (routed up + down, shared up + down) replaces b1 and b2, sums by float atomics
     int32_t sh_rows;    // merged: shared-expert FF rows per threadgroup
-    int32_t pad2;
+    int32_t a_ks;       // 2: kernel a splits every row across two simdgroups (4 rows per threadgroup)
     int64_t off_acc;    // merged: (n_lat, n_tok) weighted sum of the expert outputs (zeroed by kernel a, as dsh)
 } ggml_metal_kargs_dragon_moe;
 
