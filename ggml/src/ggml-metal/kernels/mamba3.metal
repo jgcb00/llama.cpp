@@ -695,19 +695,39 @@ constant int FC_dmoe_nch_f [[function_constant(FC_DRAGON_MOE + 2)]];
 constant int FC_dmoe_nch_s [[function_constant(FC_DRAGON_MOE + 3)]];
 constant int FC_dmoe_nf    [[function_constant(FC_DRAGON_MOE + 4)]]; // kernel m: float4 per W_down row slice
 
+// weight access of the Dragon kernels, by weight type T4: float4 / half4 / bfloat4 (4 elements of the row type), or
+// dmoe_q8 for Q8_0 rows (blocks of 32: f16 scale + 32 int8). dmoe_rb: bytes of n elements (n a multiple of 32 for
+// Q8_0: whole rows and block-aligned slices), dmoe_ld: elements e .. e+3 of a row (e a multiple of 4)
+struct dmoe_q8 { char4 v; };
+
 template<typename T4>
-static inline float4 dmoe_load4(device const char * p) {
-    return float4(*(device const T4 *) p);
+static inline size_t dmoe_rb(size_t n) {
+    return n*(sizeof(T4)/4);
+}
+template<>
+inline size_t dmoe_rb<dmoe_q8>(size_t n) {
+    return (n/32)*34;
+}
+
+template<typename T4>
+static inline float4 dmoe_ld(device const char * row, int e) {
+    return float4(*(device const T4 *) (row + (size_t) e*(sizeof(T4)/4)));
+}
+template<>
+inline float4 dmoe_ld<dmoe_q8>(device const char * row, int e) {
+    device const char * b = row + (size_t) (e >> 5)*34;
+    const float d = (float) *(device const half *) b;
+    const packed_char4 q = *(device const packed_char4 *) (b + 2 + (e & 31)); // 2-byte aligned
+    return float4(q)*d;
 }
 
 // loads the lane's chunks of one weight row: w[i] = row[tiisg*4 + i*128 .. +3], i < nch
 template<typename T4, int MAXCH>
 static inline void dmoe_load_row(thread float4 * w, device const char * wrow, int nch, ushort tiisg) {
-    constexpr int esz = sizeof(T4)/4;
 #pragma unroll
     for (int i = 0; i < MAXCH; ++i) {
         if (i < nch) {
-            w[i] = dmoe_load4<T4>(wrow + (size_t) (tiisg*4 + i*4*N_SIMDWIDTH)*esz);
+            w[i] = dmoe_ld<T4>(wrow, tiisg*4 + i*4*N_SIMDWIDTH);
         }
     }
 }
@@ -955,7 +975,6 @@ static inline void dmoe_stage_a(
         device const float * pg_scale = nullptr,
         device const float * pg_bias = nullptr,
         device       float * pg_out = nullptr) {  // written by threadgroup 0
-    constexpr int esz = sizeof(T4)/4;
 
     const int n   = args.n_embd;
     const int T   = args.n_tok;
@@ -978,7 +997,7 @@ static inline void dmoe_stage_a(
     bool relu2  = false;
 
     if (row < nA) {
-        wt     = w_ld + (size_t) row*n*esz;
+        wt     = w_ld + dmoe_rb<T4>((size_t) row*n);
         out    = ws + args.off_lat + row;
         stride = args.n_lat;
     } else if (row < nB) {
@@ -987,7 +1006,7 @@ static inline void dmoe_stage_a(
         stride = args.n_expert;
         is_f32 = true;
     } else if (row < nC) {
-        wt     = w_us + (size_t) (row - nB)*n*esz;
+        wt     = w_us + dmoe_rb<T4>((size_t) (row - nB)*n);
         out    = ws + args.off_ush + (row - nB);
         stride = args.n_ff_sh;
         relu2  = true;
@@ -1001,7 +1020,7 @@ static inline void dmoe_stage_a(
         if (is_f32) {
             dmoe_load_row<float4, DMOE_MAXCH/KS>(w, (device const char *) (wf + ko), nch, tiisg);
         } else {
-            dmoe_load_row<T4, DMOE_MAXCH/KS>(w, wt + (size_t) ko*esz, nch, tiisg);
+            dmoe_load_row<T4, DMOE_MAXCH/KS>(w, wt + dmoe_rb<T4>(ko), nch, tiisg);
         }
     }
     threadgroup float * part = shm + TB*n + 2*DMOE_NSG; // KS > 1: DMOE_TB x DMOE_NSG partial sums
@@ -1178,7 +1197,6 @@ static inline void dmoe_stage_b1(
         device const char  * w_up,
         threadgroup  float * shm,
         int p, int t, ushort tiitg, ushort sgitg, ushort tiisg) {
-    constexpr int esz = sizeof(T4)/4;
 
     const int K      = args.k;
     const int nsplit = args.nsplit;
@@ -1219,7 +1237,7 @@ static inline void dmoe_stage_b1(
     }
 
     // rows [sp*FFS, (sp+1)*FFS) of W_up[ex] (n_ff rows of n_lat), 4 rows per simdgroup pass
-    device const char * wup = w_up + ((size_t) ex*n_ff + (size_t) sp*FFS)*n_lat*esz;
+    device const char * wup = w_up + dmoe_rb<T4>(((size_t) ex*n_ff + (size_t) sp*FFS)*n_lat);
     WSP                 h   = ws + args.off_h + ((size_t) t*K + kk)*n_ff + sp*FFS;
 
     for (int j0 = sgitg*4; j0 < FFS; j0 += DMOE_NSG*4) {
@@ -1227,7 +1245,7 @@ static inline void dmoe_stage_b1(
 #pragma unroll
         for (int r = 0; r < 4; ++r) {
             if (j0 + r < FFS) {
-                dmoe_load_row<T4, 8>(w[r], wup + (size_t) (j0 + r)*n_lat*esz, nch, tiisg);
+                dmoe_load_row<T4, 8>(w[r], wup + dmoe_rb<T4>((size_t) (j0 + r)*n_lat), nch, tiisg);
             }
         }
 #pragma unroll
@@ -1278,7 +1296,6 @@ static inline void dmoe_stage_b2(
         device const char  * w_down,
         threadgroup  float * shm,
         int p, int t, ushort tiitg, ushort sgitg, ushort tiisg) {
-    constexpr int esz = sizeof(T4)/4;
 
     const int K      = args.k;
     const int nsplit = args.nsplit;
@@ -1302,7 +1319,7 @@ static inline void dmoe_stage_b2(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // rows [sq*RS, (sq+1)*RS) of W_down[ex] (n_lat rows of n_ff), 2 rows per simdgroup pass
-    device const char * wdn = w_down + ((size_t) ex*n_lat + (size_t) sq*RS)*n_ff*esz;
+    device const char * wdn = w_down + dmoe_rb<T4>(((size_t) ex*n_lat + (size_t) sq*RS)*n_ff);
     WSP                 o   = ws + args.off_o + ((size_t) t*K + kk)*n_lat + sq*RS;
 
     for (int j0 = sgitg*2; j0 < RS; j0 += DMOE_NSG*2) {
@@ -1310,7 +1327,7 @@ static inline void dmoe_stage_b2(
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
             if (j0 + r < RS) {
-                dmoe_load_row<T4, 8>(w[r], wdn + (size_t) (j0 + r)*n_ff*esz, nch, tiisg);
+                dmoe_load_row<T4, 8>(w[r], wdn + dmoe_rb<T4>((size_t) (j0 + r)*n_ff), nch, tiisg);
             }
         }
 #pragma unroll
@@ -1333,7 +1350,6 @@ static inline void dmoe_stage_ds(
         device const char  * w_ds,
         threadgroup  float * shm,
         int tgx, int tgy, ushort tiitg, ushort sgitg, ushort tiisg) {
-    constexpr int esz = sizeof(T4)/4;
 
     const int n_sh  = args.n_ff_sh;
     const int n     = args.n_embd;
@@ -1356,7 +1372,7 @@ static inline void dmoe_stage_ds(
 
     if (row < n) {
         float4 wd[DMOE_MAXCH];
-        dmoe_load_row<T4, DMOE_MAXCH>(wd, w_ds + (size_t) row*n_sh*esz, nch_s, tiisg);
+        dmoe_load_row<T4, DMOE_MAXCH>(wd, w_ds + dmoe_rb<T4>((size_t) row*n_sh), nch_s, tiisg);
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
             if (j < nt) {
@@ -1487,7 +1503,6 @@ static inline void dmoe_stage_m_routed(
         device const char  * w_down,
         threadgroup  float * shm,
         int p, int t, ushort tiitg, ushort sgitg, ushort tiisg) {
-    constexpr int esz = sizeof(T4)/4;
 
     const int K      = args.k;
     const int nsplit = args.nsplit;
@@ -1516,25 +1531,25 @@ static inline void dmoe_stage_m_routed(
 
     // down weights issued first (they depend only on the routing): columns [sp*FFS, (sp+1)*FFS) of the W_down[ex]
     // rows tiitg + i*DMOE_NTH (FFS <= 4*DMOE_MF)
-    device const char * wdn = w_down + ((size_t) ex*n_lat*n_ff + (size_t) sp*FFS)*esz;
+    device const char * wdn = w_down + dmoe_rb<T4>((size_t) ex*n_lat*n_ff); // slice: elements sp*FFS + ...
     const int nf = FC_dmoe_nf; // FFS/4
     float4 wd[DMOE_MD][DMOE_MF];
 #pragma unroll
     for (int i = 0; i < DMOE_MD; ++i) {
         const int d = tiitg + i*DMOE_NTH;
         if (d < n_lat) {
-            device const char * r = wdn + (size_t) d*n_ff*esz;
+            device const char * r = wdn + dmoe_rb<T4>((size_t) d*n_ff);
 #pragma unroll
             for (int f = 0; f < DMOE_MF; ++f) {
                 if (f < nf) {
-                    wd[i][f] = dmoe_load4<T4>(r + (size_t) f*4*esz);
+                    wd[i][f] = dmoe_ld<T4>(r, sp*FFS + f*4);
                 }
             }
         }
     }
 
     // up: rows [sp*FFS, (sp+1)*FFS) of W_up[ex], 4 rows per simdgroup pass
-    device const char * wup = w_up + ((size_t) ex*n_ff + (size_t) sp*FFS)*n_lat*esz;
+    device const char * wup = w_up + dmoe_rb<T4>(((size_t) ex*n_ff + (size_t) sp*FFS)*n_lat);
     // all the rows of the simdgroup (j = sgitg + r*DMOE_NSG, r < DMOE_MU) issued at once, before the barrier that
     // publishes xs (every simdgroup reaches it)
     float4 w[DMOE_MU][8];
@@ -1542,7 +1557,7 @@ static inline void dmoe_stage_m_routed(
     for (int r = 0; r < DMOE_MU; ++r) {
         const int j = sgitg + r*DMOE_NSG;
         if (j < FFS) {
-            dmoe_load_row<T4, 8>(w[r], wup + (size_t) j*n_lat*esz, nch, tiisg);
+            dmoe_load_row<T4, 8>(w[r], wup + dmoe_rb<T4>((size_t) j*n_lat), nch, tiisg);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1587,7 +1602,6 @@ static inline void dmoe_stage_m_shared(
         device const char  * w_ds,
         threadgroup  float * shm,
         int s, ushort tiitg, ushort sgitg, ushort tiisg) {
-    constexpr int esz = sizeof(T4)/4;
 
     const int n    = args.n_embd;
     const int n_sh = args.n_ff_sh;
@@ -1607,7 +1621,7 @@ static inline void dmoe_stage_m_shared(
     // up: rows [s*SR, (s+1)*SR) of W_us, one row per simdgroup pass
     for (int r = sgitg; r < SR; r += DMOE_NSG) {
         float4 w[DMOE_MAXCH];
-        dmoe_load_row<T4, DMOE_MAXCH>(w, w_us + (size_t) (s*SR + r)*n*esz, nch, tiisg);
+        dmoe_load_row<T4, DMOE_MAXCH>(w, w_us + dmoe_rb<T4>((size_t) (s*SR + r)*n), nch, tiisg);
         for (int j = 0; j < T; ++j) {
             float v = dmoe_dot_tg<DMOE_MAXCH>(w, xs4 + (size_t) j*(n/4), nch, tiisg);
             if (tiisg == 0) {
@@ -1619,12 +1633,12 @@ static inline void dmoe_stage_m_shared(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // down: columns [s*SR, (s+1)*SR) of every W_ds row, one row per thread
-    device const char * wds = w_ds + (size_t) s*SR*esz;
+    device const char * wds = w_ds; // slice: elements s*SR + ...
     for (int d = tiitg; d < n; d += DMOE_NTH) {
-        device const char * r = wds + (size_t) d*n_sh*esz;
+        device const char * r = wds + dmoe_rb<T4>((size_t) d*n_sh);
         float acc[DMOE_TB] = { 0.0f };
         for (int f = 0; f < SR/4; ++f) {
-            const float4 w = dmoe_load4<T4>(r + (size_t) f*4*esz);
+            const float4 w = dmoe_ld<T4>(r, s*SR + f*4);
             for (int j = 0; j < T; ++j) {
                 acc[j] += dot(w, ((threadgroup const float4 *) (us + j*SR))[f]);
             }
@@ -1670,7 +1684,6 @@ static inline void dmoe_stage_c(
         DP                   dst,
         threadgroup  float * shm,
         int tgx, int tgy, ushort tiitg, ushort sgitg, ushort tiisg) {
-    constexpr int esz = sizeof(T4)/4;
 
     const int K     = args.k;
     const int n_lat = args.n_lat;
@@ -1717,7 +1730,7 @@ static inline void dmoe_stage_c(
         // the shared expert is already projected (b2): latent up + its row
         if (row < n) {
             float4 wl[8];
-            dmoe_load_row<T4, 8>(wl, w_lu + (size_t) row*n_lat*esz, nch_l, tiisg);
+            dmoe_load_row<T4, 8>(wl, w_lu + dmoe_rb<T4>((size_t) row*n_lat), nch_l, tiisg);
             float dsh[2];
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
@@ -1739,8 +1752,8 @@ static inline void dmoe_stage_c(
     if (row < n) {
         float4 wl[8];
         float4 wd[DMOE_MAXCH];
-        dmoe_load_row<T4, 8>         (wl, w_lu + (size_t) row*n_lat*esz, nch_l, tiisg);
-        dmoe_load_row<T4, DMOE_MAXCH>(wd, w_ds + (size_t) row*n_sh*esz,  nch_s, tiisg);
+        dmoe_load_row<T4, 8>         (wl, w_lu + dmoe_rb<T4>((size_t) row*n_lat), nch_l, tiisg);
+        dmoe_load_row<T4, DMOE_MAXCH>(wd, w_ds + dmoe_rb<T4>((size_t) row*n_sh),  nch_s, tiisg);
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
             if (j < nt) {
@@ -1828,6 +1841,11 @@ template [[host_name("kernel_dragon_moe_b2_bf16")]] kernel kernel_dragon_moe_b2_
 template [[host_name("kernel_dragon_moe_c_bf16")]]  kernel kernel_dragon_moe_c_t  kernel_dragon_moe_c<bfloat4>;
 template [[host_name("kernel_dragon_moe_m_bf16")]]   kernel kernel_dragon_moe_m_t  kernel_dragon_moe_m<bfloat4>;
 #endif
+template [[host_name("kernel_dragon_moe_a_q8_0")]]  kernel kernel_dragon_moe_a_t  kernel_dragon_moe_a<dmoe_q8>;
+template [[host_name("kernel_dragon_moe_b1_q8_0")]] kernel kernel_dragon_moe_b1_t kernel_dragon_moe_b1<dmoe_q8>;
+template [[host_name("kernel_dragon_moe_b2_q8_0")]] kernel kernel_dragon_moe_b2_t kernel_dragon_moe_b2<dmoe_q8>;
+template [[host_name("kernel_dragon_moe_c_q8_0")]]  kernel kernel_dragon_moe_c_t  kernel_dragon_moe_c<dmoe_q8>;
+template [[host_name("kernel_dragon_moe_m_q8_0")]]   kernel kernel_dragon_moe_m_t  kernel_dragon_moe_m<dmoe_q8>;
 
 
 // ---------------------------------------------------------------------------------------------
@@ -1860,7 +1878,7 @@ kernel void kernel_dragon_mmv(
     const int nch  = n/(4*N_SIMDWIDTH);
     const int row0 = (tgpig.x*args.nsg + sgitg)*NR;
 
-    device const T4 * wr[NR];
+    device const char * wr[NR];
     bool ok[NR];
 #pragma unroll
     for (int r = 0; r < NR; ++r) {
@@ -1873,7 +1891,7 @@ kernel void kernel_dragon_mmv(
             }
         }
         device const char * wb = si == 0 ? w0 : si == 1 ? w1 : si == 2 ? w2 : si == 3 ? w3 : si == 4 ? w4 : si == 5 ? w5 : si == 6 ? w6 : si == 7 ? w7 : w8;
-        wr[r] = (device const T4 *) wb + (size_t) (ok[r] ? row - args.off[si] : 0)*(n/4) + tiisg;
+        wr[r] = wb + dmoe_rb<T4>((size_t) (ok[r] ? row - args.off[si] : 0)*n);
     }
 
     for (int t = 0; t < T; ++t) {
@@ -1886,7 +1904,7 @@ kernel void kernel_dragon_mmv(
 #pragma unroll
                 for (int u = 0; u < U; ++u) {
                     if (c0 + u < nch) {
-                        w[r][u] = float4(wr[r][(c0 + u)*N_SIMDWIDTH]);
+                        w[r][u] = dmoe_ld<T4>(wr[r], tiisg*4 + (c0 + u)*4*N_SIMDWIDTH);
                     }
                 }
             }
@@ -1938,7 +1956,7 @@ kernel void kernel_dragon_mmv_ks(
     const int nch  = n/(4*N_SIMDWIDTH);
     const int row0 = tgpig.x*NR;
 
-    device const T4 * wr[NR];
+    device const char * wr[NR];
     bool ok[NR];
 #pragma unroll
     for (int r = 0; r < NR; ++r) {
@@ -1951,7 +1969,7 @@ kernel void kernel_dragon_mmv_ks(
             }
         }
         device const char * wb = si == 0 ? w0 : si == 1 ? w1 : si == 2 ? w2 : si == 3 ? w3 : si == 4 ? w4 : si == 5 ? w5 : si == 6 ? w6 : si == 7 ? w7 : w8;
-        wr[r] = (device const T4 *) wb + (size_t) (ok[r] ? row - args.off[si] : 0)*(n/4) + tiisg;
+        wr[r] = wb + dmoe_rb<T4>((size_t) (ok[r] ? row - args.off[si] : 0)*n);
     }
 
     float4 w[NR][MAXC];
@@ -1961,7 +1979,7 @@ kernel void kernel_dragon_mmv_ks(
         for (int u = 0; u < MAXC; ++u) {
             const int c = sgitg + u*NSG;
             if (c < nch) {
-                w[r][u] = float4(wr[r][c*N_SIMDWIDTH]);
+                w[r][u] = dmoe_ld<T4>(wr[r], tiisg*4 + c*4*N_SIMDWIDTH);
             }
         }
     }
@@ -2043,6 +2061,18 @@ template [[host_name("kernel_dragon_mmv_ks_bf16_nr4_c3")]] kernel kernel_dragon_
 template [[host_name("kernel_dragon_mmv_ks_bf16_nr4_c4")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<bfloat4, 4, 4>;
 template [[host_name("kernel_dragon_mmv_ks_bf16_nr4_c6")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<bfloat4, 4, 6>;
 #endif
+template [[host_name("kernel_dragon_mmv_ks_q8_0_nr1_c2")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 1, 2>;
+template [[host_name("kernel_dragon_mmv_ks_q8_0_nr1_c3")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 1, 3>;
+template [[host_name("kernel_dragon_mmv_ks_q8_0_nr1_c4")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 1, 4>;
+template [[host_name("kernel_dragon_mmv_ks_q8_0_nr1_c6")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 1, 6>;
+template [[host_name("kernel_dragon_mmv_ks_q8_0_nr2_c2")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 2, 2>;
+template [[host_name("kernel_dragon_mmv_ks_q8_0_nr2_c3")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 2, 3>;
+template [[host_name("kernel_dragon_mmv_ks_q8_0_nr2_c4")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 2, 4>;
+template [[host_name("kernel_dragon_mmv_ks_q8_0_nr2_c6")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 2, 6>;
+template [[host_name("kernel_dragon_mmv_ks_q8_0_nr4_c2")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 4, 2>;
+template [[host_name("kernel_dragon_mmv_ks_q8_0_nr4_c3")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 4, 3>;
+template [[host_name("kernel_dragon_mmv_ks_q8_0_nr4_c4")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 4, 4>;
+template [[host_name("kernel_dragon_mmv_ks_q8_0_nr4_c6")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 4, 6>;
 
 typedef decltype(kernel_dragon_mmv<float4, 1, 4>) kernel_dragon_mmv_t;
 template [[host_name("kernel_dragon_mmv_f32_nr1_u2")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<float4, 1, 2>;
@@ -2083,6 +2113,18 @@ template [[host_name("kernel_dragon_mmv_bf16_nr4_u4")]] kernel kernel_dragon_mmv
 template [[host_name("kernel_dragon_mmv_bf16_nr4_u6")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<bfloat4, 4, 6>;
 template [[host_name("kernel_dragon_mmv_bf16_nr4_u12")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<bfloat4, 4, 12>;
 #endif
+template [[host_name("kernel_dragon_mmv_q8_0_nr1_u2")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 1, 2>;
+template [[host_name("kernel_dragon_mmv_q8_0_nr1_u4")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 1, 4>;
+template [[host_name("kernel_dragon_mmv_q8_0_nr1_u6")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 1, 6>;
+template [[host_name("kernel_dragon_mmv_q8_0_nr1_u12")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 1, 12>;
+template [[host_name("kernel_dragon_mmv_q8_0_nr2_u2")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 2, 2>;
+template [[host_name("kernel_dragon_mmv_q8_0_nr2_u4")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 2, 4>;
+template [[host_name("kernel_dragon_mmv_q8_0_nr2_u6")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 2, 6>;
+template [[host_name("kernel_dragon_mmv_q8_0_nr2_u12")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 2, 12>;
+template [[host_name("kernel_dragon_mmv_q8_0_nr4_u2")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 4, 2>;
+template [[host_name("kernel_dragon_mmv_q8_0_nr4_u4")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 4, 4>;
+template [[host_name("kernel_dragon_mmv_q8_0_nr4_u6")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 4, 6>;
+template [[host_name("kernel_dragon_mmv_q8_0_nr4_u12")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 4, 12>;
 
 // staged variant for larger batches (T > 4): y = concat_i(W_i^T x): one output row per simdgroup, x staged for tb tokens (same scheme as kernel_dragon_moe_a)
 template<typename T4>
@@ -2104,7 +2146,6 @@ kernel void kernel_dragon_mmv_st(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]]) {
-    constexpr int esz = sizeof(T4)/4;
 
     const int n   = args.n_embd;
     const int T   = args.n_tok;
@@ -2121,7 +2162,7 @@ kernel void kernel_dragon_mmv_st(
             }
         }
         device const char * w = sec == 0 ? w0 : sec == 1 ? w1 : sec == 2 ? w2 : sec == 3 ? w3 : sec == 4 ? w4 : sec == 5 ? w5 : sec == 6 ? w6 : sec == 7 ? w7 : w8;
-        wrow = w + (size_t) (row - args.off[sec])*n*esz;
+        wrow = w + dmoe_rb<T4>((size_t) (row - args.off[sec])*n);
     }
 
     threadgroup float4 * xs4 = (threadgroup float4 *) shm;
@@ -2157,6 +2198,7 @@ template [[host_name("kernel_dragon_mmv_st_f16")]]  kernel kernel_dragon_mmv_st_
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_dragon_mmv_st_bf16")]] kernel kernel_dragon_mmv_st_t kernel_dragon_mmv_st<bfloat4>;
 #endif
+template [[host_name("kernel_dragon_mmv_st_q8_0")]] kernel kernel_dragon_mmv_st_t kernel_dragon_mmv_st<dmoe_q8>;
 
 // one threadgroup per (q head h, token t); the kv head hn = h / (H/Hn) is prepared by the G threadgroups
 // sharing it (only the first writes it). threadgroup memory: [ kk (Dh) | vv (Dh) | red (8) ]

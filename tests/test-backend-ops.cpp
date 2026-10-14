@@ -11696,6 +11696,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_BF16, 1536, 1));
     test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_BF16, 1536, 5));
     test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_F32,   256, 3, { 64, 8, 200 }));
+    test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_Q8_0, 1536, 1));
+    test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_Q8_0, 1536, 5));
     test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 1, 1));   // decode
     test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 4, 4));   // batched decode
     test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 6, 2));   // 3 tokens per sequence (in-batch shift)
@@ -11713,6 +11715,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F16,   256,  3, 128,  32, 128,  256, 4, 1.0f));  // small dims, f16
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F32,   128,  2, 128,  16, 128,  128, 2, 1.5f));  // f32, n_ff_sh < n_embd (CPU reference dsh fix)
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F32,   256,  5, 128,  16, 256,  128, 3, 1.5f));  // f32, 5 tokens (2 passes of kernel a)
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  1, 384, 256, 768, 1536, 6, 2.45f, 3)); // Q8_0 decode, geodesic in and out
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  2, 384, 256, 768, 1536, 6, 2.45f, 2)); // Q8_0, 2 tokens
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  4, 384, 256, 768, 1536, 6, 2.45f));    // Q8_0, b1/b2 path
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536, 19, 384, 256, 768, 1536, 6, 2.45f));    // Q8_0, odd batch
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

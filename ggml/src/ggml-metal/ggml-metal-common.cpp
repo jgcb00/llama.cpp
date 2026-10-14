@@ -161,7 +161,8 @@ int ggml_metal_op_dragon_moe_msplit(const struct ggml_tensor * op) {
 int ggml_metal_op_dragon_moe_sh_rows(const struct ggml_tensor * op) {
     const int64_t n_ff_sh = op->src[7]->ne[1];
     static const int want = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_SH_ROWS"); return e ? atoi(e) : 16; }();
-    for (int r = std::max(4, want) & ~3; r >= 4; r -= 4) {
+    const int step = 4;
+    for (int r = (std::max(step, want)/step)*step; r >= step; r -= step) {
         if (n_ff_sh % r == 0) {
             return r;
         }
@@ -172,7 +173,9 @@ int ggml_metal_op_dragon_moe_sh_rows(const struct ggml_tensor * op) {
 // kernel m replaces b1 and b2 for T <= GGML_METAL_DRAGON_MOE_MERGE_T (default 2, 0 disables)
 bool ggml_metal_op_dragon_moe_merged(const struct ggml_tensor * op) {
     static const int max_t = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_MERGE_T"); return e ? atoi(e) : 2; }();
-    return op->src[0]->ne[1] <= std::min(max_t, 4) && ggml_metal_op_dragon_moe_msplit(op) > 0 && ggml_metal_op_dragon_moe_sh_rows(op) > 0;
+    // kernel m reads W_up, W_down, W_us and W_ds with one weight type
+    const bool same_type = op->src[4]->type == op->src[7]->type && op->src[4]->type == op->src[8]->type;
+    return same_type && op->src[0]->ne[1] <= std::min(max_t, 4) && ggml_metal_op_dragon_moe_msplit(op) > 0 && ggml_metal_op_dragon_moe_sh_rows(op) > 0;
 }
 
 bool ggml_metal_op_dragon_moe_sh_split(const struct ggml_tensor * op) {
