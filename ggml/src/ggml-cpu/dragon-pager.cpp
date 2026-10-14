@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <list>
 #include <mutex>
 #include <string>
@@ -25,6 +26,9 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
+#if defined(__APPLE__)
+#include <libproc.h>
 #endif
 
 // a fault (or MADV_POPULATE_READ) also maps the neighbouring pages that are in
@@ -297,3 +301,245 @@ int dragon_pager_used(const char * const * ptrs, const size_t * sizes, int n, si
     }
     return n_out;
 }
+
+// ---------------------------------------------------------------- explicit cache
+
+#if defined(__linux__) || defined(__APPLE__)
+
+static bool dragon_pager_env_flag(const char * name) {
+    const char * e = getenv(name);
+    return e != nullptr && atoi(e) != 0;
+}
+
+#if defined(__APPLE__)
+// file and offset behind [a, b) from the VM region info (PROC_PIDREGIONPATHINFO);
+// the region may be split in several entries (madvise behaviours): followed as
+// long as they continue the same file contiguously
+static bool dragon_pager_locate_darwin(uintptr_t a, uintptr_t b, std::string * path, uint64_t * off) {
+    uintptr_t cur = a;
+    uint64_t  cur_off = 0;
+    bool first = true;
+    while (cur < b) {
+        struct proc_regionwithpathinfo info;
+        const int r = proc_pidinfo(getpid(), PROC_PIDREGIONPATHINFO, (uint64_t) cur, &info, sizeof(info));
+        if (r != (int) sizeof(info)) {
+            return false;
+        }
+        const uintptr_t beg = (uintptr_t) info.prp_prinfo.pri_address;
+        const uintptr_t end = beg + (uintptr_t) info.prp_prinfo.pri_size;
+        if (cur < beg || cur >= end || info.prp_vip.vip_path[0] != '/') {
+            return false;
+        }
+        const uint64_t o = info.prp_prinfo.pri_offset + (cur - beg);
+        if (first) {
+            *path   = info.prp_vip.vip_path;
+            *off    = o;
+            first   = false;
+        } else if (*path != info.prp_vip.vip_path || o != cur_off) {
+            return false;
+        }
+        cur_off = o + (end - cur);
+        cur     = end;
+    }
+    return true;
+}
+#endif
+
+namespace {
+struct dragon_pager_cache {
+    struct entry {
+        char *   buf;
+        size_t   n;
+        uint64_t call; // last call that returned it (pinned while == current call)
+        std::list<const char *>::iterator it;
+    };
+    struct src {
+        int      fd;
+        uint64_t off;
+    };
+
+    std::mutex mtx;
+    std::unordered_map<const char *, entry> map;
+    std::list<const char *> lru; // front = most recently used
+    std::unordered_map<const char *, src> srcs; // slab -> file, offset (cached lookups)
+    std::unordered_map<std::string, int>  fds;
+    size_t   bytes = 0;
+    uint64_t call  = 0;
+
+    // statistics (DRAGON_EXPERT_CACHE_STATS=1: printed at exit)
+    uint64_t n_hit = 0, n_miss = 0, b_read = 0;
+
+    static dragon_pager_cache & get() {
+        static dragon_pager_cache c;
+        return c;
+    }
+
+    ~dragon_pager_cache() {
+        if (dragon_pager_env_flag("DRAGON_EXPERT_CACHE_STATS") && n_hit + n_miss > 0) {
+            fprintf(stderr, "dragon expert cache: %llu hits, %llu misses (%.1f%% hit), %.1f MiB read, %.1f MiB resident\n",
+                (unsigned long long) n_hit, (unsigned long long) n_miss, 100.0*n_hit/(n_hit + n_miss),
+                b_read/1048576.0, bytes/1048576.0);
+        }
+    }
+
+    int open_file(const std::string & path) {
+        auto it = fds.find(path);
+        if (it != fds.end()) {
+            return it->second;
+        }
+        int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+#if defined(__APPLE__)
+        if (fd >= 0 && !dragon_pager_env_flag("DRAGON_EXPERT_PAGE_CACHE")) {
+            fcntl(fd, F_NOCACHE, 1);
+        }
+#endif
+        fds.emplace(path, fd);
+        return fd;
+    }
+
+    bool locate(const char * p, size_t n, src * s) {
+        auto it = srcs.find(p);
+        if (it != srcs.end()) {
+            *s = it->second;
+            return s->fd >= 0;
+        }
+        src r = { -1, 0 };
+#if defined(__APPLE__)
+        std::string path;
+        if (dragon_pager_locate_darwin((uintptr_t) p, (uintptr_t) p + n, &path, &r.off)) {
+            r.fd = open_file(path);
+        }
+#else
+        int fd;
+        uint64_t off;
+        if (dragon_pager_file_map::get().find((uintptr_t) p, (uintptr_t) p + n, &fd, &off)) {
+            r.fd  = fd;
+            r.off = off;
+        }
+#endif
+        srcs.emplace(p, r);
+        *s = r;
+        return r.fd >= 0;
+    }
+
+    // buffers of evicted slabs, reused by the misses of the same call (no
+    // malloc/free churn: the allocator would keep freed blocks around)
+    std::vector<std::pair<char *, size_t>> spare;
+
+    void evict_back() {
+        const char * p = lru.back();
+        lru.pop_back();
+        auto it = map.find(p);
+        bytes -= it->second.n;
+        spare.emplace_back(it->second.buf, it->second.n);
+        map.erase(it);
+    }
+
+    char * alloc(size_t n) {
+        for (size_t i = 0; i < spare.size(); ++i) {
+            if (spare[i].second == n) {
+                char * b = spare[i].first;
+                spare[i] = spare.back();
+                spare.pop_back();
+                return b;
+            }
+        }
+        char * b = (char *) malloc(n);
+        if (b == nullptr) {
+            fprintf(stderr, "dragon expert cache: out of memory\n");
+            abort();
+        }
+        return b;
+    }
+};
+}
+
+bool dragon_pager_cache_enabled() {
+    static const bool v = !dragon_pager_env_flag("DRAGON_EXPERT_MMAP");
+    return v;
+}
+
+bool dragon_pager_cache_get(const char * const * ptrs, const size_t * sizes, int n, size_t budget,
+                            const char ** out, dragon_pager_read * reads, int * n_reads) {
+    dragon_pager_cache & c = dragon_pager_cache::get();
+    std::lock_guard<std::mutex> lock(c.mtx);
+
+    std::vector<dragon_pager_cache::src> src(n);
+    for (int i = 0; i < n; ++i) {
+        if (!c.locate(ptrs[i], sizes[i], &src[i])) {
+            return false;
+        }
+    }
+
+    const uint64_t call = ++c.call;
+
+    *n_reads = 0;
+    for (int i = 0; i < n; ++i) {
+        auto it = c.map.find(ptrs[i]);
+        if (it != c.map.end()) {
+            it->second.call = call;
+            c.lru.splice(c.lru.begin(), c.lru, it->second.it);
+            out[i] = it->second.buf;
+            c.n_hit++;
+            continue;
+        }
+        // make room: least recently used slabs not used by this call
+        while (c.bytes + sizes[i] > budget && !c.lru.empty() && c.map[c.lru.back()].call != call) {
+            c.evict_back();
+        }
+        char * buf = c.alloc(sizes[i]);
+        c.lru.push_front(ptrs[i]);
+        c.map[ptrs[i]] = { buf, sizes[i], call, c.lru.begin() };
+        c.bytes += sizes[i];
+        out[i] = buf;
+        reads[(*n_reads)++] = { buf, src[i].fd, src[i].off, sizes[i] };
+        c.n_miss++;
+        c.b_read += sizes[i];
+    }
+    // over budget (this call alone did not fit, e.g. a prompt batch): give the
+    // older slabs back now
+    while (c.bytes > budget && !c.lru.empty() && c.map[c.lru.back()].call != call) {
+        c.evict_back();
+    }
+    for (auto & b : c.spare) {
+        free(b.first);
+    }
+    c.spare.clear();
+    return true;
+}
+
+void dragon_pager_cache_read(const dragon_pager_read & r, size_t off, size_t len) {
+    size_t done = 0;
+    while (done < len) {
+        const ssize_t k = pread(r.fd, r.dst + off + done, len - done, (off_t) (r.off + off + done));
+        if (k <= 0) {
+            if (k < 0 && errno == EINTR) {
+                continue;
+            }
+            fprintf(stderr, "%s: pread failed (%s)\n", __func__, k < 0 ? strerror(errno) : "end of file");
+            abort();
+        }
+        done += (size_t) k;
+    }
+#if defined(__linux__)
+    static const bool keep = dragon_pager_env_flag("DRAGON_EXPERT_PAGE_CACHE");
+    if (!keep) {
+        posix_fadvise(r.fd, (off_t) (r.off + off), (off_t) len, POSIX_FADV_DONTNEED);
+    }
+#endif
+}
+
+#else // no explicit cache
+
+bool dragon_pager_cache_enabled() {
+    return false;
+}
+
+bool dragon_pager_cache_get(const char * const *, const size_t *, int, size_t, const char **, dragon_pager_read *, int *) {
+    return false;
+}
+
+void dragon_pager_cache_read(const dragon_pager_read &, size_t, size_t) {
+}
+
+#endif

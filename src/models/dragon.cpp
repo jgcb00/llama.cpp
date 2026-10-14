@@ -753,7 +753,7 @@ void llama_model_dragon::load_arch_tensors(llama_model_loader & ml) {
     // Low-memory mode (--lazy-mode on): the routed experts (~82% of the file) and the
     // token embeddings stay on disk and are paged in on demand; the fused MoE op then
     // prefetches the selected experts after routing and releases them after use
-    // (DRAGON_EXPERT_CACHE_MB bounds what stays resident). Off by default (auto only
+    // (--lazy-cache bounds what stays resident). Off by default (auto only
     // marks tensors > 4 GiB).
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_READ_LAZY);
     output   = create_tensor(tn(LLM_TENSOR_OUTPUT,     "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
@@ -1383,13 +1383,16 @@ static bool dragon_tensor_repacked(const ggml_tensor * w) {
         std::strcmp(ggml_backend_buffer_name(w->buffer), "CPU_REPACK") == 0;
 }
 
-// Low-memory mode (--lazy-mode on): resident budget for recently used expert
-// slabs, in MiB (DRAGON_EXPERT_CACHE_MB, default 0 = release every expert
-// right after use).
-static int dragon_expert_cache_mib() {
+// Low-memory mode (--lazy-mode on): RAM budget of the expert cache in MiB:
+// --lazy-cache, else DRAGON_EXPERT_CACHE_MB, else 1 GiB (~70-80% of the experts
+// a token needs are then already resident: 25-45 MB read per token in Q8_0).
+static int dragon_expert_cache_mib(const llama_model & model) {
+    if (model.lazy_cache_mib >= 0) {
+        return model.lazy_cache_mib;
+    }
     static const int v = [] {
         const char * e = std::getenv("DRAGON_EXPERT_CACHE_MB");
-        return e ? std::max(0, std::atoi(e)) : 0;
+        return e ? std::max(0, std::atoi(e)) : 1024;
     }();
     return v;
 }
@@ -3789,7 +3792,7 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
                     model.layers[il].ffn_up_shexp,
                     model.layers[il].ffn_down_shexp,
                     (int) n_expert_used, hparams.expert_weights_scale,
-                    lazy_experts ? dragon_expert_cache_mib() : -1);
+                    lazy_experts ? dragon_expert_cache_mib(model) : -1);
             cb(y_mlp, "mlp_out", il);
         } else {
             // n_embd → moe_latent_size bottleneck before the routed experts.
