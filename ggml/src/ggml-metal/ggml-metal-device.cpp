@@ -801,8 +801,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_geodesic(ggml_me
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_moe(ggml_metal_library_t lib, const ggml_tensor * op, int which) {
     GGML_ASSERT(op->op == GGML_OP_DRAGON_MOE);
 
-    const ggml_tensor * w = which == 0 ? op->src[1] : which == 1 ? op->src[4] : which == 2 ? op->src[5] : op->src[6];
-    const char * kname   = which == 0 ? "a" : which == 1 ? "b1" : which == 2 ? "b2" : which == 3 ? "c" : "f";
+    const ggml_tensor * w = which == 0 ? op->src[1] : which == 1 || which == 4 ? op->src[4] : which == 2 ? op->src[5] : op->src[6];
+    const char * kname   = which == 0 ? "a" : which == 1 ? "b1" : which == 2 ? "b2" : which == 3 ? "c" : "m";
 
     char base[256];
     char name[256];
@@ -811,9 +811,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_moe(ggml_
     const int32_t nch_l = (int32_t) (op->src[1]->ne[1]/128);
     const int32_t nch_f = (int32_t) (op->src[4]->ne[1]/128);
     const int32_t nch_s = (int32_t) (op->src[7]->ne[1]/128);
+    const int32_t msplit = ggml_metal_op_dragon_moe_msplit(op);
+    const int32_t nf    = msplit > 0 ? (int32_t) (op->src[4]->ne[1]/msplit/4) : 1;
 
     snprintf(base, 256, "kernel_dragon_moe_%s_%s", kname, ggml_type_name(w->type));
-    snprintf(name, 256, "%s_e%d_l%d_f%d_s%d", base, nch_e, nch_l, nch_f, nch_s);
+    snprintf(name, 256, "%s_e%d_l%d_f%d_s%d_m%d", base, nch_e, nch_l, nch_f, nch_s, nf);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -822,6 +824,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_moe(ggml_
         ggml_metal_cv_set_int32(cv, nch_l, FC_DRAGON_MOE + 1);
         ggml_metal_cv_set_int32(cv, nch_f, FC_DRAGON_MOE + 2);
         ggml_metal_cv_set_int32(cv, nch_s, FC_DRAGON_MOE + 3);
+        ggml_metal_cv_set_int32(cv, nf,    FC_DRAGON_MOE + 4);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

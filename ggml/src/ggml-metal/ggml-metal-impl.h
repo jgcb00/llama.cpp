@@ -1086,7 +1086,10 @@ typedef struct {
     int32_t sh_split;   // 1: shared-expert up in extra threadgroups of b1, down in extra threadgroups of b2
     int32_t pre_geo;    // 1: the input is GEODESIC(x, g), computed by every threadgroup of kernel a (fused)
     float   pre_geo_inv_depth;
-    int32_t pad1;
+    int32_t merged;     // 1: kernel m (routed up + down, shared up + down) replaces b1 and b2, sums by float atomics
+    int32_t sh_rows;    // merged: shared-expert FF rows per threadgroup
+    int32_t pad2;
+    int64_t off_acc;    // merged: (n_lat, n_tok) weighted sum of the expert outputs (zeroed by kernel a, as dsh)
 } ggml_metal_kargs_dragon_moe;
 
 // Dragon V-layer helpers (kernels/mamba3.metal)

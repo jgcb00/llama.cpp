@@ -124,6 +124,12 @@ size_t ggml_metal_op_dragon_moe_smem(const struct ggml_tensor * op, int which) {
         case 2: n = n_ff;                   break; // b2: h
         default: n = std::min<int64_t>(2, n_tok)*(n_lat + n_ff_sh); break; // c : routed | ush of the pass
     }
+    if (which == 4) {
+        // kernel m: routed [ lat | red | redi | selv | sele | h slice ], shared [ x (T x n_embd) | us (T x sh_rows) ]
+        const int64_t ffs = n_ff/ggml_metal_op_dragon_moe_msplit(op);
+        n = std::max<int64_t>(((n_lat + 3) & ~3) + ffs, n_tok*(n_embd + ggml_metal_op_dragon_moe_sh_rows(op)));
+        return GGML_PAD(n*sizeof(float), 16);
+    }
     if (ggml_metal_op_dragon_moe_sh_split(op)) {
         // the shared expert runs in extra threadgroups of b1 (up, as kernel a) and b2 (down, as kernel c)
         switch (which) {
@@ -134,6 +140,39 @@ size_t ggml_metal_op_dragon_moe_smem(const struct ggml_tensor * op, int which) {
         }
     }
     return GGML_PAD(n*sizeof(float), 16);
+}
+
+// kernel m (merged up + down) FF slices of an expert and shared-expert rows per threadgroup; 0: not usable
+int ggml_metal_op_dragon_moe_msplit(const struct ggml_tensor * op) {
+    const int64_t n_ff = op->src[4]->ne[1];
+    static const int want = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_MSPLIT"); return e ? atoi(e) : 16; }();
+    const int64_t n_lat = op->src[1]->ne[1];
+    if (n_lat > 2*256) {
+        return 0; // DMOE_MD*DMOE_NTH
+    }
+    for (int ns = (int) std::min<int64_t>(want, n_ff/4); ns >= 1; --ns) {
+        if (n_ff % ns == 0 && (n_ff/ns) % 4 == 0 && n_ff/ns <= 64) {
+            return ns;
+        }
+    }
+    return 0;
+}
+
+int ggml_metal_op_dragon_moe_sh_rows(const struct ggml_tensor * op) {
+    const int64_t n_ff_sh = op->src[7]->ne[1];
+    static const int want = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_SH_ROWS"); return e ? atoi(e) : 16; }();
+    for (int r = std::max(4, want) & ~3; r >= 4; r -= 4) {
+        if (n_ff_sh % r == 0) {
+            return r;
+        }
+    }
+    return 0;
+}
+
+// kernel m replaces b1 and b2 for T <= GGML_METAL_DRAGON_MOE_MERGE_T (default 2, 0 disables)
+bool ggml_metal_op_dragon_moe_merged(const struct ggml_tensor * op) {
+    static const int max_t = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_MERGE_T"); return e ? atoi(e) : 2; }();
+    return op->src[0]->ne[1] <= std::min(max_t, 4) && ggml_metal_op_dragon_moe_msplit(op) > 0 && ggml_metal_op_dragon_moe_sh_rows(op) > 0;
 }
 
 bool ggml_metal_op_dragon_moe_sh_split(const struct ggml_tensor * op) {

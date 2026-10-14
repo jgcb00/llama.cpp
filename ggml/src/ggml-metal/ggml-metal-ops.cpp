@@ -2369,8 +2369,8 @@ size_t ggml_metal_op_dragon_moe_extra_ws(const ggml_tensor * op) {
 
     const ggml_metal_dragon_moe_dims d = ggml_metal_dragon_moe_get_dims(op);
 
-    // [lat | logits | ush | sel | wk | h | o | counter (4 floats) | dsh]
-    const int64_t n = d.n_tok*(d.n_lat + d.n_expert + d.n_ff_sh + 2*d.k + d.k*d.n_ff + d.k*d.n_lat) + 4 + d.n_tok*d.n_embd;
+    // [lat | logits | ush | sel | wk | h | o | counter (4 floats) | dsh | acc]
+    const int64_t n = d.n_tok*(d.n_lat + d.n_expert + d.n_ff_sh + 2*d.k + d.k*d.n_ff + d.k*d.n_lat) + 4 + d.n_tok*(d.n_embd + d.n_lat);
 
     return GGML_PAD(n*sizeof(float), 16);
 }
@@ -2438,8 +2438,20 @@ static int ggml_metal_op_dragon_moe_impl(ggml_metal_op_t ctx, int idx, ggml_tens
         /*.sh_split   =*/ ggml_metal_op_dragon_moe_sh_split(op) ? 1 : 0,
         /*.pre_geo    =*/ pre ? 1 : 0,
         /*.pre_geo_inv_depth =*/ pre ? ggml_get_op_params_f32(pre, 0) : 0.0f,
-        /*.pad1       =*/ 0,
+        /*.merged     =*/ 0,
+        /*.sh_rows    =*/ 0,
+        /*.pad2       =*/ 0,
+        /*.off_acc    =*/ off_o + T*d.k*d.n_lat + 4 + T*d.n_embd,
     };
+
+    // kernel m: routed up + down and shared up + down in one dispatch (atomic sums into acc and dsh)
+    const bool merged = ggml_metal_op_dragon_moe_merged(op);
+    if (merged) {
+        args.merged   = 1;
+        args.sh_split = 1; // kernel c: latent up + dsh
+        args.nsplit   = ggml_metal_op_dragon_moe_msplit(op);
+        args.sh_rows  = ggml_metal_op_dragon_moe_sh_rows(op);
+    }
 
     // fuse the following GEODESIC(x, mlp_out) into kernel c (last threadgroup), GGML_METAL_DRAGON_GEO_FUSE=0 disables
     // (one threadgroup applies it to the T tokens in turn: only worth it for small batches, GGML_METAL_DRAGON_GEO_FUSE_MAX_T)
@@ -2504,17 +2516,28 @@ static int ggml_metal_op_dragon_moe_impl(ggml_metal_op_t ctx, int idx, ggml_tens
     }
     ggml_metal_op_concurrency_reset(ctx);
 
+    if (merged) {
+        if (!skip_1) {
+            encode(4, { bid_ws, b_rb, b_up, b_dn, b_x, b_us, b_ds }, d.k*args.nsplit + d.n_ff_sh/args.sh_rows, T);
+        }
+        ggml_metal_op_concurrency_reset(ctx);
+    }
+
     // b1: routing + expert up, one threadgroup per (token, expert slot, FF slice)
-    if (!skip_1) {
+    if (!skip_1 && !merged) {
         encode(1, { bid_ws, b_rb, b_up, bid_ws, b_x, b_us }, d.k*d.nsplit + (sh ? (d.n_ff_sh + 7)/8 : 0), T);
     }
-    ggml_metal_op_concurrency_reset(ctx);
+    if (!merged) {
+        ggml_metal_op_concurrency_reset(ctx);
+    }
 
     // b2: expert down, one threadgroup per (token, expert slot, n_lat row slice)
-    if (!skip_2) {
+    if (!skip_2 && !merged) {
         encode(2, { bid_ws, b_dn, bid_ws, b_ds }, d.k*d.nsplit + (sh ? (d.n_embd + 7)/8 : 0), T);
     }
-    ggml_metal_op_concurrency_reset(ctx);
+    if (!merged) {
+        ggml_metal_op_concurrency_reset(ctx);
+    }
 
     // c: sum over the experts, latent up + shared-expert down (+ the fused geodesic)
     if (!skip_c) {

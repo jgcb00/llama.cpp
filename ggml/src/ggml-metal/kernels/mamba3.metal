@@ -692,6 +692,7 @@ constant int FC_dmoe_nch_e [[function_constant(FC_DRAGON_MOE + 0)]];
 constant int FC_dmoe_nch_l [[function_constant(FC_DRAGON_MOE + 1)]];
 constant int FC_dmoe_nch_f [[function_constant(FC_DRAGON_MOE + 2)]];
 constant int FC_dmoe_nch_s [[function_constant(FC_DRAGON_MOE + 3)]];
+constant int FC_dmoe_nf    [[function_constant(FC_DRAGON_MOE + 4)]]; // kernel m: float4 per W_down row slice
 
 template<typename T4>
 static inline float4 dmoe_load4(device const char * p) {
@@ -904,6 +905,16 @@ static inline void dmoe_stage_a(
 
     threadgroup float4 * xs4 = (threadgroup float4 *) shm; // TB x n
 
+    // the weight row is issued first: its latency overlaps the staging of x (and the fused geodesic)
+    float4 w[DMOE_MAXCH];
+    if (row < nC) {
+        if (is_f32) {
+            dmoe_load_row<float4, DMOE_MAXCH>(w, (device const char *) wf, nch, tiisg);
+        } else {
+            dmoe_load_row<T4, DMOE_MAXCH>(w, wt, nch, tiisg);
+        }
+    }
+
     for (int t0 = 0; t0 < T; t0 += TB) {
         const int nt = min(TB, T - t0);
 
@@ -924,12 +935,6 @@ static inline void dmoe_stage_a(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (row < nC) {
-            float4 w[DMOE_MAXCH];
-            if (is_f32) {
-                dmoe_load_row<float4, DMOE_MAXCH>(w, (device const char *) wf, nch, tiisg);
-            } else {
-                dmoe_load_row<T4, DMOE_MAXCH>(w, wt, nch, tiisg);
-            }
 #pragma unroll
             for (int j = 0; j < DMOE_TB; ++j) {
                 if (j < nt) {
@@ -966,6 +971,13 @@ kernel void kernel_dragon_moe_a(
         ushort tiisg[[thread_index_in_simdgroup]]) {
     if (tgpig.x == 0 && tiitg == 0) {
         ((device uint *) (ws + args.off_cnt))[0] = 0u;
+    }
+    if (args.merged && tgpig.x == 1) {
+        // the atomic sums of kernel m: dsh and acc are contiguous
+        const int nz = args.n_tok*(args.n_embd + args.n_lat);
+        for (int i = tiitg; i < nz; i += DMOE_NTH) {
+            ws[args.off_dsh + i] = 0.0f;
+        }
     }
 
     if (args.pre_geo) {
@@ -1246,6 +1258,281 @@ kernel void kernel_dragon_moe_b2(
     dmoe_stage_b2<T4>(args, ws_out, w_down, shm, tgpig.x, tgpig.y, tiitg, sgitg, tiisg);
 }
 
+// routing of token t by one simdgroup (no threadgroup barrier; every simdgroup computes the same result): lane l
+// owns the experts l + 32*i (E <= 256), k rounds of (max score, lowest index among the equal) as dmoe_route.
+// Returns the expert of slot kk, its score (*skk) and the sum of the k selected scores (*ssum).
+static inline int dmoe_route_sg(
+        device const float * lt, device const float * bias, int E, int K, int kk,
+        thread float * skk, thread float * ssum, ushort tiisg) {
+    float s[8];
+    float r[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int e = tiisg + 32*i;
+        s[i] = 0.0f;
+        r[i] = -INFINITY;
+        if (e < E) {
+            s[i] = 1.0f/(1.0f + exp(-lt[e]));
+            r[i] = s[i] + bias[e];
+        }
+    }
+    uint taken = 0u;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        if ((int) tiisg + 32*i >= E) {
+            taken |= 1u << i;
+        }
+    }
+    int   ex  = 0;
+    float sk  = 0.0f;
+    float sum = 0.0f;
+    for (int j = 0; j < K; ++j) {
+        // lane best: max r, lowest index (lowest i) among the equal
+        float lb = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            if (!(taken & (1u << i)) && r[i] > lb) {
+                lb = r[i];
+            }
+        }
+        const float gm = simd_max(lb);
+        int   li = 8;
+        float ls = 0.0f;
+#pragma unroll
+        for (int i = 7; i >= 0; --i) {
+            if (!(taken & (1u << i)) && r[i] == gm) {
+                li = i;
+                ls = s[i];
+            }
+        }
+        const int cand = li < 8 ? (int) tiisg + 32*li : 0x7fffffff;
+        int sel = simd_min(cand);
+        float sv;
+        if (sel == 0x7fffffff) {
+            sel = j; // all scores -inf/NaN: in-bounds fallback, as the CPU reference
+            // score of expert j: lane j%32, slot j/32
+            float mine = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                if (i == j/32) {
+                    mine = s[i];
+                }
+            }
+            sv = simd_shuffle(mine, (ushort) (j & 31));
+        } else {
+            sv = simd_shuffle(ls, (ushort) (sel & 31));
+            if ((int) tiisg == (sel & 31)) {
+                taken |= 1u << (sel >> 5);
+            }
+        }
+        sum += sv;
+        if (j == kk) {
+            ex = sel;
+            sk = sv;
+        }
+    }
+    *skk  = sk;
+    *ssum = sum;
+    return ex;
+}
+
+#define DMOE_MD 2  // kernel m: W_down rows per thread (n_lat <= DMOE_MD*DMOE_NTH)
+#define DMOE_MF 16 // kernel m: float4 per W_down row slice (FF slice <= 64)
+
+// merged stage (kernel m, args.merged): routing + expert up + expert down in one dispatch. Threadgroup (p, t) of the
+// routed part computes the FF slice p%nsplit of the expert slot p/nsplit (into threadgroup memory), then its share of
+// the down projection (the slice columns of every W_down row) and adds it, weighted, to acc[t] by float atomics.
+// The extra threadgroups do the same for the shared expert (sh_rows FF rows each, all the tokens) into dsh.
+template<typename T4>
+static inline void dmoe_stage_m_routed(
+        constant ggml_metal_kargs_dragon_moe & args,
+        device       float * ws,
+        device const float * bias,
+        device const char  * w_up,
+        device const char  * w_down,
+        threadgroup  float * shm,
+        int p, int t, ushort tiitg, ushort sgitg, ushort tiisg) {
+    constexpr int esz = sizeof(T4)/4;
+
+    const int K      = args.k;
+    const int nsplit = args.nsplit;
+    const int E      = args.n_expert;
+    const int n_lat  = args.n_lat;
+    const int n_ff   = args.n_ff;
+    const int FFS    = n_ff/nsplit;
+    const int nch    = FC_dmoe_nch_l;
+
+    const int kk = p/nsplit;
+    const int sp = p - kk*nsplit;
+
+    // [ xs (n_lat) | hs (FFS) ]
+    threadgroup float * xs = shm;
+    threadgroup float * hs = shm + ((n_lat + 3) & ~3);
+
+    device const float * lat = ws + args.off_lat + (size_t) t*n_lat;
+    for (int i = tiitg; i < n_lat; i += DMOE_NTH) {
+        xs[i] = lat[i];
+    }
+
+    float skk;
+    float sum;
+    const int   ex = dmoe_route_sg(ws + args.off_logits + (size_t) t*E, bias, E, K, kk, &skk, &sum, tiisg);
+    const float wk = (skk/max(sum, 6.103515625e-5f))*args.w_scale;
+
+    // down weights issued first (they depend only on the routing): columns [sp*FFS, (sp+1)*FFS) of the W_down[ex]
+    // rows tiitg + i*DMOE_NTH (FFS <= 4*DMOE_MF)
+    device const char * wdn = w_down + ((size_t) ex*n_lat*n_ff + (size_t) sp*FFS)*esz;
+    const int nf = FC_dmoe_nf; // FFS/4
+    float4 wd[DMOE_MD][DMOE_MF];
+#pragma unroll
+    for (int i = 0; i < DMOE_MD; ++i) {
+        const int d = tiitg + i*DMOE_NTH;
+        if (d < n_lat) {
+            device const char * r = wdn + (size_t) d*n_ff*esz;
+#pragma unroll
+            for (int f = 0; f < DMOE_MF; ++f) {
+                if (f < nf) {
+                    wd[i][f] = dmoe_load4<T4>(r + (size_t) f*4*esz);
+                }
+            }
+        }
+    }
+
+    // up: rows [sp*FFS, (sp+1)*FFS) of W_up[ex], 4 rows per simdgroup pass
+    device const char * wup = w_up + ((size_t) ex*n_ff + (size_t) sp*FFS)*n_lat*esz;
+    // the first pass is issued before the barrier that publishes xs (every simdgroup reaches it)
+    float4 w[4][8];
+    int j0 = sgitg*4;
+#pragma unroll
+    for (int r = 0; r < 4; ++r) {
+        if (j0 + r < FFS) {
+            dmoe_load_row<T4, 8>(w[r], wup + (size_t) (j0 + r)*n_lat*esz, nch, tiisg);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (; j0 < FFS; j0 += DMOE_NSG*4) {
+        if (j0 != (int) sgitg*4) {
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                if (j0 + r < FFS) {
+                    dmoe_load_row<T4, 8>(w[r], wup + (size_t) (j0 + r)*n_lat*esz, nch, tiisg);
+                }
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            if (j0 + r < FFS) {
+                const float s = dmoe_dot_tg<8>(w[r], (threadgroup const float4 *) xs, nch, tiisg);
+                if (tiisg == 0) {
+                    const float rl = max(s, 0.0f);
+                    hs[j0 + r] = wk*rl*rl;
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // down: one row per thread
+    device atomic_float * acc = (device atomic_float *) (ws + args.off_acc + (size_t) t*n_lat);
+    threadgroup const float4 * h4 = (threadgroup const float4 *) hs;
+#pragma unroll
+    for (int i = 0; i < DMOE_MD; ++i) {
+        const int d = tiitg + i*DMOE_NTH;
+        if (d < n_lat) {
+            float s = 0.0f;
+#pragma unroll
+            for (int f = 0; f < DMOE_MF; ++f) {
+                if (f < nf) {
+                    s += dot(wd[i][f], h4[f]);
+                }
+            }
+            atomic_fetch_add_explicit(acc + d, s, memory_order_relaxed);
+        }
+    }
+}
+
+template<typename T4>
+static inline void dmoe_stage_m_shared(
+        constant ggml_metal_kargs_dragon_moe & args,
+        device       float * ws,
+        device const float * x,
+        device const char  * w_us,
+        device const char  * w_ds,
+        threadgroup  float * shm,
+        int s, ushort tiitg, ushort sgitg, ushort tiisg) {
+    constexpr int esz = sizeof(T4)/4;
+
+    const int n    = args.n_embd;
+    const int n_sh = args.n_ff_sh;
+    const int T    = args.n_tok;
+    const int SR   = args.sh_rows;
+    const int nch  = FC_dmoe_nch_e;
+
+    // [ xs (T x n) | us (T x SR) ]
+    threadgroup float4 * xs4 = (threadgroup float4 *) shm;
+    threadgroup float  * us  = shm + T*n;
+
+    for (int i = tiitg; i < T*(n/4); i += DMOE_NTH) {
+        xs4[i] = ((device const float4 *) x)[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // up: rows [s*SR, (s+1)*SR) of W_us, one row per simdgroup pass
+    for (int r = sgitg; r < SR; r += DMOE_NSG) {
+        float4 w[DMOE_MAXCH];
+        dmoe_load_row<T4, DMOE_MAXCH>(w, w_us + (size_t) (s*SR + r)*n*esz, nch, tiisg);
+        for (int j = 0; j < T; ++j) {
+            float v = dmoe_dot_tg<DMOE_MAXCH>(w, xs4 + (size_t) j*(n/4), nch, tiisg);
+            if (tiisg == 0) {
+                v = max(v, 0.0f);
+                us[j*SR + r] = v*v;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // down: columns [s*SR, (s+1)*SR) of every W_ds row, one row per thread
+    device const char * wds = w_ds + (size_t) s*SR*esz;
+    for (int d = tiitg; d < n; d += DMOE_NTH) {
+        device const char * r = wds + (size_t) d*n_sh*esz;
+        float acc[DMOE_TB] = { 0.0f };
+        for (int f = 0; f < SR/4; ++f) {
+            const float4 w = dmoe_load4<T4>(r + (size_t) f*4*esz);
+            for (int j = 0; j < T; ++j) {
+                acc[j] += dot(w, ((threadgroup const float4 *) (us + j*SR))[f]);
+            }
+        }
+        for (int j = 0; j < T; ++j) {
+            atomic_fetch_add_explicit((device atomic_float *) (ws + args.off_dsh + (size_t) j*n + d), acc[j], memory_order_relaxed);
+        }
+    }
+}
+
+template<typename T4>
+kernel void kernel_dragon_moe_m(
+        constant ggml_metal_kargs_dragon_moe & args,
+        device       float * ws,
+        device const float * bias,
+        device const char  * w_up,
+        device const char  * w_down,
+        device const float * x,
+        device const char  * w_us,
+        device const char  * w_ds,
+        threadgroup  float * shm [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    const int nb = args.k*args.nsplit;
+    if ((int) tgpig.x >= nb) {
+        if (tgpig.y == 0) {
+            dmoe_stage_m_shared<T4>(args, ws, x, w_us, w_ds, shm, tgpig.x - nb, tiitg, sgitg, tiisg);
+        }
+        return;
+    }
+    dmoe_stage_m_routed<T4>(args, ws, bias, w_up, w_down, shm, tgpig.x, tgpig.y, tiitg, sgitg, tiisg);
+}
+
 // stage c of (output row block tgx, token pair tgy)
 template<typename T4, typename WSP, typename DP>
 static inline void dmoe_stage_c(
@@ -1275,13 +1562,20 @@ static inline void dmoe_stage_c(
     threadgroup float * ush    = shm + TBc*n_lat;
 
     for (int j = 0; j < nt; ++j) {
-        WSP o = ws + args.off_o + (size_t) (t0 + j)*K*n_lat;
-        for (int d = tiitg; d < n_lat; d += DMOE_NTH) {
-            float s = 0.0f;
-            for (int i = 0; i < K; ++i) {
-                s += o[(size_t) i*n_lat + d];
+        if (args.merged) {
+            WSP a = ws + args.off_acc + (size_t) (t0 + j)*n_lat;
+            for (int d = tiitg; d < n_lat; d += DMOE_NTH) {
+                routed[j*n_lat + d] = a[d];
             }
-            routed[j*n_lat + d] = s;
+        } else {
+            WSP o = ws + args.off_o + (size_t) (t0 + j)*K*n_lat;
+            for (int d = tiitg; d < n_lat; d += DMOE_NTH) {
+                float s = 0.0f;
+                for (int i = 0; i < K; ++i) {
+                    s += o[(size_t) i*n_lat + d];
+                }
+                routed[j*n_lat + d] = s;
+            }
         }
         if (!args.sh_split) {
             WSP u = ws + args.off_ush + (size_t) (t0 + j)*n_sh;
@@ -1383,20 +1677,24 @@ typedef decltype(kernel_dragon_moe_a<float4>)  kernel_dragon_moe_a_t;
 typedef decltype(kernel_dragon_moe_b1<float4>) kernel_dragon_moe_b1_t;
 typedef decltype(kernel_dragon_moe_b2<float4>) kernel_dragon_moe_b2_t;
 typedef decltype(kernel_dragon_moe_c<float4>)  kernel_dragon_moe_c_t;
+typedef decltype(kernel_dragon_moe_m<float4>)  kernel_dragon_moe_m_t;
 
 template [[host_name("kernel_dragon_moe_a_f32")]]   kernel kernel_dragon_moe_a_t  kernel_dragon_moe_a<float4>;
 template [[host_name("kernel_dragon_moe_b1_f32")]]  kernel kernel_dragon_moe_b1_t kernel_dragon_moe_b1<float4>;
 template [[host_name("kernel_dragon_moe_b2_f32")]]  kernel kernel_dragon_moe_b2_t kernel_dragon_moe_b2<float4>;
 template [[host_name("kernel_dragon_moe_c_f32")]]   kernel kernel_dragon_moe_c_t  kernel_dragon_moe_c<float4>;
+template [[host_name("kernel_dragon_moe_m_f32")]]   kernel kernel_dragon_moe_m_t  kernel_dragon_moe_m<float4>;
 template [[host_name("kernel_dragon_moe_a_f16")]]   kernel kernel_dragon_moe_a_t  kernel_dragon_moe_a<half4>;
 template [[host_name("kernel_dragon_moe_b1_f16")]]  kernel kernel_dragon_moe_b1_t kernel_dragon_moe_b1<half4>;
 template [[host_name("kernel_dragon_moe_b2_f16")]]  kernel kernel_dragon_moe_b2_t kernel_dragon_moe_b2<half4>;
 template [[host_name("kernel_dragon_moe_c_f16")]]   kernel kernel_dragon_moe_c_t  kernel_dragon_moe_c<half4>;
+template [[host_name("kernel_dragon_moe_m_f16")]]   kernel kernel_dragon_moe_m_t  kernel_dragon_moe_m<half4>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_dragon_moe_a_bf16")]]  kernel kernel_dragon_moe_a_t  kernel_dragon_moe_a<bfloat4>;
 template [[host_name("kernel_dragon_moe_b1_bf16")]] kernel kernel_dragon_moe_b1_t kernel_dragon_moe_b1<bfloat4>;
 template [[host_name("kernel_dragon_moe_b2_bf16")]] kernel kernel_dragon_moe_b2_t kernel_dragon_moe_b2<bfloat4>;
 template [[host_name("kernel_dragon_moe_c_bf16")]]  kernel kernel_dragon_moe_c_t  kernel_dragon_moe_c<bfloat4>;
+template [[host_name("kernel_dragon_moe_m_bf16")]]   kernel kernel_dragon_moe_m_t  kernel_dragon_moe_m<bfloat4>;
 #endif
 
 
