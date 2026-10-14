@@ -69,6 +69,13 @@ struct ggml_metal {
     id<MTLCommandBuffer> spin_cb;     // command buffer that signals spin_val (weak, compared with cmd_buf_last)
     uint64_t             spin_val;
 
+    // GGML_METAL_SPIN_WAIT=2: the blit of get_tensor_async also writes an incrementing byte into flag_buf (shared
+    // storage) after the copy, and ggml_metal_synchronize polls that byte (no command buffer completion involved)
+    id<MTLBuffer>        flag_buf;
+    id<MTLFence>         flag_fence;
+    id<MTLCommandBuffer> flag_cb;     // weak, compared with cmd_buf_last
+    uint8_t              flag_val;
+
     // the callback given to the thread pool
     void (^encode_async)(size_t ith);
 
@@ -199,6 +206,15 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         {
             const char * e = getenv("GGML_METAL_SPIN_WAIT");
             res->spin = e && e[0] == '1';
+            res->flag_buf = (e && e[0] == '2') ? [(id<MTLDevice>) ggml_metal_device_get_obj(dev) newBufferWithLength:64 options:MTLResourceStorageModeShared] : nil;
+            if (res->flag_buf) {
+                memset([res->flag_buf contents], 0, 64);
+                GGML_LOG_INFO("%s: busy-wait synchronization on a shared-memory flag (GGML_METAL_SPIN_WAIT=2)\n", __func__);
+            }
+            res->flag_fence = res->flag_buf ? [(id<MTLDevice>) ggml_metal_device_get_obj(dev) newFence] : nil;
+            res->flag_cb  = nil;
+            res->flag_val = 0;
+
             res->spin_ev  = res->spin ? [ggml_metal_device_get_obj(dev) newSharedEvent] : nil;
             res->spin_seq = 0;
             res->spin_cb  = nil;
@@ -231,6 +247,11 @@ void ggml_metal_free(ggml_metal_t ctx) {
 
     [ctx->cmd_bufs_ext removeAllObjects];
     [ctx->cmd_bufs_ext release];
+
+    if (ctx->flag_buf) {
+        [ctx->flag_buf release];
+        [ctx->flag_fence release];
+    }
 
     @autoreleasepool {
         [ctx->buf_refs removeAllObjects];
@@ -283,17 +304,59 @@ static void ggml_metal_spin_signal(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_bu
     ctx->spin_val = ctx->spin_seq;
 }
 
+static double ggml_metal_host_time_s(void);
+
+// GGML_METAL_GAPLOG=1 (debug): host-side timeline of the GPU idle gap between graphs, without extra waits:
+// GPU end -> wake (synchronize returns), wake -> next graph_compute entry, entry -> GPU start of its first command buffer
+static int    g_gl = -1;
+static double g_gl_wake = 0.0, g_gl_entry = 0.0, g_gl_t_wake = 0.0, g_gl_t_entry = 0.0, g_gl_start = 0.0, g_gl_gpu = 0.0, g_gl_end_prev = 0.0;
+static int64_t g_gl_n = 0;
+static id<MTLCommandBuffer> g_gl_first = nil;
+static void ggml_metal_gaplog_print(void) {
+    const double n = MAX(g_gl_n, 1);
+    fprintf(stderr, "[metal-gap] %lld graphs: GPU end -> wake %.1f us, wake -> entry %.1f us, entry -> GPU start %.1f us, GPU span %.1f us\n",
+            (long long) g_gl_n, g_gl_wake/n*1e6, g_gl_entry/n*1e6, g_gl_start/n*1e6, g_gl_gpu/n*1e6);
+}
+
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     bool spun = false;
     if (ctx->cmd_buf_last) {
-        if (ctx->spin && ctx->spin_cb == ctx->cmd_buf_last) {
+        if (ctx->flag_buf && ctx->flag_cb == ctx->cmd_buf_last) {
+            volatile const uint8_t * f = (volatile const uint8_t *) [ctx->flag_buf contents];
+            const uint8_t want = ctx->flag_val;
+            int64_t it = 0;
+            while (*f != want) {
+                if ((++it & 0xffff) == 0 && [ctx->cmd_buf_last status] >= MTLCommandBufferStatusCompleted) {
+                    break; // completed (or failed) without the flag becoming visible
+                }
+            }
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            spun = true;
+        } else if (ctx->spin && ctx->spin_cb == ctx->cmd_buf_last) {
             while ([ctx->spin_ev signaledValue] < ctx->spin_val) {
                 // busy-wait
             }
             spun = true;
         } else {
             [ctx->cmd_buf_last waitUntilCompleted];
+        }
+        if (g_gl < 0) { g_gl = getenv("GGML_METAL_GAPLOG") != NULL; if (g_gl) atexit(ggml_metal_gaplog_print); }
+        if (g_gl && !spun && g_gl_first) {
+            const double t_wake = ggml_metal_host_time_s();
+            const double t_end  = [ctx->cmd_buf_last GPUEndTime];
+            const double t_beg  = [g_gl_first GPUStartTime];
+            if (g_gl_end_prev > 0 && t_beg > 0 && t_end > 0) {
+                g_gl_wake  += t_wake - t_end;
+                g_gl_entry += g_gl_t_entry - g_gl_t_wake;
+                g_gl_start += t_beg - g_gl_t_entry;
+                g_gl_gpu   += t_end - t_beg;
+                g_gl_n++;
+            }
+            g_gl_end_prev = t_end;
+            g_gl_t_wake   = t_wake;
+            [g_gl_first release];
+            g_gl_first = nil;
         }
         ctx->cmd_buf_last = nil;
     }
@@ -309,7 +372,7 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             }
 
             MTLCommandBufferStatus status = [cmd_buf status];
-            if ((spun || ctx->spin) ? status == MTLCommandBufferStatusError : status != MTLCommandBufferStatusCompleted) {
+            if ((spun || ctx->spin || ctx->flag_buf) ? status == MTLCommandBufferStatusError : status != MTLCommandBufferStatusCompleted) {
                 GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, cb_idx, (int) status);
                 if (status == MTLCommandBufferStatusError) {
                     GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
@@ -326,7 +389,7 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs_ext[i];
 
             MTLCommandBufferStatus status = [cmd_buf status];
-            if ((spun || ctx->spin) ? status == MTLCommandBufferStatusError : status != MTLCommandBufferStatusCompleted) {
+            if ((spun || ctx->spin || ctx->flag_buf) ? status == MTLCommandBufferStatusError : status != MTLCommandBufferStatusCompleted) {
                 GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, (int) i, (int) status);
                 if (status == MTLCommandBufferStatusError) {
                     GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
@@ -439,7 +502,20 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
               destinationOffset:0
                            size:size];
 
-        [encoder endEncoding];
+        if (ctx->flag_buf) {
+            // the flag is written by a second encoder that waits for the copy (fence)
+            [encoder updateFence:ctx->flag_fence];
+            [encoder endEncoding];
+
+            ctx->flag_val = ctx->flag_val == 255 ? 1 : ctx->flag_val + 1;
+            id<MTLBlitCommandEncoder> enc_flag = [cmd_buf blitCommandEncoder];
+            [enc_flag waitForFence:ctx->flag_fence];
+            [enc_flag fillBuffer:ctx->flag_buf range:NSMakeRange(0, 1) value:ctx->flag_val];
+            [enc_flag endEncoding];
+            ctx->flag_cb = cmd_buf;
+        } else {
+            [encoder endEncoding];
+        }
         ggml_metal_spin_signal(ctx, cmd_buf);
         [cmd_buf commit];
 
@@ -773,6 +849,12 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+
+        if (g_gl > 0) {
+            g_gl_t_entry = t_entry;
+            [g_gl_first release];
+            g_gl_first = [ctx->cmd_bufs[n_cb].obj retain];
+        }
 
         static int use_span = -1;
         if (use_span < 0) { use_span = getenv("GGML_METAL_SPAN") != NULL; if (use_span) atexit(ggml_metal_span_print); }
