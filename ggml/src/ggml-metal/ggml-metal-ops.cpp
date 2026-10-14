@@ -2301,7 +2301,7 @@ int ggml_metal_op_geodesic(ggml_metal_op_t ctx, int idx) {
         static const int64_t max_t    = [] { const char * e = getenv("GGML_METAL_DRAGON_PRE_GEO_FUSE_MAX_T"); return e ? (int64_t) atoll(e) : (int64_t) 2; }();
         if (fuse_env && ctx->use_fusion() && idx + 1 < ctx->n_nodes()) {
             ggml_tensor * m = ctx->node(idx + 1);
-            if (m->op == GGML_OP_DRAGON_MOE && m->src[0] == op && op->ne[1] <= max_t && op->ne[2] == 1 && op->ne[3] == 1 &&
+            if (m->op == GGML_OP_DRAGON_MOE && m->src[0] == op && op->ne[1] <= max_t && op->ne[0] <= 8*256 && op->ne[2] == 1 && op->ne[3] == 1 &&
                 ggml_is_contiguous(op) && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                 ggml_are_same_shape(op->src[0], op) && ggml_are_same_shape(op->src[1], op) &&
                 (m->flags & GGML_TENSOR_FLAG_COMPUTE)) {

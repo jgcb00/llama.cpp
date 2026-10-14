@@ -684,6 +684,7 @@ kernel void kernel_geodesic_f32(
 #define DMOE_NTH   256
 #define DMOE_NSG   8
 #define DMOE_TB    4    // max tokens per pass of kernel a (x staged in threadgroup memory)
+#define DMOE_GE    8    // max elements per thread of the register-resident geodesic rows (n <= 8*256)
 #define DMOE_MAXCH 16   // max float4 per lane per row: n <= 16*128 = 2048 columns
 
 // row lengths in 4-wide chunks per lane (n/128) of the input / latent / expert FF / shared FF, fixed when the
@@ -786,19 +787,26 @@ static inline void dmoe_geodesic_row(
     }
 }
 
-// geodesic of one row into threadgroup memory y (and into yd when non-null), same formulas as dmoe_geodesic_row
-static inline void dmoe_geodesic_row_tg(
-        device const float * xr, device const float * gr, threadgroup float * y, device float * yd, int n,
+// register-resident variant of dmoe_geodesic_row (n <= DMOE_GE*DMOE_NTH): x and g are loaded once (all the loads
+// in flight together), the two reductions and the output use the registers
+static inline void dmoe_geodesic_row_r(
+        device const float * xr, coherent(device) device const float * gr, device float * yr, int n,
         float scale, float bias, float inv_depth, threadgroup float * red,
         ushort tiitg, ushort sgitg, ushort tiisg) {
+    float xv[DMOE_GE];
+    float gv[DMOE_GE];
+#pragma unroll
+    for (int k = 0; k < DMOE_GE; ++k) {
+        const int i = tiitg + k*DMOE_NTH;
+        xv[k] = i < n ? xr[i] : 0.0f;
+        gv[k] = i < n ? gr[i] : 0.0f;
+    }
     float xx = 0.0f;
     float xg = 0.0f;
-    for (int i = tiitg; i < n; i += DMOE_NTH) {
-        const float xv = xr[i];
-        const float gv = gr[i];
-        y[i] = gv; // g staged: read once from device memory
-        xx += xv*xv;
-        xg += xv*gv;
+#pragma unroll
+    for (int k = 0; k < DMOE_GE; ++k) {
+        xx += xv[k]*xv[k];
+        xg += xv[k]*gv[k];
     }
     xx = simd_sum(xx);
     xg = simd_sum(xg);
@@ -818,8 +826,9 @@ static inline void dmoe_geodesic_row_tg(
     const float coef      = xg/x_norm_sq;
 
     float pp = 0.0f;
-    for (int i = tiitg; i < n; i += DMOE_NTH) {
-        const float gp = y[i] - coef*xr[i];
+#pragma unroll
+    for (int k = 0; k < DMOE_GE; ++k) {
+        const float gp = gv[k] - coef*xv[k];
         pp += gp*gp;
     }
     pp = simd_sum(pp);
@@ -843,12 +852,89 @@ static inline void dmoe_geodesic_row_tg(
     const float c = precise::cos(theta);
     const float s = precise::sin(theta)*xn/tan_norm;
 
-    for (int i = tiitg; i < n; i += DMOE_NTH) {
-        const float xv = xr[i];
-        const float yv = xv*c + (y[i] - coef*xv)*s;
-        y[i] = yv;
-        if (yd) {
-            yd[i] = yv;
+#pragma unroll
+    for (int k = 0; k < DMOE_GE; ++k) {
+        const int i = tiitg + k*DMOE_NTH;
+        if (i < n) {
+            yr[i] = xv[k]*c + (gv[k] - coef*xv[k])*s;
+        }
+    }
+}
+
+// geodesic of one row into threadgroup memory y (and into yd when non-null), same formulas as dmoe_geodesic_row
+static inline void dmoe_geodesic_row_tg(
+        device const float * xr, device const float * gr, threadgroup float * y, device float * yd, int n,
+        float scale, float bias, float inv_depth, threadgroup float * red,
+        ushort tiitg, ushort sgitg, ushort tiisg) {
+    // x and g loaded once into registers (n <= DMOE_GE*DMOE_NTH, checked by the host), all the loads in flight
+    float xv[DMOE_GE];
+    float gv[DMOE_GE];
+#pragma unroll
+    for (int k = 0; k < DMOE_GE; ++k) {
+        const int i = tiitg + k*DMOE_NTH;
+        xv[k] = i < n ? xr[i] : 0.0f;
+        gv[k] = i < n ? gr[i] : 0.0f;
+    }
+    float xx = 0.0f;
+    float xg = 0.0f;
+#pragma unroll
+    for (int k = 0; k < DMOE_GE; ++k) {
+        xx += xv[k]*xv[k];
+        xg += xv[k]*gv[k];
+    }
+    xx = simd_sum(xx);
+    xg = simd_sum(xg);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        red[sgitg]            = xx;
+        red[DMOE_NSG + sgitg] = xg;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    xx = 0.0f;
+    xg = 0.0f;
+    for (int k = 0; k < DMOE_NSG; ++k) {
+        xx += red[k];
+        xg += red[DMOE_NSG + k];
+    }
+    const float x_norm_sq = fmax(xx, 1e-12f);
+    const float coef      = xg/x_norm_sq;
+
+    float pp = 0.0f;
+#pragma unroll
+    for (int k = 0; k < DMOE_GE; ++k) {
+        const float gp = gv[k] - coef*xv[k];
+        pp += gp*gp;
+    }
+    pp = simd_sum(pp);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) {
+        red[sgitg] = pp;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    pp = 0.0f;
+    for (int k = 0; k < DMOE_NSG; ++k) {
+        pp += red[k];
+    }
+
+    const float pi4      = 0.785398163f;
+    const float tan_norm = fmax(sqrt(pp), 1e-8f);
+    const float xn       = sqrt(x_norm_sq);
+
+    float theta = fmin(tan_norm/fmax(xn, 1e-6f), pi4);
+    theta = fmin((theta*scale + bias)*inv_depth, pi4);
+
+    const float c = precise::cos(theta);
+    const float s = precise::sin(theta)*xn/tan_norm;
+
+#pragma unroll
+    for (int k = 0; k < DMOE_GE; ++k) {
+        const int i = tiitg + k*DMOE_NTH;
+        if (i < n) {
+            const float yv = xv[k]*c + (gv[k] - coef*xv[k])*s;
+            y[i] = yv;
+            if (yd) {
+                yd[i] = yv;
+            }
         }
     }
 }
@@ -1661,8 +1747,13 @@ kernel void kernel_dragon_moe_c(
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
 
     for (int t = 0; t < args.n_tok; ++t) {
-        dmoe_geodesic_row(geo_x + (size_t) t*n, dst + (size_t) t*n, geo_dst + (size_t) t*n, n,
-                          geo_scale[0], geo_bias[0], args.geo_inv_depth, shm, tiitg, sgitg, tiisg);
+        if (n <= DMOE_GE*DMOE_NTH) {
+            dmoe_geodesic_row_r(geo_x + (size_t) t*n, dst + (size_t) t*n, geo_dst + (size_t) t*n, n,
+                                geo_scale[0], geo_bias[0], args.geo_inv_depth, shm, tiitg, sgitg, tiisg);
+        } else {
+            dmoe_geodesic_row(geo_x + (size_t) t*n, dst + (size_t) t*n, geo_dst + (size_t) t*n, n,
+                              geo_scale[0], geo_bias[0], args.geo_inv_depth, shm, tiitg, sgitg, tiisg);
+        }
     }
 }
 
