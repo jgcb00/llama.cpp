@@ -3499,7 +3499,17 @@ static ggml_tensor * build_dragon_v_mixer(
         attn_out = ggml_reshape_3d(ctx, attn_out, head_dim, n_head, n_tokens);
 
         ggml_tensor * y_attn = ggml_dragon_diff_gate(ctx, attn_out, lam, gs);
-        ggml_tensor * v_out  = ggml_mul_mat(ctx, layer.wo, y_attn);
+        // DRAGON_V_OUT_MMV=1 (experimental, off: slower on M3 Ultra): the output projection as DRAGON_MMV, which the Metal
+        // backend fuses with the gate (gated input computed while the GEMV loads it: one dispatch and one dependency
+        // level less), but this GEMV is latency-bound at K = n_signal*head_dim (~31 us vs ~19 us for mul_mat)
+        static const bool v_out_mmv = dragon_env_on("DRAGON_V_OUT_MMV");
+        ggml_tensor * v_out = nullptr;
+        if (v_out_mmv && n_tokens <= 4 && y_attn->ne[0] % 128 == 0) {
+            ggml_tensor * wl[1] = { layer.wo };
+            v_out = ggml_dragon_mmv(ctx, y_attn, wl, 1);
+        } else {
+            v_out = ggml_mul_mat(ctx, layer.wo, y_attn);
+        }
         ggml_set_name(v_out, "v_out_proj");
         return v_out;
     }

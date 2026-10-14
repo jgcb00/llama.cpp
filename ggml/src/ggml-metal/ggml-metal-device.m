@@ -1967,7 +1967,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
                 }
                 const int64_t n = op->src[0]->ne[0];
-                if (n % 128 != 0 || n > 2048 || !ggml_is_contiguous(op->src[0])) {
+                // (> 2048: only the unstaged decode path, the staged one keeps x in threadgroup memory)
+                if (n % 128 != 0 || (n > 2048 && (ggml_metal_op_dragon_mmv_staged(op) || ggml_metal_op_dragon_mmv_ks())) ||
+                    !ggml_is_contiguous(op->src[0])) {
                     return false;
                 }
                 const enum ggml_type wt = op->src[1]->type;
@@ -1979,7 +1981,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                         return false;
                     }
                 }
-                return 4*n*sizeof(float) <= dev->props.max_theadgroup_memory_size;
+                return n > 2048 || 4*n*sizeof(float) <= dev->props.max_theadgroup_memory_size;
             }
         case GGML_OP_DRAGON_TPA_PREP:
             {

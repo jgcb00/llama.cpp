@@ -848,9 +848,16 @@ static ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_simple(gg
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_mmv(ggml_metal_library_t lib, const ggml_tensor * op) {
+// dg: variant with the DRAGON_DIFF_GATE input fused (decode path only, nr 1/2/4, u 2/4)
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_mmv(ggml_metal_library_t lib, const ggml_tensor * op, bool dg) {
     GGML_ASSERT(op->op == GGML_OP_DRAGON_MMV);
     char base[256];
+    if (dg) {
+        snprintf(base, 256, "kernel_dragon_mmv_%s_nr%d_u%d_dg", ggml_type_name(op->src[1]->type), ggml_metal_op_dragon_mmv_nr(), ggml_metal_op_dragon_mmv_u());
+        ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline_simple(lib, base);
+        res.smem = 0;
+        return res;
+    }
     if (ggml_metal_op_dragon_mmv_staged(op)) {
         snprintf(base, 256, "kernel_dragon_mmv_st_%s", ggml_type_name(op->src[1]->type));
         ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline_simple(lib, base);

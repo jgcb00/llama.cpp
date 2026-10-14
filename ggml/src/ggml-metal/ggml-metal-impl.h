@@ -1104,6 +1104,13 @@ typedef struct {
     int32_t off[9];     // first output row of each matrix
     int32_t rows_total;
     int32_t nsg;        // simdgroups per threadgroup
+    // GGML_METAL_FUSION_DIFF_GATE_MMV: x = DRAGON_DIFF_GATE(attn, lam, gs) computed on load (attn in x, lam in w1, gs in w2)
+    int32_t dg_Dh;
+    int32_t dg_H;
+    int32_t dg_Hn;
+    int32_t dg_pad;
+    int64_t dg_lam_s;   // token stride of lam (floats)
+    int64_t dg_gs_s;    // token stride of gs (floats)
 } ggml_metal_kargs_dragon_mmv;
 
 typedef struct {
@@ -1127,6 +1134,13 @@ typedef struct {
     int64_t o_lam;
     int64_t o_g;
     int64_t o_last;
+    // GGML_METAL_FUSION_TPA_PREP_CACHE (one token per sequence): K/V rows also written into the KV cache at the rows
+    // given by k_idx/v_idx, and the pre-shift last K/V into the recurrent cache (the CPY and SET_ROWS are skipped)
+    int32_t fuse;
+    int32_t kv_f16;     // KV cache type: 1 = f16, 0 = f32
+    uint64_t kc_nb1;    // KV cache row strides (bytes)
+    uint64_t vc_nb1;
+    int64_t last_s;     // recurrent cache row stride (floats)
 } ggml_metal_kargs_dragon_tpa_prep;
 
 typedef struct {
