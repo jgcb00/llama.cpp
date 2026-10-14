@@ -145,7 +145,7 @@ size_t ggml_metal_op_dragon_moe_smem(const struct ggml_tensor * op, int which) {
 // kernel m (merged up + down) FF slices of an expert and shared-expert rows per threadgroup; 0: not usable
 int ggml_metal_op_dragon_moe_msplit(const struct ggml_tensor * op) {
     const int64_t n_ff = op->src[4]->ne[1];
-    static const int want = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_MSPLIT"); return e ? atoi(e) : 16; }();
+    static const int want = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_MSPLIT"); return e ? atoi(e) : 24; }();
     const int64_t n_lat = op->src[1]->ne[1];
     if (n_lat > 2*256) {
         return 0; // DMOE_MD*DMOE_NTH

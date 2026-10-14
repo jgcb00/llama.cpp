@@ -203,6 +203,19 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                 return 1;
             }
         }
+        // GGML_METAL_SKIP_NAMES=mixer_out,m_in_proj,... skips the nodes with these names (without the layer suffix)
+        static const char * skip_names = getenv("GGML_METAL_SKIP_NAMES");
+        if (skip_names) {
+            char name[GGML_MAX_NAME];
+            snprintf(name, sizeof(name), "%s", node->name);
+            char * dash = strrchr(name, '-');
+            if (dash && dash[1] >= '0' && dash[1] <= '9') *dash = 0;
+            const char * p = strstr(skip_names, name);
+            const size_t len = strlen(name);
+            if (len > 0 && p && (p == skip_names || p[-1] == ',') && (p[len] == 0 || p[len] == ',')) {
+                return 1;
+            }
+        }
     }
 
     switch (node->op) {

@@ -1336,6 +1336,7 @@ static inline int dmoe_route_sg(
     return ex;
 }
 
+#define DMOE_MU 8  // kernel m: W_up rows per simdgroup (FF slice <= DMOE_MU*DMOE_NSG)
 #define DMOE_MD 2  // kernel m: W_down rows per thread (n_lat <= DMOE_MD*DMOE_NTH)
 #define DMOE_MF 16 // kernel m: float4 per W_down row slice (FF slice <= 64)
 
@@ -1359,7 +1360,7 @@ static inline void dmoe_stage_m_routed(
     const int E      = args.n_expert;
     const int n_lat  = args.n_lat;
     const int n_ff   = args.n_ff;
-    const int FFS    = n_ff/nsplit;
+    const int FFS    = 4*FC_dmoe_nf; // n_ff/nsplit
     const int nch    = FC_dmoe_nch_l;
 
     const int kk = p/nsplit;
@@ -1400,33 +1401,25 @@ static inline void dmoe_stage_m_routed(
 
     // up: rows [sp*FFS, (sp+1)*FFS) of W_up[ex], 4 rows per simdgroup pass
     device const char * wup = w_up + ((size_t) ex*n_ff + (size_t) sp*FFS)*n_lat*esz;
-    // the first pass is issued before the barrier that publishes xs (every simdgroup reaches it)
-    float4 w[4][8];
-    int j0 = sgitg*4;
+    // all the rows of the simdgroup (j = sgitg + r*DMOE_NSG, r < DMOE_MU) issued at once, before the barrier that
+    // publishes xs (every simdgroup reaches it)
+    float4 w[DMOE_MU][8];
 #pragma unroll
-    for (int r = 0; r < 4; ++r) {
-        if (j0 + r < FFS) {
-            dmoe_load_row<T4, 8>(w[r], wup + (size_t) (j0 + r)*n_lat*esz, nch, tiisg);
+    for (int r = 0; r < DMOE_MU; ++r) {
+        const int j = sgitg + r*DMOE_NSG;
+        if (j < FFS) {
+            dmoe_load_row<T4, 8>(w[r], wup + (size_t) j*n_lat*esz, nch, tiisg);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (; j0 < FFS; j0 += DMOE_NSG*4) {
-        if (j0 != (int) sgitg*4) {
 #pragma unroll
-            for (int r = 0; r < 4; ++r) {
-                if (j0 + r < FFS) {
-                    dmoe_load_row<T4, 8>(w[r], wup + (size_t) (j0 + r)*n_lat*esz, nch, tiisg);
-                }
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < 4; ++r) {
-            if (j0 + r < FFS) {
-                const float s = dmoe_dot_tg<8>(w[r], (threadgroup const float4 *) xs, nch, tiisg);
-                if (tiisg == 0) {
-                    const float rl = max(s, 0.0f);
-                    hs[j0 + r] = wk*rl*rl;
-                }
+    for (int r = 0; r < DMOE_MU; ++r) {
+        const int j = sgitg + r*DMOE_NSG;
+        if (j < FFS) {
+            const float s = dmoe_dot_tg<8>(w[r], (threadgroup const float4 *) xs, nch, tiisg);
+            if (tiisg == 0) {
+                const float rl = max(s, 0.0f);
+                hs[j] = wk*rl*rl;
             }
         }
     }
