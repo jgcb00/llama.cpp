@@ -445,8 +445,9 @@ struct dragon_pager_cache {
     std::vector<dragon_pager_key>    keys;
     std::vector<int>                 key_fd;
 
-    // buffers of evicted slabs, reused by the misses of the same call (no
-    // malloc/free churn: the allocator would keep freed blocks around)
+    // buffers of evicted slabs, reused by the misses of the same call. Slabs are
+    // anonymous mappings, unmapped when evicted: malloc keeps large freed blocks
+    // around (macOS), the resident size would not follow the budget
     std::vector<std::pair<char *, size_t>> spare;
 
     static dragon_pager_cache & get() {
@@ -520,7 +521,7 @@ struct dragon_pager_cache {
 
     void free_spare() {
         for (auto & b : spare) {
-            free(b.first);
+            munmap(b.first, b.second);
         }
         spare.clear();
     }
@@ -534,7 +535,8 @@ struct dragon_pager_cache {
                 return b;
             }
         }
-        char * b = (char *) malloc(n);
+        void * m = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        char * b = m == MAP_FAILED ? nullptr : (char *) m;
         if (b == nullptr) {
             GGML_LOG_ERROR("%s: dragon expert cache: failed to allocate %zu bytes\n", __func__, n);
             GGML_ABORT("out of memory");
