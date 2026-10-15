@@ -182,6 +182,10 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // true when the first n cells of the ubatch read their own state (src0 == cell, no rollback slots): the states
+    // can then be updated in place in the cache (no gather); no side effect, unlike s_copy()
+    bool s_copy_is_identity(int n) const;
+
 private:
     const llama_memory_status status;
 

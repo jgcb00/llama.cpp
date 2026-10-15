@@ -122,6 +122,7 @@
 #define FC_DSV4_HC                     2000
 #define FC_PAD                         2100
 #define FC_FLASH_ATTN_EXT_TENSOR       2200
+#define FC_DRAGON_MOE                  2300
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -1056,6 +1057,108 @@ typedef struct {
     uint64_t nb3;
     float    inv_depth;
 } ggml_metal_kargs_geodesic;
+
+// fused Dragon MoE kernel (kernel_dragon_moe_f): layout of the device sync scratch (32-bit words, one 128-byte line
+// per barrier word), shared with the host
+#define GGML_METAL_DMOE_F_B1   0
+#define GGML_METAL_DMOE_F_R1   32
+#define GGML_METAL_DMOE_F_B2   64
+#define GGML_METAL_DMOE_F_R2   96
+#define GGML_METAL_DMOE_F_B3   128
+#define GGML_METAL_DMOE_F_R3   160
+#define GGML_METAL_DMOE_F_EXIT 192
+#define GGML_METAL_DMOE_F_ERR  224                 // set when a wait timed out (threadgroups not all resident)
+#define GGML_METAL_DMOE_F_ACC  256                 // n_lat floats
+#define GGML_METAL_DMOE_F_DSH  (256 + GGML_METAL_DMOE_F_MAX_LAT) // n_embd floats
+#define GGML_METAL_DMOE_F_MAX_LAT  1024
+#define GGML_METAL_DMOE_F_MAX_EMBD 2048
+
+// Dragon latent MoE block (kernels/mamba3.metal); workspace offsets in floats, after dst
+typedef struct {
+    int32_t n_embd;
+    int32_t n_tok;
+    int32_t n_lat;
+    int32_t n_expert;
+    int32_t n_ff;
+    int32_t n_ff_sh;
+    int32_t k;
+    int32_t nsplit;     // threadgroups per (token, expert slot): FF row slices (up) / n_lat row slices (down)
+    float   w_scale;
+    int32_t tb;         // tokens per pass in the input projections (<= DMOE_TB)
+    int32_t tbc;        // tokens per threadgroup in the output projections (<= 2)
+    int32_t nsplit2;    // n_lat row slices of kernel b2 (each threadgroup sums the k experts of its rows)
+    int64_t off_lat;    // (n_lat, n_tok)
+    int64_t off_logits; // (n_expert, n_tok)
+    int64_t off_ush;    // (n_ff_sh, n_tok)  relu^2 of the shared-expert up projection
+    int64_t off_sel;    // (k, n_tok) selected experts (as float)
+    int64_t off_wk;     // (k, n_tok) expert weights
+    int64_t off_h;      // (n_ff, k, n_tok) relu^2 of the expert up projections
+    int64_t off_o;      // (n_lat, k, n_tok) weighted expert outputs
+    int64_t off_cnt;    // uint counter of the finished threadgroups of kernel c (reset by kernel a)
+    int64_t off_dsh;    // (n_embd, n_tok) shared-expert down projection (sh_split)
+    int32_t geo;        // 1: the last threadgroup of kernel c applies the following GEODESIC (fused)
+    float   geo_inv_depth;
+    int32_t sh_split;   // 1: shared-expert up in extra threadgroups of b1, down in extra threadgroups of b2
+    int32_t pre_geo;    // 1: the input is GEODESIC(x, g), computed by every threadgroup of kernel a (fused)
+    float   pre_geo_inv_depth;
+    int32_t merged;     // 1: kernel m (routed up + down, shared up + down) replaces b1 and b2, sums by float atomics
+    int32_t sh_rows;    // merged: shared-expert FF rows per threadgroup
+    int32_t a_ks;       // 2: kernel a splits every row across two simdgroups (4 rows per threadgroup)
+    int64_t off_acc;    // merged: (n_lat, n_tok) weighted sum of the expert outputs (zeroed by kernel a, as dsh)
+    int32_t pad3;
+    int32_t pad4;
+} ggml_metal_kargs_dragon_moe;
+
+// Dragon V-layer helpers (kernels/mamba3.metal)
+typedef struct {
+    int32_t n_embd;
+    int32_t n_tok;
+    int32_t n_ws;
+    int32_t tb;         // tokens per pass (<= 4)
+    int32_t rows[9];    // rows of each weight matrix
+    int32_t off[9];     // first output row of each matrix
+    int32_t rows_total;
+    int32_t nsg;        // simdgroups per threadgroup
+} ggml_metal_kargs_dragon_mmv;
+
+typedef struct {
+    int32_t H;
+    int32_t Hn;
+    int32_t R;
+    int32_t Dh;
+    int32_t Hs;
+    int32_t n_seqs;
+    int32_t n_tok;
+    int32_t ROW;
+    int32_t GS;         // gate elements written per (head, token) threadgroup (0: head 0 writes all)
+    int32_t pad0;
+    float   eps;
+    float   wsize;
+    float   gate_b;
+    int32_t pad1;
+    int64_t prev_s;     // seq stride of prev (floats)
+    int64_t o_k;        // output offsets (floats)
+    int64_t o_v;
+    int64_t o_lam;
+    int64_t o_g;
+    int64_t o_last;
+    // GGML_METAL_FUSION_TPA_PREP_CACHE (one token per sequence): K/V rows also written into the KV cache at the rows
+    // given by k_idx/v_idx, and the pre-shift last K/V into the recurrent cache (the CPY and SET_ROWS are skipped)
+    int32_t fuse;
+    int32_t kv_f16;     // KV cache type: 1 = f16, 0 = f32
+    uint64_t kc_nb1;    // KV cache row strides (bytes)
+    uint64_t vc_nb1;
+    int64_t last_s;     // recurrent cache row stride (floats)
+} ggml_metal_kargs_dragon_tpa_prep;
+
+typedef struct {
+    int32_t Dh;
+    int32_t H;
+    int32_t Hn;
+    int32_t T;
+    int64_t lam_s;      // token stride of lam (floats)
+    int64_t gs_s;       // token stride of gs (floats)
+} ggml_metal_kargs_dragon_diff_gate;
 
 typedef struct {
     int32_t  ne00;

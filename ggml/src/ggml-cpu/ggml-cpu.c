@@ -2117,6 +2117,18 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dragon_moe(params, tensor);
             } break;
+        case GGML_OP_DRAGON_MMV:
+            {
+                ggml_compute_forward_dragon_mmv(params, tensor);
+            } break;
+        case GGML_OP_DRAGON_TPA_PREP:
+            {
+                ggml_compute_forward_dragon_tpa_prep(params, tensor);
+            } break;
+        case GGML_OP_DRAGON_DIFF_GATE:
+            {
+                ggml_compute_forward_dragon_diff_gate(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2303,6 +2315,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MAMBA3_MIMO:
         case GGML_OP_GEODESIC:
         case GGML_OP_DRAGON_MOE:
+        case GGML_OP_DRAGON_MMV:
+        case GGML_OP_DRAGON_TPA_PREP:
+        case GGML_OP_DRAGON_DIFF_GATE:
             {
                 n_tasks = n_threads;
             } break;
@@ -3046,6 +3061,17 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         cur = ggml_dragon_moe_work_size(node, n_tasks);
                     } break;
+                case GGML_OP_DRAGON_MMV:
+                    {
+                        // one dequantized weight row per thread
+                        cur = sizeof(float)*(node->src[0]->ne[0] + CACHE_LINE_SIZE_F32)*n_tasks;
+                    } break;
+                case GGML_OP_DRAGON_TPA_PREP:
+                    {
+                        // 5 rows of Dh floats per thread
+                        const int64_t Dh = ggml_get_op_params_i32(node, 3);
+                        cur = sizeof(float)*(5*Dh + CACHE_LINE_SIZE_F32)*n_tasks;
+                    } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {
                         const int64_t S_v = node->src[2]->ne[0];
@@ -3091,7 +3117,7 @@ struct ggml_cplan ggml_graph_plan(
 #define GGML_PROF_MAX_NAMES 512
 
 struct ggml_prof_entry {
-    char   name[GGML_MAX_NAME];
+    char   name[2*GGML_MAX_NAME]; // "op(node name)"
     double us;
     int64_t n;
 };
@@ -3156,7 +3182,7 @@ static void ggml_prof_node(const struct ggml_tensor * node, int n_nodes, double 
 
     // normalize name: strip trailing "-<digits>" / "_<digits>" so per-layer
     // tensors aggregate ("ffn_moe_out-31" -> "ffn_moe_out")
-    char key[GGML_MAX_NAME];
+    char key[2*GGML_MAX_NAME];
     snprintf(key, sizeof(key), "%s(%s)", ggml_op_name(node->op), node->name);
     size_t len = strlen(key);
     // (length-1 guard: never strip the leading char)

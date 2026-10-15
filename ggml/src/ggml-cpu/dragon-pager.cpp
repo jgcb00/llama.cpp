@@ -1,4 +1,11 @@
+// 64-bit off_t for pread/posix_fadvise on 32-bit Linux (checked below)
+#if defined(__linux__) && !defined(_FILE_OFFSET_BITS)
+#define _FILE_OFFSET_BITS 64
+#endif
+
 #include "dragon-pager.h"
+
+#include "ggml-impl.h"
 
 #include <algorithm>
 #include <atomic>
@@ -6,12 +13,20 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <list>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -24,7 +39,19 @@
 #elif defined(__linux__) || defined(__APPLE__)
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#endif
+
+// explicit expert cache: needs the file behind an address (Linux /proc/self/maps, macOS proc_pidinfo)
+#if defined(__linux__)
+#include <sys/sysmacros.h>
+#define DRAGON_PAGER_CACHE 1
+#elif defined(__APPLE__) && TARGET_OS_OSX
+#include <libproc.h>
+#define DRAGON_PAGER_CACHE 1
+#else
+#define DRAGON_PAGER_CACHE 0
 #endif
 
 // a fault (or MADV_POPULATE_READ) also maps the neighbouring pages that are in
@@ -93,10 +120,7 @@ void dragon_pager_prefetch(const char * p, size_t n) {
 // ---------------------------------------------------------------- populate
 
 void dragon_pager_populate(const char * p, size_t n) {
-#if defined(__linux__)
-#ifndef MADV_POPULATE_READ
-#define MADV_POPULATE_READ 22
-#endif
+#if defined(__linux__) && defined(MADV_POPULATE_READ)
     static std::atomic<bool> unsupported { false };
     if (unsupported.load(std::memory_order_relaxed)) {
         return;
@@ -112,25 +136,37 @@ void dragon_pager_populate(const char * p, size_t n) {
 #endif
 }
 
-// ---------------------------------------------------------------- release
+// ---------------------------------------------------------------- file behind an address
+//
+// A mapping can be freed (model unloaded) and its addresses reused by another
+// mapping, so a slab is identified by its file (device, inode) and offset, and
+// the region behind an address is checked again on every use:
+// - macOS: proc_pidinfo(PROC_PIDREGIONPATHINFO) queries the live VM map
+// - Linux: the VMAs of /proc/self/maps are memoized; a VMA is used only if
+//   readlink(/proc/self/map_files/<beg>-<end>) still gives its path, else
+//   /proc/self/maps is read again
+// A batch of slabs checks each region once (see dragon_pager_locate).
+
+#if DRAGON_PAGER_CACHE
+
+struct dragon_pager_region {
+    uintptr_t   beg    = 0;
+    uintptr_t   end    = 0;
+    uint64_t    off    = 0; // file offset of beg
+    uint64_t    dev    = 0;
+    uint64_t    ino    = 0; // 0: not a file mapping
+    bool        shared = false;
+    std::string path;
+};
 
 #if defined(__linux__)
-// file behind an address, from /proc/self/maps: release checks that a slab
-// really lies in a shared file mapping before MADV_DONTNEED (destructive on
-// anonymous memory), and can drop its pages from the page cache via the file
-// (fadvise), much cheaper than MADV_PAGEOUT (TLB shootdowns page by page)
-struct dragon_pager_file_map {
-    struct region {
-        uintptr_t beg, end;
-        uint64_t  off; // file offset of beg
-        int       fd;  // -1: not a shared file mapping
-    };
-    std::mutex          mtx;
-    std::vector<region> regions;
-    std::unordered_map<std::string, int> fds; // path -> fd
+namespace {
+struct dragon_pager_maps {
+    std::mutex mtx;
+    std::vector<dragon_pager_region> regions; // sorted by address
 
-    static dragon_pager_file_map & get() {
-        static dragon_pager_file_map m;
+    static dragon_pager_maps & get() {
+        static dragon_pager_maps m;
         return m;
     }
 
@@ -143,68 +179,142 @@ struct dragon_pager_file_map {
         char line[4096];
         while (fgets(line, sizeof(line), f)) {
             unsigned long long beg, end, off, inode;
-            char perms[8], dev[32];
+            unsigned int dev_major, dev_minor;
+            char perms[8];
             int n_read = 0;
-            if (sscanf(line, "%llx-%llx %7s %llx %31s %llu %n", &beg, &end, perms, &off, dev, &inode, &n_read) < 6) {
+            if (sscanf(line, "%llx-%llx %7s %llx %x:%x %llu %n", &beg, &end, perms, &off, &dev_major, &dev_minor, &inode, &n_read) < 7) {
                 continue;
             }
-            std::string path = line + n_read;
-            while (!path.empty() && (path.back() == '\n' || path.back() == ' ')) {
-                path.pop_back();
+            dragon_pager_region r;
+            r.beg    = (uintptr_t) beg;
+            r.end    = (uintptr_t) end;
+            r.off    = (uint64_t) off;
+            r.dev    = (uint64_t) makedev(dev_major, dev_minor);
+            r.shared = perms[3] == 's';
+            r.path   = line + n_read;
+            while (!r.path.empty() && (r.path.back() == '\n' || r.path.back() == ' ')) {
+                r.path.pop_back();
             }
-            int fd = -1;
-            if (perms[3] == 's' && inode != 0 && !path.empty() && path[0] == '/') {
-                auto it = fds.find(path);
-                if (it == fds.end()) {
-                    it = fds.emplace(path, open(path.c_str(), O_RDONLY | O_CLOEXEC)).first;
-                }
-                fd = it->second;
-            }
-            regions.push_back({ (uintptr_t) beg, (uintptr_t) end, (uint64_t) off, fd });
+            r.ino = !r.path.empty() && r.path[0] == '/' ? (uint64_t) inode : 0;
+            regions.push_back(std::move(r));
         }
         fclose(f);
     }
 
-    // fd and file offset of [a, b) if it lies in one shared file mapping (the
-    // range may run over several VMAs of that mapping: madvise splits them)
-    bool find(uintptr_t a, uintptr_t b, int * fd, uint64_t * off) {
-        std::lock_guard<std::mutex> lock(mtx);
-        for (int pass = 0; pass < 2; ++pass) {
-            for (const region & r : regions) {
-                if (a < r.beg || a >= r.end) {
-                    continue;
-                }
-                uintptr_t      cur  = r.end;
-                const region * last = &r;
-                while (cur < b) {
-                    const region * nx = nullptr;
-                    for (const region & q : regions) {
-                        if (q.beg == cur) {
-                            nx = &q;
-                            break;
-                        }
-                    }
-                    if (!nx || nx->fd != r.fd || nx->off != last->off + (last->end - last->beg)) {
-                        break;
-                    }
-                    last = nx;
-                    cur  = nx->end;
-                }
-                if (r.fd >= 0 && cur >= b) {
-                    *fd  = r.fd;
-                    *off = r.off + (a - r.beg);
-                    return true;
-                }
-                break;
-            }
-            if (pass == 0) {
-                reload();
-            }
+    const dragon_pager_region * find(uintptr_t p) const {
+        auto it = std::upper_bound(regions.begin(), regions.end(), p,
+            [](uintptr_t v, const dragon_pager_region & r) { return v < r.beg; });
+        if (it == regions.begin()) {
+            return nullptr;
         }
-        return false;
+        --it;
+        return p < it->end ? &*it : nullptr;
+    }
+
+    // the file VMA r is still mapped at the same place
+    static bool still_mapped(const dragon_pager_region & r) {
+        if (r.ino == 0) {
+            return false;
+        }
+        char name[64];
+        snprintf(name, sizeof(name), "/proc/self/map_files/%llx-%llx", (unsigned long long) r.beg, (unsigned long long) r.end);
+        char buf[4096];
+        const ssize_t k = readlink(name, buf, sizeof(buf));
+        return k > 0 && (size_t) k == r.path.size() && memcmp(buf, r.path.data(), (size_t) k) == 0;
+    }
+
+    bool at(uintptr_t p, dragon_pager_region * out) {
+        std::lock_guard<std::mutex> lock(mtx);
+        const dragon_pager_region * r = find(p);
+        if (r == nullptr || !still_mapped(*r)) {
+            reload();
+            r = find(p);
+        }
+        if (r == nullptr) {
+            return false;
+        }
+        *out = *r;
+        return true;
     }
 };
+}
+
+// current region that contains p
+static bool dragon_pager_region_at(uintptr_t p, dragon_pager_region * r) {
+    return dragon_pager_maps::get().at(p, r);
+}
+#else
+static bool dragon_pager_region_at(uintptr_t p, dragon_pager_region * r) {
+    struct proc_regionwithpathinfo info;
+    if (proc_pidinfo(getpid(), PROC_PIDREGIONPATHINFO, (uint64_t) p, &info, sizeof(info)) != (int) sizeof(info)) {
+        return false;
+    }
+    r->beg    = (uintptr_t) info.prp_prinfo.pri_address;
+    r->end    = r->beg + (uintptr_t) info.prp_prinfo.pri_size;
+    r->off    = info.prp_prinfo.pri_offset;
+    r->path   = info.prp_vip.vip_path;
+    r->dev    = (uint64_t) info.prp_vip.vip_vi.vi_stat.vst_dev;
+    r->ino    = !r->path.empty() && r->path[0] == '/' ? (uint64_t) info.prp_vip.vip_vi.vi_stat.vst_ino : 0;
+    r->shared = true; // not checked on Darwin (MADV_DONTNEED is not destructive)
+    // the call returns the next region if p is not mapped
+    return p >= r->beg && p < r->end;
+}
 #endif
+
+struct dragon_pager_file {
+    uint64_t    dev = 0, ino = 0;
+    uint64_t    off = 0; // file offset of the start of the range
+    std::string path;
+};
+
+// file and offset behind [a, b), which may run over several regions (madvise
+// splits them) as long as they continue the same file. checked: the regions
+// already checked in the current batch (nullptr: check them all)
+static bool dragon_pager_locate(uintptr_t a, uintptr_t b, bool need_shared, dragon_pager_file * f,
+                                std::vector<dragon_pager_region> * checked) {
+    uintptr_t cur = a;
+    while (cur < b) {
+        const dragon_pager_region * r = nullptr;
+        dragon_pager_region tmp;
+        if (checked) {
+            for (const dragon_pager_region & q : *checked) {
+                if (cur >= q.beg && cur < q.end) {
+                    r = &q;
+                    break;
+                }
+            }
+        }
+        if (r == nullptr) {
+            if (!dragon_pager_region_at(cur, &tmp)) {
+                return false;
+            }
+            if (checked) {
+                checked->push_back(tmp);
+                r = &checked->back();
+            } else {
+                r = &tmp;
+            }
+        }
+        if (r->ino == 0 || (need_shared && !r->shared)) {
+            return false;
+        }
+        const uint64_t o = r->off + (cur - r->beg);
+        if (cur == a) {
+            f->dev  = r->dev;
+            f->ino  = r->ino;
+            f->off  = o;
+            f->path = r->path;
+        } else if (r->dev != f->dev || r->ino != f->ino || o != f->off + (cur - a)) {
+            return false;
+        }
+        cur = r->end;
+    }
+    return true;
+}
+
+#endif // DRAGON_PAGER_CACHE
+
+// ---------------------------------------------------------------- release
 
 void dragon_pager_release(const char * p, size_t n) {
     uintptr_t a, b;
@@ -219,29 +329,12 @@ void dragon_pager_release(const char * p, size_t n) {
     // without disk I/O if the expert returns before Windows reuses them.
     VirtualUnlock((LPVOID) a, (SIZE_T) (b - a));
 #elif defined(__linux__)
-#ifndef MADV_PAGEOUT
-#define MADV_PAGEOUT 21
-#endif
-    // unmap from this process (MADV_DONTNEED, non-destructive on a shared file
-    // mapping, which is checked first). The pages stay in the page cache, which
-    // the kernel reclaims under pressure (or at a cgroup limit) and which serves
-    // the experts that come back soon; DRAGON_EXPERT_DROP_CACHE=1 also drops them
-    // from the page cache right away (strict footprint, slower: the kernel drains
-    // the per-CPU page lists of every core). Unknown mappings: MADV_PAGEOUT
-    // (slow, also non-destructive).
-    static const bool drop_cache = [] {
-        const char * e = getenv("DRAGON_EXPERT_DROP_CACHE");
-        return e != nullptr && atoi(e) != 0;
-    }();
-    int fd;
-    uint64_t off;
-    if (dragon_pager_file_map::get().find(a, b, &fd, &off)) {
+    // unmap from this process. MADV_DONTNEED is not destructive only on a shared
+    // file mapping: do nothing unless the range is still one. The pages stay in
+    // the page cache, which the kernel reclaims under pressure.
+    dragon_pager_file f;
+    if (dragon_pager_locate(a, b, /*need_shared =*/ true, &f, nullptr)) {
         madvise((void *) a, b - a, MADV_DONTNEED);
-        if (drop_cache) {
-            posix_fadvise(fd, (off_t) off, (off_t) (b - a), POSIX_FADV_DONTNEED);
-        }
-    } else {
-        madvise((void *) a, b - a, MADV_PAGEOUT);
     }
 #elif defined(__APPLE__)
     // non-destructive on Darwin: the pages leave the process footprint and are
@@ -297,3 +390,302 @@ int dragon_pager_used(const char * const * ptrs, const size_t * sizes, int n, si
     }
     return n_out;
 }
+
+// ---------------------------------------------------------------- explicit cache
+
+#if DRAGON_PAGER_CACHE
+
+static_assert(sizeof(off_t) == 8, "the expert cache needs a 64-bit off_t for pread");
+
+namespace {
+struct dragon_pager_key {
+    uint64_t dev, ino, off;
+    size_t   n;
+
+    bool operator==(const dragon_pager_key & o) const {
+        return dev == o.dev && ino == o.ino && off == o.off && n == o.n;
+    }
+};
+
+struct dragon_pager_key_hash {
+    size_t operator()(const dragon_pager_key & k) const {
+        uint64_t h = k.dev*0x9e3779b97f4a7c15ULL;
+        h = (h ^ k.ino)*0x9e3779b97f4a7c15ULL;
+        h = (h ^ k.off)*0x9e3779b97f4a7c15ULL;
+        h = (h ^ (uint64_t) k.n)*0x9e3779b97f4a7c15ULL;
+        return (size_t) (h ^ (h >> 32));
+    }
+};
+
+struct dragon_pager_cache {
+    struct entry {
+        char * buf  = nullptr;
+        size_t n    = 0;
+        int    pins = 0; // ops using it: never evicted while > 0
+        std::unique_ptr<std::atomic<size_t>> done; // bytes read
+        std::list<dragon_pager_key>::iterator it;  // position in lru, valid when pins == 0
+    };
+    struct file {
+        int      fd;
+        uint64_t call; // last call that used it
+    };
+
+    std::mutex mtx;
+    std::unordered_map<dragon_pager_key, entry, dragon_pager_key_hash> map;
+    std::unordered_map<const char *, dragon_pager_key> by_buf;
+    std::list<dragon_pager_key> lru; // unpinned entries, front = most recently used
+    std::map<std::pair<uint64_t, uint64_t>, file> files; // (dev, ino) -> fd
+    size_t   bytes    = 0;
+    size_t   budget   = 0;
+    int64_t  n_pinned = 0;
+    uint64_t call     = 0;
+
+    // scratch of dragon_pager_cache_get
+    std::vector<dragon_pager_region> checked;
+    std::vector<dragon_pager_key>    keys;
+    std::vector<int>                 key_fd;
+
+    // buffers of evicted slabs, reused by the misses of the same call. Slabs are
+    // anonymous mappings, unmapped when evicted: malloc keeps large freed blocks
+    // around (macOS), the resident size would not follow the budget
+    std::vector<std::pair<char *, size_t>> spare;
+
+    static dragon_pager_cache & get() {
+        static dragon_pager_cache c;
+        return c;
+    }
+
+    // fd of the file f (opened with the OS file cache bypassed), -1 if f can not be opened
+    int open_file(const dragon_pager_file & f, bool * opened) {
+        auto it = files.find({ f.dev, f.ino });
+        if (it != files.end()) {
+            it->second.call = call;
+            return it->second.fd;
+        }
+        const int fd = open(f.path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            return -1;
+        }
+        // the path can name another file now (replaced on disk)
+        struct stat st;
+        if (fstat(fd, &st) != 0 || (uint64_t) st.st_dev != f.dev || (uint64_t) st.st_ino != f.ino) {
+            close(fd);
+            return -1;
+        }
+#if defined(__APPLE__)
+        fcntl(fd, F_NOCACHE, 1);
+#endif
+        files.emplace(std::make_pair(f.dev, f.ino), file { fd, call });
+        *opened = true;
+        return fd;
+    }
+
+    // close the files not used by this call. Only when no op holds a pin, i.e.
+    // no read of another op is in flight.
+    void close_unused() {
+        if (n_pinned != 0) {
+            return;
+        }
+        for (auto it = files.begin(); it != files.end(); ) {
+            if (it->second.call != call) {
+                close(it->second.fd);
+                it = files.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void pin(entry & e) {
+        if (e.pins++ == 0) {
+            lru.erase(e.it);
+        }
+        n_pinned++;
+    }
+
+    void evict_back() {
+        auto it = map.find(lru.back());
+        lru.pop_back();
+        bytes -= it->second.n;
+        spare.emplace_back(it->second.buf, it->second.n);
+        by_buf.erase(it->second.buf);
+        map.erase(it);
+    }
+
+    // evict unpinned entries down to the budget (stays over it if the pinned ones do not fit)
+    void trim() {
+        while (bytes > budget && !lru.empty()) {
+            evict_back();
+        }
+    }
+
+    void free_spare() {
+        for (auto & b : spare) {
+            munmap(b.first, b.second);
+        }
+        spare.clear();
+    }
+
+    char * alloc(size_t n) {
+        for (size_t i = 0; i < spare.size(); ++i) {
+            if (spare[i].second == n) {
+                char * b = spare[i].first;
+                spare[i] = spare.back();
+                spare.pop_back();
+                return b;
+            }
+        }
+        void * m = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        char * b = m == MAP_FAILED ? nullptr : (char *) m;
+        if (b == nullptr) {
+            GGML_LOG_ERROR("%s: dragon expert cache: failed to allocate %zu bytes\n", __func__, n);
+            GGML_ABORT("out of memory");
+        }
+        return b;
+    }
+};
+}
+
+bool dragon_pager_cache_enabled() {
+    return true;
+}
+
+bool dragon_pager_cache_get(const char * const * ptrs, const size_t * sizes, int n, size_t budget,
+                            const char ** out, dragon_pager_read * reads, int * n_reads) {
+    dragon_pager_cache & c = dragon_pager_cache::get();
+    std::lock_guard<std::mutex> lock(c.mtx);
+
+    c.call++;
+    c.checked.clear();
+    c.keys.resize(n);
+    c.key_fd.resize(n);
+    bool opened = false;
+    for (int i = 0; i < n; ++i) {
+        dragon_pager_file f;
+        if (!dragon_pager_locate((uintptr_t) ptrs[i], (uintptr_t) ptrs[i] + sizes[i], /*need_shared =*/ false, &f, &c.checked)) {
+            return false;
+        }
+        c.key_fd[i] = c.open_file(f, &opened);
+        if (c.key_fd[i] < 0) {
+            return false;
+        }
+        c.keys[i] = { f.dev, f.ino, f.off, sizes[i] };
+    }
+    if (opened) {
+        c.close_unused();
+    }
+
+    c.budget = budget;
+    *n_reads = 0;
+    for (int i = 0; i < n; ++i) {
+        auto it = c.map.find(c.keys[i]);
+        if (it != c.map.end()) {
+            c.pin(it->second);
+            out[i] = it->second.buf;
+            continue;
+        }
+        // make room: least recently used slabs that no op uses
+        while (c.bytes + sizes[i] > budget && !c.lru.empty()) {
+            c.evict_back();
+        }
+        dragon_pager_cache::entry & e = c.map[c.keys[i]];
+        e.buf  = c.alloc(sizes[i]);
+        e.n    = sizes[i];
+        e.pins = 1;
+        e.done = std::make_unique<std::atomic<size_t>>(0);
+        c.by_buf[e.buf] = c.keys[i];
+        c.bytes += sizes[i];
+        c.n_pinned++;
+        out[i] = e.buf;
+        reads[(*n_reads)++] = { e.buf, c.key_fd[i], c.keys[i].off, sizes[i], e.done.get() };
+    }
+    c.trim();
+    c.free_spare();
+    return true;
+}
+
+void dragon_pager_cache_read(const dragon_pager_read & r, size_t off, size_t len) {
+    size_t done = 0;
+    while (done < len) {
+        const ssize_t k = pread(r.fd, r.dst + off + done, len - done, (off_t) (r.off + off + done));
+        if (k <= 0) {
+            if (k < 0 && errno == EINTR) {
+                continue;
+            }
+            GGML_LOG_ERROR("%s: pread of %zu bytes at file offset %llu failed (%s)\n", __func__,
+                len - done, (unsigned long long) (r.off + off + done), k < 0 ? strerror(errno) : "end of file");
+            GGML_ABORT("dragon expert cache: read failed");
+        }
+        done += (size_t) k;
+    }
+#if defined(__linux__)
+    // bypass the page cache, so the resident size is the cache
+    posix_fadvise(r.fd, (off_t) (r.off + off), (off_t) len, POSIX_FADV_DONTNEED);
+#endif
+    r.done->fetch_add(len, std::memory_order_release);
+}
+
+void dragon_pager_cache_wait(const char * const * copies, int n) {
+    dragon_pager_cache & c = dragon_pager_cache::get();
+    for (int i = 0; i < n; ++i) {
+        if (copies[i] == nullptr) {
+            continue;
+        }
+        std::atomic<size_t> * done;
+        size_t size;
+        {
+            std::lock_guard<std::mutex> lock(c.mtx);
+            const auto it = c.by_buf.find(copies[i]);
+            GGML_ASSERT(it != c.by_buf.end());
+            const dragon_pager_cache::entry & e = c.map.at(it->second);
+            done = e.done.get();
+            size = e.n;
+        }
+        // pinned by the caller: e stays valid
+        while (done->load(std::memory_order_acquire) < size) {
+            std::this_thread::yield();
+        }
+    }
+}
+
+void dragon_pager_cache_release(const char * const * copies, int n) {
+    dragon_pager_cache & c = dragon_pager_cache::get();
+    std::lock_guard<std::mutex> lock(c.mtx);
+    for (int i = 0; i < n; ++i) {
+        if (copies[i] == nullptr) {
+            continue;
+        }
+        const auto it = c.by_buf.find(copies[i]);
+        GGML_ASSERT(it != c.by_buf.end());
+        dragon_pager_cache::entry & e = c.map.at(it->second);
+        GGML_ASSERT(e.pins > 0);
+        if (--e.pins == 0) {
+            c.lru.push_front(it->second);
+            e.it = c.lru.begin();
+        }
+        c.n_pinned--;
+    }
+    c.trim();
+    c.free_spare();
+}
+
+#else // no explicit cache
+
+bool dragon_pager_cache_enabled() {
+    return false;
+}
+
+bool dragon_pager_cache_get(const char * const *, const size_t *, int, size_t, const char **, dragon_pager_read *, int *) {
+    return false;
+}
+
+void dragon_pager_cache_read(const dragon_pager_read &, size_t, size_t) {
+}
+
+void dragon_pager_cache_wait(const char * const *, int) {
+}
+
+void dragon_pager_cache_release(const char * const *, int) {
+}
+
+#endif

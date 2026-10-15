@@ -281,6 +281,10 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // the ubatch sequences read their own state rows (see llama_memory_recurrent_context::s_copy_is_identity);
+    // graphs may then update the states in place, so it must match for graph reuse too
+    bool s_copy_ident = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

@@ -2720,6 +2720,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_LAZY_MODE"));
     add_opt(common_arg(
+        {"--lazy-cache"}, "SIZE",
+        "RAM budget for the data read on demand in lazy mode (--lazy-mode on), for example the MoE experts\n"
+        "of the architectures that support it: the most recently used ones are kept up to this size,\n"
+        "the others are read again from disk when needed. In MiB, or with a K/M/G suffix (e.g. 512M, 2G),\n"
+        "rounded up to a whole MiB. Larger = faster (fewer disk reads), smaller = less memory (default: 1 GiB)",
+        [](common_params & params, const std::string & value) {
+            char * end = nullptr;
+            const double v = std::strtod(value.c_str(), &end);
+            if (end == value.c_str() || !std::isfinite(v) || v < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            const std::string suf = end;
+            double mib;
+            if (suf == "" || suf == "M" || suf == "m" || suf == "MiB" || suf == "MB") {
+                mib = v;
+            } else if (suf == "G" || suf == "g" || suf == "GiB" || suf == "GB") {
+                mib = v*1024;
+            } else if (suf == "K" || suf == "k" || suf == "KiB" || suf == "KB") {
+                mib = v/1024;
+            } else {
+                throw std::invalid_argument("invalid size suffix");
+            }
+            params.lazy_cache_mib = (int32_t) std::min(std::ceil(mib), 1.0e9);
+        }
+    ).set_env("LLAMA_ARG_LAZY_CACHE"));
+    add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
         "- distribute: spread execution evenly over all nodes\n"

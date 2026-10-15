@@ -588,6 +588,9 @@ extern "C" {
         GGML_OP_MAMBA3_MIMO,
         GGML_OP_GEODESIC,
         GGML_OP_DRAGON_MOE,
+        GGML_OP_DRAGON_MMV,
+        GGML_OP_DRAGON_TPA_PREP,
+        GGML_OP_DRAGON_DIFF_GATE,
 
         GGML_OP_UNARY,
 
@@ -2822,6 +2825,38 @@ extern "C" {
                                                      // prefetched after routing and released
                                                      // after use, keeping at most this many MiB
                                                      // of recently used experts resident
+
+    // Dragon V-layer helpers (decode kernels; Metal + CPU reference)
+    //   y = concat_i(W_i^T x) for up to 9 weight matrices sharing the input x (n_embd, T) f32 -> (sum_i rows_i, T) f32
+    GGML_API struct ggml_tensor * ggml_dragon_mmv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor ** ws,
+            int                   n_ws);
+
+    //   attention preparation of the Dragon V-layer (semantic reference: ggml_compute_forward_dragon_tpa_prep_f32):
+    //   pr (ROW, T) f32 = [q (H*Dh) | A_k (Hn*R) | A_v (Hn*R) | B_k (R*Dh) | B_v (R*Dh) | sh_k (Hn) | sh_v (Hn) | lam (Hn) | g (Hs*Dh)]
+    //   prev (2*Hn*Dh, n_seqs) f32 = [K_prev | V_prev] per sequence, pos (T) i32, q_norm / k_norm (Dh), scaler (H)
+    //   out: flat f32 [q (Dh,H,T) normed+scaled | k (Dh,Hn,T) shifted+normed | v (Dh,Hn,T) shifted | lam (Hn,T) sigmoid |
+    //        gs (Hs*Dh,T) silu(g + gate_b) | kvlast (2*Hn*Dh, n_seqs) pre-shift K/V of each sequence's last token]
+    GGML_API struct ggml_tensor * ggml_dragon_tpa_prep(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * pr,
+            struct ggml_tensor  * prev,
+            struct ggml_tensor  * pos,
+            struct ggml_tensor  * q_norm,
+            struct ggml_tensor  * k_norm,
+            struct ggml_tensor  * scaler,
+            int H, int Hn, int R, int Dh, int Hs, int n_seqs,
+            float eps, float wsize, float gate_b);
+
+    //   differential combine + gate: attn (Dh, H, T), lam (Hn, T), gs (Hs*Dh, T) -> (Hs*Dh, T)
+    //   out[(hn*snr+i)*Dh+d] = (attn[(hn*(snr+1)+i)*Dh+d] - lam[hn]*attn[(hn*(snr+1)+snr)*Dh+d]) * gs[(hn*snr+i)*Dh+d]
+    GGML_API struct ggml_tensor * ggml_dragon_diff_gate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * attn,
+            struct ggml_tensor  * lam,
+            struct ggml_tensor  * gs);
 
     // custom operators
 

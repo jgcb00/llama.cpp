@@ -59,6 +59,14 @@ struct ggml_metal {
 
     struct ggml_cgraph * gf;
 
+    // GGML_METAL_SPIN_WAIT=1: the blit of get_tensor_async also writes an incrementing byte into flag_buf (shared
+    // storage) after the copy, and ggml_metal_synchronize busy-waits on that byte instead of sleeping in
+    // waitUntilCompleted (saves the wake-up latency, ~2% faster decode of small models; costs a busy CPU core)
+    id<MTLBuffer>        flag_buf;
+    id<MTLFence>         flag_fence;
+    id<MTLCommandBuffer> flag_cb;     // weak, compared with cmd_buf_last
+    uint8_t              flag_val;
+
     // the callback given to the thread pool
     void (^encode_async)(size_t ith);
 
@@ -186,6 +194,19 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
         res->cmd_buf_last = nil;
 
+        {
+            const char * e = getenv("GGML_METAL_SPIN_WAIT");
+            const bool spin = e && atoi(e) != 0;
+            res->flag_buf   = spin ? [(id<MTLDevice>) ggml_metal_device_get_obj(dev) newBufferWithLength:64 options:MTLResourceStorageModeShared] : nil;
+            res->flag_fence = spin ? [(id<MTLDevice>) ggml_metal_device_get_obj(dev) newFence] : nil;
+            res->flag_cb    = nil;
+            res->flag_val   = 0;
+            if (spin) {
+                memset([res->flag_buf contents], 0, 64);
+                GGML_LOG_INFO("%s: busy-wait synchronization on a shared-memory flag (GGML_METAL_SPIN_WAIT)\n", __func__);
+            }
+        }
+
         res->pipelines_ext = ggml_metal_pipelines_init();
 
         return res;
@@ -209,6 +230,11 @@ void ggml_metal_free(ggml_metal_t ctx) {
 
     [ctx->cmd_bufs_ext removeAllObjects];
     [ctx->cmd_bufs_ext release];
+
+    if (ctx->flag_buf) {
+        [ctx->flag_buf release];
+        [ctx->flag_fence release];
+    }
 
     @autoreleasepool {
         [ctx->buf_refs removeAllObjects];
@@ -253,10 +279,35 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
 
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
+    const bool spin = ctx->flag_buf != nil;
     if (ctx->cmd_buf_last) {
-        [ctx->cmd_buf_last waitUntilCompleted];
+        if (ctx->flag_buf && ctx->flag_cb == ctx->cmd_buf_last) {
+            volatile const uint8_t * f = (volatile const uint8_t *) [ctx->flag_buf contents];
+            const uint8_t want = ctx->flag_val;
+            int64_t it = 0;
+            while (*f != want) {
+                if ((++it & 0xffff) == 0 && [ctx->cmd_buf_last status] >= MTLCommandBufferStatusCompleted) {
+                    break; // completed (or failed) without the flag becoming visible
+                }
+            }
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            // the flag only covers the last copy: command buffers without a dependency between them can complete
+            // out of order, so the other pending copies (several outputs or ubatches per graph) are waited for
+            for (NSUInteger i = 0; i < ctx->cmd_bufs_ext.count; ++i) {
+                id<MTLCommandBuffer> cb = ctx->cmd_bufs_ext[i];
+                if (cb != ctx->flag_cb && [cb status] < MTLCommandBufferStatusCompleted) {
+                    [cb waitUntilCompleted];
+                }
+            }
+        } else {
+            [ctx->cmd_buf_last waitUntilCompleted];
+        }
         ctx->cmd_buf_last = nil;
     }
+    // flag_cb is a weak reference compared by address: once its command buffer is released (below, or with the next
+    // graph), a new command buffer can get the same address and would pass the check with a stale flag value, so it
+    // is only valid until this synchronization
+    ctx->flag_cb = nil;
 
     // check status of all command buffers
     {
@@ -269,7 +320,7 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             }
 
             MTLCommandBufferStatus status = [cmd_buf status];
-            if (status != MTLCommandBufferStatusCompleted) {
+            if (spin ? status == MTLCommandBufferStatusError : status != MTLCommandBufferStatusCompleted) {
                 GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, cb_idx, (int) status);
                 if (status == MTLCommandBufferStatusError) {
                     GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
@@ -286,7 +337,7 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
             id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs_ext[i];
 
             MTLCommandBufferStatus status = [cmd_buf status];
-            if (status != MTLCommandBufferStatusCompleted) {
+            if (spin ? status == MTLCommandBufferStatusError : status != MTLCommandBufferStatusCompleted) {
                 GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, (int) i, (int) status);
                 if (status == MTLCommandBufferStatusError) {
                     GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
@@ -398,7 +449,20 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
               destinationOffset:0
                            size:size];
 
-        [encoder endEncoding];
+        if (ctx->flag_buf) {
+            // the flag is written by a second encoder that waits for the copy (fence)
+            [encoder updateFence:ctx->flag_fence];
+            [encoder endEncoding];
+
+            ctx->flag_val = ctx->flag_val == 255 ? 1 : ctx->flag_val + 1;
+            id<MTLBlitCommandEncoder> enc_flag = [cmd_buf blitCommandEncoder];
+            [enc_flag waitForFence:ctx->flag_fence];
+            [enc_flag fillBuffer:ctx->flag_buf range:NSMakeRange(0, 1) value:ctx->flag_val];
+            [enc_flag endEncoding];
+            ctx->flag_cb = cmd_buf;
+        } else {
+            [encoder endEncoding];
+        }
         [cmd_buf commit];
 
         [ctx->buf_refs addObject:buf_dst];

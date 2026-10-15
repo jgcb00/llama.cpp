@@ -1,4 +1,5 @@
 #include "ggml-metal-device.h"
+#include "ggml-metal-common.h"
 
 #include "ggml-metal-impl.h"
 #include "ggml-metal-tuning.h"
@@ -797,6 +798,79 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_geodesic(ggml_me
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_moe(ggml_metal_library_t lib, const ggml_tensor * op, int which) {
+    GGML_ASSERT(op->op == GGML_OP_DRAGON_MOE);
+
+    const ggml_tensor * w = which == 0 ? op->src[1] : which == 1 || which == 4 ? op->src[4] : which == 2 ? op->src[5] : op->src[6];
+    const char * kname   = which == 0 ? "a" : which == 1 ? "b1" : which == 2 ? "b2" : which == 3 ? "c" : which == 4 ? "m" : "f";
+
+    char base[256];
+    char name[256];
+
+    const int32_t nch_e = (int32_t) (op->src[0]->ne[0]/128);
+    const int32_t nch_l = (int32_t) (op->src[1]->ne[1]/128);
+    const int32_t nch_f = (int32_t) (op->src[4]->ne[1]/128);
+    const int32_t nch_s = (int32_t) (op->src[7]->ne[1]/128);
+    const int32_t msplit = ggml_metal_op_dragon_moe_msplit(op);
+    const int32_t nf    = msplit > 0 ? (int32_t) (op->src[4]->ne[1]/msplit/4) : 1;
+
+    snprintf(base, 256, "kernel_dragon_moe_%s_%s", kname, ggml_type_name(w->type));
+    snprintf(name, 256, "%s_e%d_l%d_f%d_s%d_m%d", base, nch_e, nch_l, nch_f, nch_s, nf);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int32(cv, nch_e, FC_DRAGON_MOE + 0);
+        ggml_metal_cv_set_int32(cv, nch_l, FC_DRAGON_MOE + 1);
+        ggml_metal_cv_set_int32(cv, nch_f, FC_DRAGON_MOE + 2);
+        ggml_metal_cv_set_int32(cv, nch_s, FC_DRAGON_MOE + 3);
+        ggml_metal_cv_set_int32(cv, nf,    FC_DRAGON_MOE + 4);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    res.nsg  = 8;
+    res.smem = ggml_metal_op_dragon_moe_smem(op, which);
+
+    return res;
+}
+
+static ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_simple(ggml_metal_library_t lib, const char * base) {
+    char name[256];
+    snprintf(name, 256, "%s", base);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
+    }
+    res.nsg = 8;
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_mmv(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_DRAGON_MMV);
+    char base[256];
+    const bool staged = ggml_metal_op_dragon_mmv_staged(op);
+    snprintf(base, 256, "kernel_dragon_mmv%s_%s", staged ? "_st" : "", ggml_type_name(op->src[1]->type));
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline_simple(lib, base);
+    res.smem = staged ? GGML_PAD(std::min<int64_t>(4, op->src[0]->ne[1])*op->src[0]->ne[0]*sizeof(float), 16) : 0;
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_tpa_prep(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_DRAGON_TPA_PREP);
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline_simple(lib, "kernel_dragon_tpa_prep_f32");
+    const int64_t Dh = ggml_get_op_params_i32(op, 3);
+    res.smem = GGML_PAD((2*Dh + 8)*sizeof(float), 16);
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_diff_gate(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_DRAGON_DIFF_GATE);
+    return ggml_metal_library_get_pipeline_simple(lib, "kernel_dragon_diff_gate_f32");
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];
@@ -884,7 +958,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    // src1 precision >= BF16 [TAG_GGML_PREC]: bfloat operands instead of half (Q8_0)
+    const bool s1_bf = !has_tensor && tsrc0 == GGML_TYPE_Q8_0 && tsrc1 == GGML_TYPE_F32 && ggml_get_op_params_i32(op, 3) == GGML_PREC_BF16 &&
+        ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_bfloat;
+
+    snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), s1_bf ? "_bf" : "");
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
              base, bc_inp, bc_out, ne12, ne13, r2, r3);
 
@@ -1228,7 +1306,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     // src1 prec [TAG_GGML_PREC]
     const bool amax = ggml_get_op_params_i32(op, 3) == GGML_PREC_F32;
 
-    snprintf(base, 256, "kernel_mul_mm_id_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    // src1 precision >= BF16 [TAG_GGML_PREC]: bfloat operands instead of half (Q8_0)
+    const bool s1_bf = tsrc0 == GGML_TYPE_Q8_0 && tsrc1 == GGML_TYPE_F32 && ggml_get_op_params_i32(op, 3) == GGML_PREC_BF16 &&
+        ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_bfloat;
+
+    snprintf(base, 256, "kernel_mul_mm_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), s1_bf ? "_bf" : "");
     snprintf(name, 256, "%s_bci=%d_amax=%d", base, bc_inp, amax);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

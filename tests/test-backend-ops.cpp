@@ -5033,6 +5033,182 @@ struct test_geodesic : public test_case {
     }
 };
 
+// GGML_OP_DRAGON_MOE (the Dragon latent MoE block; CPU reference vs the Metal 3-dispatch implementation)
+struct test_dragon_moe : public test_case {
+    const ggml_type type_w;
+    const int64_t n_embd;
+    const int64_t n_tok;
+    const int64_t n_lat;
+    const int64_t n_expert;
+    const int64_t n_ff;
+    const int64_t n_ff_sh;
+    const int     k;
+    const float   w_scale;
+    const int     geo; // bits: 1: followed by GGML_OP_GEODESIC(x2, moe), 2: input = GGML_OP_GEODESIC(x0, g),
+                       // 4: followed by GGML_OP_GEODESIC(input, moe) as in the model (the Metal backend fuses them for small batches)
+
+    std::string vars() override {
+        return VARS_TO_STR9(type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale) + (geo ? ",geo=" + std::to_string(geo) : "");
+    }
+
+    double max_nmse_err() override {
+        return 5e-4; // the CPU reference rounds the activations to the weight type before its dot products
+    }
+
+    test_dragon_moe(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 1536, int64_t n_tok = 1, int64_t n_lat = 384,
+            int64_t n_expert = 256, int64_t n_ff = 768, int64_t n_ff_sh = 1536, int k = 6, float w_scale = 2.45f, int geo = 0)
+        : type_w(type_w), n_embd(n_embd), n_tok(n_tok), n_lat(n_lat), n_expert(n_expert), n_ff(n_ff), n_ff_sh(n_ff_sh), k(k), w_scale(w_scale), geo(geo) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+        if (geo & 2) {
+            ggml_tensor * g     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+            ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_tensor * gbias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            x = ggml_geodesic(ctx, x, g, scale, gbias, 0.25f);
+        }
+        ggml_tensor * w_ld   = ggml_new_tensor_2d(ctx, type_w,        n_embd, n_lat);
+        ggml_tensor * w_r    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_expert);
+        ggml_tensor * bias   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
+        ggml_tensor * w_up   = ggml_new_tensor_3d(ctx, type_w,        n_lat, n_ff, n_expert);
+        ggml_tensor * w_down = ggml_new_tensor_3d(ctx, type_w,        n_ff, n_lat, n_expert);
+        ggml_tensor * w_lu   = ggml_new_tensor_2d(ctx, type_w,        n_lat, n_embd);
+        ggml_tensor * w_us   = ggml_new_tensor_2d(ctx, type_w,        n_embd, n_ff_sh);
+        ggml_tensor * w_ds   = ggml_new_tensor_2d(ctx, type_w,        n_ff_sh, n_embd);
+        ggml_tensor * out    = ggml_dragon_moe(ctx, x, w_ld, w_r, bias, w_up, w_down, w_lu, w_us, w_ds, k, w_scale, -1);
+        if (geo & 4) {
+            // as in the model: l_out = GEODESIC(moe input, moe output)
+            ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_tensor * gbias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            out = ggml_geodesic(ctx, x, out, scale, gbias, 0.5f);
+        }
+        if (geo & 1) {
+            ggml_tensor * x2    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+            ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            ggml_tensor * gbias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            out = ggml_geodesic(ctx, x2, out, scale, gbias, 0.5f);
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            init_tensor_uniform(t, -0.2f, 0.2f);
+        }
+        // router bias: a permutation of 0, 2, 4, ... The sigmoid of the logits is in (0, 1), so the bias alone picks
+        // the experts with margins >= 1 and the top-k cannot differ between backends (it only selects: the expert
+        // weights use the logits)
+        ggml_tensor * bias = nullptr;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_DRAGON_MOE) {
+                bias = t->src[3];
+            }
+        }
+        GGML_ASSERT(bias != nullptr && bias->type == GGML_TYPE_F32);
+        std::vector<float> b(n_expert);
+        for (int64_t e = 0; e < n_expert; ++e) {
+            b[e] = 2.0f*(float) e;
+        }
+        std::mt19937 gen(1234);
+        std::shuffle(b.begin(), b.end(), gen);
+        ggml_backend_tensor_set(bias, b.data(), 0, b.size()*sizeof(float));
+    }
+};
+
+// GGML_OP_DRAGON_MMV
+struct test_dragon_mmv : public test_case {
+    const ggml_type type_w;
+    const int64_t n_embd;
+    const int64_t n_tok;
+    const std::vector<int64_t> rows;
+
+    std::string vars() override {
+        return VARS_TO_STR3(type_w, n_embd, n_tok) + ",n_ws=" + std::to_string(rows.size()) + ",rows0=" + std::to_string(rows[0]);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_dragon_mmv(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 1536, int64_t n_tok = 1,
+            std::vector<int64_t> rows = { 6144, 48, 48, 512, 512, 12, 12, 12, 4608 })
+        : type_w(type_w), n_embd(n_embd), n_tok(n_tok), rows(rows) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
+        ggml_tensor * ws[9];
+        GGML_ASSERT(rows.size() <= 9);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            ws[i] = ggml_new_tensor_2d(ctx, type_w, n_embd, rows[i]);
+        }
+        return ggml_dragon_mmv(ctx, x, ws, (int) rows.size());
+    }
+};
+
+// GGML_OP_DRAGON_TPA_PREP
+struct test_dragon_tpa_prep : public test_case {
+    const int H, Hn, R, Dh, n_tok, n_seqs;
+
+    std::string vars() override {
+        return VARS_TO_STR6(H, Hn, R, Dh, n_tok, n_seqs);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_dragon_tpa_prep(int H = 48, int Hn = 12, int R = 4, int Dh = 128, int n_tok = 1, int n_seqs = 1)
+        : H(H), Hn(Hn), R(R), Dh(Dh), n_tok(n_tok), n_seqs(n_seqs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int Hs = H - Hn;
+        const int64_t ROW = (int64_t) H*Dh + 2*Hn*R + 2*R*Dh + 3*Hn + (int64_t) Hs*Dh;
+        ggml_tensor * pr     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ROW, n_tok);
+        ggml_tensor * prev   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*Hn*Dh, n_seqs);
+        ggml_tensor * pos    = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tok);
+        ggml_set_name(pos, "pos");
+        ggml_tensor * q_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, Dh);
+        ggml_tensor * k_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, Dh);
+        ggml_tensor * scaler = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        return ggml_dragon_tpa_prep(ctx, pr, prev, pos, q_norm, k_norm, scaler, H, Hn, R, Dh, Hs, n_seqs, 1e-6f, 4096.0f, 0.5f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "pos") == 0) {
+                // seq-major tokens: the first token of the first sequence is at position 0 (alpha masked), the others not
+                std::vector<int32_t> v(n_tok);
+                const int n_seq_t = n_tok/n_seqs;
+                for (int i = 0; i < n_tok; ++i) {
+                    v[i] = (i/n_seq_t == 0) ? i % n_seq_t : 100 + i % n_seq_t;
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, n_tok*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
+// GGML_OP_DRAGON_DIFF_GATE
+struct test_dragon_diff_gate : public test_case {
+    const int64_t Dh, H, Hn, n_tok;
+
+    std::string vars() override {
+        return VARS_TO_STR4(Dh, H, Hn, n_tok);
+    }
+
+    test_dragon_diff_gate(int64_t Dh = 128, int64_t H = 48, int64_t Hn = 12, int64_t n_tok = 3)
+        : Dh(Dh), H(H), Hn(Hn), n_tok(n_tok) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * attn = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, Dh, H, n_tok);
+        ggml_tensor * lam  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Hn, n_tok);
+        ggml_tensor * gs   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (H - Hn)*Dh, n_tok);
+        return ggml_dragon_diff_gate(ctx, attn, lam, gs);
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -11541,6 +11717,36 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_geodesic(1536, 7, 0.25f));
     test_cases.emplace_back(new test_geodesic(1536, 512, 1.0f/36));
     test_cases.emplace_back(new test_geodesic(100, 3, 0.5f));
+    // (type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale); Dragon 7A1B: bf16, 1536, 384, 256, 768, 1536, 6, 2.45
+    test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_BF16, 1536, 1));
+    test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_BF16, 1536, 5));
+    test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_F32,   256, 3, { 64, 8, 200 }));
+    test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_Q8_0, 1536, 1));
+    test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_Q8_0, 1536, 5));
+    test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 1, 1));   // decode
+    test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 4, 4));   // batched decode
+    test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 6, 2));   // 3 tokens per sequence (in-batch shift)
+    test_cases.emplace_back(new test_dragon_tpa_prep(8, 2, 3, 64, 5, 1));      // small dims, gate not divisible by H
+    test_cases.emplace_back(new test_dragon_diff_gate(128, 48, 12, 3));
+    test_cases.emplace_back(new test_dragon_diff_gate(64, 8, 2, 1));
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f)); // decode (the model has 256 experts: perf mode)
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 1)); // decode + fused geodesic
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  4, 384,  32, 768, 1536, 6, 2.45f, 1)); // batched + geodesic
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 3)); // decode, geodesic in and out
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  2, 384,  32, 768, 1536, 6, 2.45f, 2)); // 2 tokens, input geodesic
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F32,   128,  2, 128,  16, 128,  128, 2, 1.5f, 3)); // small dims, both geodesics
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  4, 384,  32, 768, 1536, 6, 2.45f)); // batched decode
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536, 19, 384,  32, 768, 1536, 6, 2.45f)); // odd batch (> 8 tokens per pass)
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F16,   256,  3, 128,  32, 128,  256, 4, 1.0f));  // small dims, f16
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F32,   128,  2, 128,  16, 128,  128, 2, 1.5f));  // f32, n_ff_sh < n_embd (CPU reference dsh fix)
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F32,   256,  5, 128,  16, 256,  128, 3, 1.5f));  // f32, 5 tokens (2 passes of kernel a)
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 3)); // Q8_0 decode, geodesic in and out
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 4)); // decode, output geodesic on the input (model)
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 6)); // decode, both geodesics as in the model
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 6)); // Q8_0, both geodesics as in the model
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  2, 384,  32, 768, 1536, 6, 2.45f, 2)); // Q8_0, 2 tokens
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  4, 384,  32, 768, 1536, 6, 2.45f));    // Q8_0, b1/b2 path
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536, 19, 384,  32, 768, 1536, 6, 2.45f));    // Q8_0, odd batch
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
@@ -12036,6 +12242,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     }
                 }
             }
+        }
+    }
+
+    // Dragon 7A1B MoE block at full size (256 experts)
+    for (ggml_type type_w : { GGML_TYPE_BF16, GGML_TYPE_Q8_0 }) {
+        for (int n_tok : { 1, 4 }) {
+            test_cases.emplace_back(new test_dragon_moe(type_w, 1536, n_tok, 384, 256, 768, 1536, 6, 2.45f, 6));
         }
     }
 

@@ -9198,7 +9198,8 @@ static bool fa_prof_enabled(void) {
     return en == 1;
 }
 #define FA_PROF_DECL  uint64_t fa_c[8] = {0}; uint64_t fa_t0 = 0, fa_t1 = 0; const bool fa_on = fa_prof_enabled(); \
-    if (fa_on) fa_t0 = __rdtsc(); const uint64_t fa_start = fa_t0; (void) fa_t1;
+    if (fa_on) { fa_t0 = __rdtsc(); } \
+    const uint64_t fa_start = fa_t0; (void) fa_t1;
 #define FA_PROF_TIC   if (fa_on) fa_t0 = __rdtsc();
 #define FA_PROF_TOC(i) if (fa_on) { fa_t1 = __rdtsc(); fa_c[i] += fa_t1 - fa_t0; fa_t0 = fa_t1; }
 #define FA_PROF_FLUSH if (fa_on) { fa_c[7] = __rdtsc() - fa_start; for (int fa_i = 0; fa_i < 8; fa_i++) fa_prof_cycles[fa_i] += fa_c[fa_i]; }
@@ -13445,7 +13446,7 @@ static inline size_t dragon_moe_qrow(enum ggml_type wtype, int64_t n) {
 
 struct dragon_moe_ws {
     // shared (bytes from the start of the work buffer)
-    size_t lat, logits, ush, up, dsh, down, ev_ptr, ev_size, ev_n, shared;
+    size_t lat, logits, ush, up, dsh, down, ev_ptr, ev_size, ev_n, s_ptr, s_size, s_copy, c_slab, c_rd, c_n, shared;
     // per-thread (bytes from the start of the thread's scratch)
     size_t xq_ld, xq_r, xq_sh, latq, upq, ushq, routedq, routed, tmp, sel, wsel, scores, taken, order, cnt, per_thread;
 };
@@ -13460,11 +13461,17 @@ static dragon_moe_ws dragon_moe_layout(const ggml_tensor * op) {
     w.logits = take(T*d.n_expert*sizeof(float));
     w.ush    = take(T*d.n_ff_sh*sizeof(float));
     w.up     = take(T*k*d.n_ff*sizeof(float));
-    w.dsh    = take(T*d.n_ff_sh*sizeof(float));
+    w.dsh    = take(T*d.n_embd*sizeof(float)); // shared-expert down output (was n_ff_sh: overflowed into `down` when n_ff_sh < n_embd)
     w.down   = take(T*k*d.n_lat*sizeof(float));
     w.ev_ptr  = take(4*d.n_expert*sizeof(const char *));
     w.ev_size = take(4*d.n_expert*sizeof(size_t));
     w.ev_n    = take(sizeof(int32_t));
+    w.s_ptr   = take(2*d.n_expert*sizeof(const char *));          // up/down slabs of the selected experts
+    w.s_size  = take(2*d.n_expert*sizeof(size_t));
+    w.s_copy  = take(2*d.n_expert*sizeof(const char *));          // expert cache: their copies
+    w.c_slab  = take(2*d.n_expert*sizeof(const char *));          // expert cache: copy of each up/down slab
+    w.c_rd    = take(2*d.n_expert*sizeof(dragon_pager_read));     // expert cache: reads to do
+    w.c_n     = take(sizeof(int32_t));                            // number of reads, -1 = cache not usable
     w.shared = off;
     off = 0;
     w.xq_ld   = take(T*dragon_moe_qrow(op->src[1]->type, d.n_embd));
@@ -13475,7 +13482,7 @@ static dragon_moe_ws dragon_moe_layout(const ggml_tensor * op) {
     w.ushq    = take(T*dragon_moe_qrow(op->src[8]->type, d.n_ff_sh));
     w.routedq = take(T*dragon_moe_qrow(op->src[6]->type, d.n_lat));
     w.routed  = take(T*d.n_lat*sizeof(float));
-    w.tmp     = take(std::max(d.n_ff, d.n_ff_sh)*sizeof(float));
+    w.tmp     = take(std::max({d.n_ff, d.n_ff_sh, d.n_lat})*sizeof(float));
     w.sel     = take(T*k*sizeof(int32_t));
     w.wsel    = take(T*k*sizeof(float));
     w.scores  = take(d.n_expert*sizeof(float));
@@ -13500,6 +13507,40 @@ static void dragon_moe_quantize(enum ggml_type wtype, const float * src, void * 
     ggml_from_float_t from_float = ggml_get_type_traits_cpu(vdt)->from_float;
     GGML_ASSERT(from_float != nullptr);
     from_float(src, dst, n);
+}
+
+// the Dragon activations can leave the range of the f16 values of the dot operands (Q8_0 block scale: block
+// max > ~8e6 -> inf; F16: > 65504): a row whose max exceeds the limit of the vec_dot type of wtype is divided by a
+// power of two before the conversion (exact), the dot products are multiplied back by the returned factor (1 for the
+// usual rows). F32/BF16 operands need no guard.
+static inline float dragon_moe_row_mul(enum ggml_type wtype, const float * src, int64_t n) {
+    const enum ggml_type vdt = ggml_get_type_traits_cpu(wtype)->vec_dot_type;
+    if (vdt == GGML_TYPE_F32 || vdt == GGML_TYPE_BF16) {
+        return 1.0f;
+    }
+    const float lim = vdt == GGML_TYPE_F16 ? 32768.0f : 4194304.0f;
+    float amax = 0.0f;
+    for (int64_t i = 0; i < n; ++i) {
+        amax = fmaxf(amax, fabsf(src[i]));
+    }
+    if (!(amax > lim)) {
+        return 1.0f;
+    }
+    return exp2f(ceilf(log2f(amax/lim)));
+}
+
+// expert cache budget in bytes
+static inline size_t dragon_moe_budget(int32_t mib) {
+    return (uint64_t) mib >= SIZE_MAX/(1024*1024) ? SIZE_MAX : (size_t) mib*1024*1024;
+}
+
+static inline void dragon_moe_scale(float * x, int64_t n, float mul) {
+    if (mul != 1.0f) {
+        const float inv = 1.0f/mul;
+        for (int64_t i = 0; i < n; ++i) {
+            x[i] *= inv;
+        }
+    }
 }
 
 static inline void dragon_moe_relu2(float * dst, const float * src, int64_t n) {
@@ -13640,6 +13681,9 @@ static void ggml_compute_forward_dragon_moe_f32(
 
     // low-memory mode: >= 0 = expert weights paged from disk, budget in MiB
     const int32_t cache_mib = ggml_get_op_params_i32(dst, 2);
+    // the experts are read from the explicit cache (c_slab) this call
+    bool cached = false;
+    const char * const * c_slab = (const char * const *) (shared + ws.c_slab);
 
     const size_t qs_ld = dragon_moe_qrow(W_ld->type,   d.n_embd);
     const size_t qs_r  = dragon_moe_qrow(W_r->type,    d.n_embd);
@@ -13731,10 +13775,64 @@ static void ggml_compute_forward_dragon_moe_f32(
             order[cnt[sel[p]]++] = (int32_t) p;
         }
 
-        // low-memory mode: every thread starts the reads of the expert rows it
-        // will compute (up now, down in stage C), so the requests go out in
-        // parallel and the shared expert below runs while they are in flight
-        if (cache_mib >= 0) {
+        // low-memory mode, explicit expert cache: thread 0 resolves the selected
+        // slabs to their copies in the cache (pinned until the end of stage C),
+        // then every thread reads a share of the misses (in 128 KiB pieces, so
+        // the SSD sees many requests at once)
+        if (cache_mib >= 0 && dragon_pager_cache_enabled()) {
+            const char ** c_slab_w = (const char **) (shared + ws.c_slab);
+            dragon_pager_read * c_rd = (dragon_pager_read *) (shared + ws.c_rd);
+            int32_t * c_n = (int32_t *) (shared + ws.c_n);
+            if (ith == 0) {
+                for (int64_t e = 0; e < d.n_expert; ++e) {
+                    taken[e] = 0;
+                }
+                for (int64_t p = 0; p < T*k; ++p) {
+                    taken[sel[p]] = 1;
+                }
+                const char ** ptrs   = (const char **) (shared + ws.s_ptr);
+                size_t      * sizes  = (size_t *)      (shared + ws.s_size);
+                const char ** copies = (const char **) (shared + ws.s_copy);
+                const int n = dragon_moe_slabs(W_up, W_down, taken, d.n_expert, ptrs, sizes);
+                int n_rd = 0;
+                if (dragon_pager_cache_get(ptrs, sizes, n, dragon_moe_budget(cache_mib), copies, c_rd, &n_rd)) {
+                    // slabs are listed up then down, each in expert order
+                    int j = 0;
+                    for (int w = 0; w < 2; ++w) {
+                        for (int64_t e = 0; e < d.n_expert; ++e) {
+                            c_slab_w[w*d.n_expert + e] = taken[e] ? copies[j++] : nullptr;
+                        }
+                    }
+                    *c_n = n_rd;
+                } else {
+                    *c_n = -1;
+                }
+            }
+            ggml_barrier(params->threadpool);
+            if (*c_n >= 0) {
+                cached = true;
+                const size_t piece = 128*1024;
+                int64_t idx = 0;
+                for (int32_t j = 0; j < *c_n; ++j) {
+                    for (size_t o = 0; o < c_rd[j].n; o += piece, ++idx) {
+                        if (idx % nth == ith) {
+                            dragon_pager_cache_read(c_rd[j], o, std::min(piece, c_rd[j].n - o));
+                        }
+                    }
+                }
+                // also the slabs another op (context) is reading
+                if (ith == 0) {
+                    dragon_pager_cache_wait(c_slab, (int) (2*d.n_expert));
+                }
+                ggml_barrier(params->threadpool);
+            }
+        }
+
+        // low-memory mode, paging the mapping: every thread starts the reads of
+        // the expert rows it will compute (up now, down in stage C), so the
+        // requests go out in parallel and the shared expert below runs while
+        // they are in flight
+        if (cache_mib >= 0 && !cached) {
             for (int w = 0; w < 2; ++w) {
                 const ggml_tensor * Wx = w == 0 ? W_up : W_down;
                 const int64_t n_r = w == 0 ? d.n_ff : d.n_lat;
@@ -13758,11 +13856,24 @@ static void ggml_compute_forward_dragon_moe_f32(
         // shared expert down: relu2 of ush, then W_ds rows
         dragon_moe_split(d.n_embd, ith, nth, &a, &b);
         if (a < b) {
+            bool scaled = false;
             for (int64_t t = 0; t < T; ++t) {
                 dragon_moe_relu2(tmp, ush + t*d.n_ff_sh, d.n_ff_sh);
+                const float mul = dragon_moe_row_mul(W_ds->type, tmp, d.n_ff_sh);
+                scaled |= mul != 1.0f;
+                dragon_moe_scale(tmp, d.n_ff_sh, mul);
                 dragon_moe_quantize(W_ds->type, tmp, ushq + t*qs_ds, d.n_ff_sh);
             }
             dragon_moe_gemv(W_ds, (const char *) W_ds->data, d.n_ff_sh, a, b, ushq, qs_ds, T, dsh, d.n_embd);
+            if (scaled) {
+                for (int64_t t = 0; t < T; ++t) {
+                    dragon_moe_relu2(tmp, ush + t*d.n_ff_sh, d.n_ff_sh);
+                    const float mul = dragon_moe_row_mul(W_ds->type, tmp, d.n_ff_sh);
+                    for (int64_t r = a; r < b && mul != 1.0f; ++r) {
+                        dsh[t*d.n_embd + r] *= mul;
+                    }
+                }
+            }
         }
 
         for (int64_t t = 0; t < T; ++t) {
@@ -13781,10 +13892,10 @@ static void ggml_compute_forward_dragon_moe_f32(
                 const int64_t r0   = i % d.n_ff;
                 const int64_t r1   = std::min<int64_t>(d.n_ff, r0 + (b - i));
                 const int32_t e    = sel[pair];
-                if (cache_mib >= 0) {
+                if (cache_mib >= 0 && !cached) {
                     pop.rows(W_up, e, r0, r1);
                 }
-                const char * wbase = (const char *) W_up->data + (size_t) e*W_up->nb[2];
+                const char * wbase = cached ? c_slab[e] : (const char *) W_up->data + (size_t) e*W_up->nb[2];
                 const char * xq    = latq + t*qs_up;
                 float * out = up + pair*d.n_ff;
                 for (int64_t r = r0; r < r1; ++r) {
@@ -13802,30 +13913,39 @@ static void ggml_compute_forward_dragon_moe_f32(
         const int64_t n_rows = T*k*d.n_lat;
         dragon_moe_split(n_rows, ith, nth, &a, &b);
         int64_t last_pair = -1;
+        float   mul_dn    = 1.0f;
         dragon_moe_populated pop;
         for (int64_t i = a; i < b; ) {
             const int64_t pair = order[i/d.n_lat];
             const int64_t r0 = i % d.n_lat;
             const int64_t r1 = std::min<int64_t>(d.n_lat, r0 + (b - i));
-            if (cache_mib >= 0) {
+            if (cache_mib >= 0 && !cached) {
                 pop.rows(W_down, sel[pair], r0, r1);
             }
             if (pair != last_pair) {
                 dragon_moe_relu2(tmp, up + pair*d.n_ff, d.n_ff);
+                mul_dn = dragon_moe_row_mul(W_down->type, tmp, d.n_ff);
+                dragon_moe_scale(tmp, d.n_ff, mul_dn);
                 dragon_moe_quantize(W_down->type, tmp, upq + pair*qs_dn, d.n_ff);
                 last_pair = pair;
             }
             const int32_t e = sel[pair];
-            const char * wbase = (const char *) W_down->data + (size_t) e*W_down->nb[2];
+            const char * wbase = cached ? c_slab[d.n_expert + e] : (const char *) W_down->data + (size_t) e*W_down->nb[2];
             const char * xq    = upq + pair*qs_dn;
             float * out = down + pair*d.n_lat;
             for (int64_t r = r0; r < r1; ++r) {
                 vec_dot((int) d.n_ff, out + r, 0, wbase + r*W_down->nb[1], 0, xq, 0, 1);
+                out[r] *= mul_dn;
             }
             i += r1 - r0;
         }
     }
     ggml_barrier(params->threadpool);
+
+    // explicit expert cache: no thread reads the copies past this point
+    if (cached && ith == 0) {
+        dragon_pager_cache_release(c_slab, (int) (2*d.n_expert));
+    }
 
     // ---- stage D: weighted reduce (redundant per thread), latent up + shared
     {
@@ -13845,13 +13965,17 @@ static void ggml_compute_forward_dragon_moe_f32(
                         ot[i] += ei[i]*wi;
                     }
                 }
-                dragon_moe_quantize(W_lu->type, ot, routedq + t*qs_lu, d.n_lat);
+                const float mul = dragon_moe_row_mul(W_lu->type, ot, d.n_lat);
+                memcpy(tmp, ot, d.n_lat*sizeof(float));
+                dragon_moe_scale(tmp, d.n_lat, mul);
+                dragon_moe_quantize(W_lu->type, tmp, routedq + t*qs_lu, d.n_lat);
             }
             float * out = (float *) dst->data;
             dragon_moe_gemv(W_lu, (const char *) W_lu->data, d.n_lat, a, b, routedq, qs_lu, T, out, d.n_embd);
             for (int64_t t = 0; t < T; ++t) {
+                const float mul = dragon_moe_row_mul(W_lu->type, routed + t*d.n_lat, d.n_lat);
                 for (int64_t r = a; r < b; ++r) {
-                    out[t*d.n_embd + r] += dsh[t*d.n_embd + r];
+                    out[t*d.n_embd + r] = out[t*d.n_embd + r]*mul + dsh[t*d.n_embd + r];
                 }
             }
         }
@@ -13860,8 +13984,8 @@ static void ggml_compute_forward_dragon_moe_f32(
     // low-memory mode: no thread reads the expert weights past the stage C
     // barrier. Thread 0 updates the LRU of resident slabs (taken[] still holds
     // the experts of this call, see stage B) and publishes the slabs to drop;
-    // all threads then release a share of them.
-    if (cache_mib >= 0) {
+    // all threads then release a share of them. (Explicit cache: released above.)
+    if (cache_mib >= 0 && !cached) {
         const char ** ev_ptr  = (const char **) (shared + ws.ev_ptr);
         size_t      * ev_size = (size_t *)      (shared + ws.ev_size);
         int32_t     * ev_n    = (int32_t *)     (shared + ws.ev_n);
@@ -13872,10 +13996,10 @@ static void ggml_compute_forward_dragon_moe_f32(
             for (int64_t p = 0; p < T*k; ++p) {
                 taken[sel[p]] = 1;
             }
-            std::vector<const char *> ptrs(2*d.n_expert);
-            std::vector<size_t>       sizes(2*d.n_expert);
-            const int n = dragon_moe_slabs(W_up, W_down, taken, d.n_expert, ptrs.data(), sizes.data());
-            *ev_n = dragon_pager_used(ptrs.data(), sizes.data(), n, (size_t) cache_mib*1024*1024,
+            const char ** ptrs  = (const char **) (shared + ws.s_ptr);
+            size_t      * sizes = (size_t *)      (shared + ws.s_size);
+            const int n = dragon_moe_slabs(W_up, W_down, taken, d.n_expert, ptrs, sizes);
+            *ev_n = dragon_pager_used(ptrs, sizes, n, dragon_moe_budget(cache_mib),
                                       ev_ptr, ev_size, (int) (4*d.n_expert));
         }
         ggml_barrier(params->threadpool);
@@ -14685,5 +14809,212 @@ void ggml_compute_forward_lightning_indexer(
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
         }
+    }
+}
+
+
+// ---- Dragon V-layer helpers (reference implementations; the production CPU path keeps the author's graph) ----
+
+static inline void dragon_row_to_f32(const ggml_tensor * W, int64_t r, float * dst) {
+    const char * p = (const char *) W->data + (size_t) r*W->nb[1];
+    if (W->type == GGML_TYPE_F32) {
+        memcpy(dst, p, (size_t) W->ne[0]*sizeof(float));
+        return;
+    }
+    ggml_to_float_t to_float = ggml_get_type_traits(W->type)->to_float;
+    GGML_ASSERT(to_float != nullptr);
+    to_float(p, dst, W->ne[0]);
+}
+
+// y = concat_i(W_i^T x): rows split across the threads
+void ggml_compute_forward_dragon_mmv(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const int64_t n = x->ne[0];
+    const int64_t T = x->ne[1];
+    const int64_t rows = dst->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    const int64_t r0 = rows*ith/nth;
+    const int64_t r1 = rows*(ith + 1)/nth;
+
+    // one dequantized row per thread (work size: ggml_graph_plan)
+    float * w = (float *) params->wdata + (n + CACHE_LINE_SIZE_F32)*ith;
+    const float * xd = (const float *) x->data;
+    float * y = (float *) dst->data;
+
+    int64_t base = 0;
+    for (int i = 1; i < GGML_MAX_SRC && dst->src[i] != nullptr; ++i) {
+        const ggml_tensor * W = dst->src[i];
+        const int64_t nr = W->ne[1];
+        const int64_t a = std::max<int64_t>(r0, base);
+        const int64_t b = std::min<int64_t>(r1, base + nr);
+        for (int64_t r = a; r < b; ++r) {
+            dragon_row_to_f32(W, r - base, w);
+            for (int64_t t = 0; t < T; ++t) {
+                const float * xt = xd + t*n;
+                float s = 0.0f;
+                for (int64_t c = 0; c < n; ++c) {
+                    s += w[c]*xt[c];
+                }
+                y[t*rows + r] = s;
+            }
+        }
+        base += nr;
+    }
+}
+
+static inline float dragon_sigmoid_f32(float x) { return 1.0f/(1.0f + expf(-x)); }
+
+// see ggml_dragon_tpa_prep (ggml.h) for the layouts; the math follows build_dragon_v_mixer (llama.cpp src/models/dragon.cpp)
+void ggml_compute_forward_dragon_tpa_prep(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * pr   = dst->src[0];
+    const ggml_tensor * prev = dst->src[1];
+    const ggml_tensor * pos  = dst->src[2];
+    const float * qn = (const float *) dst->src[3]->data;
+    const float * kn = (const float *) dst->src[4]->data;
+    const float * sc = (const float *) dst->src[5]->data;
+
+    const int H  = ggml_get_op_params_i32(dst, 0);
+    const int Hn = ggml_get_op_params_i32(dst, 1);
+    const int R  = ggml_get_op_params_i32(dst, 2);
+    const int Dh = ggml_get_op_params_i32(dst, 3);
+    const int Hs = ggml_get_op_params_i32(dst, 4);
+    const int n_seqs = ggml_get_op_params_i32(dst, 5);
+    const float eps    = ggml_get_op_params_f32(dst, 6);
+    const float wsize  = ggml_get_op_params_f32(dst, 7);
+    const float gate_b = ggml_get_op_params_f32(dst, 8);
+
+    const int64_t T = pr->ne[1];
+    const int64_t n_seq_t = T/n_seqs;
+    const int64_t ROW = pr->ne[0];
+    const int64_t OAK = (int64_t) H*Dh, OAV = OAK + Hn*R, OBK = OAV + Hn*R, OBV = OBK + R*Dh, OSK = OBV + R*Dh, OSV = OSK + Hn, OLAM = OSV + Hn, OG = OLAM + Hn;
+    const int64_t o_k = T*H*Dh, o_v = o_k + T*Hn*Dh, o_lam = o_v + T*Hn*Dh, o_g = o_lam + T*Hn, o_last = o_g + (int64_t) T*Hs*Dh;
+
+    const float   * prd  = (const float *) pr->data;
+    const int32_t * posd = (const int32_t *) pos->data;
+    const float   * pvd  = (const float *) prev->data;
+    const int64_t   pv_s = prev->nb[1]/sizeof(float);
+    float * out = (float *) dst->data;
+
+    // raw TPA k/v of token t, kv head hn (1/R scale as the graph)
+    auto raw = [&](int64_t t, int hn, bool is_v, float * o) {
+        const float * p = prd + t*ROW;
+        const float * A = p + (is_v ? OAV : OAK) + hn*R;
+        const float * B = p + (is_v ? OBV : OBK);
+        for (int d = 0; d < Dh; ++d) {
+            float s = 0.0f;
+            for (int r = 0; r < R; ++r) {
+                s += B[r*Dh + d]*A[r];
+            }
+            o[d] = s*(1.0f/(float) R);
+        }
+    };
+
+    // 5 rows of Dh floats per thread (work size: ggml_graph_plan)
+    float * kr = (float *) params->wdata + (5*Dh + CACHE_LINE_SIZE_F32)*params->ith;
+    float * vr = kr + Dh;
+    float * kp = vr + Dh;
+    float * vp = kp + Dh;
+    float * kx = vp + Dh;
+
+    // (token, q head) pairs across the threads; the kv-head work is done by the pair whose head is the first of its group
+    const int64_t n_pairs = T*H;
+    for (int64_t pi = params->ith; pi < n_pairs; pi += params->nth) {
+        const int64_t t = pi/H;
+        const int     h = (int) (pi - t*H);
+        const int     G = H/Hn;
+        const int     hn = h/G;
+        const int64_t s  = t/n_seq_t;
+        const int64_t tt = t - s*n_seq_t;
+        const float * p  = prd + t*ROW;
+        float pmask = (float) posd[t];
+        pmask = pmask < 0.0f ? 0.0f : (pmask > 1.0f ? 1.0f : pmask);
+        const float lp = logf(std::min(std::max((float) posd[t] + 1.0f, 1.0f), wsize));
+
+        if (h % G == 0) {
+            raw(t, hn, false, kr);
+            raw(t, hn, true,  vr);
+            if (tt == 0) {
+                memcpy(kp, pvd + s*pv_s + hn*Dh,         Dh*sizeof(float));
+                memcpy(vp, pvd + s*pv_s + Hn*Dh + hn*Dh, Dh*sizeof(float));
+            } else {
+                raw(t - 1, hn, false, kp);
+                raw(t - 1, hn, true,  vp);
+            }
+            if (tt == n_seq_t - 1) {
+                memcpy(out + o_last + s*2*Hn*Dh + hn*Dh,         kr, Dh*sizeof(float));
+                memcpy(out + o_last + s*2*Hn*Dh + Hn*Dh + hn*Dh, vr, Dh*sizeof(float));
+            }
+            const float ak = dragon_sigmoid_f32(p[OSK + hn])*pmask;
+            const float av = dragon_sigmoid_f32(p[OSV + hn])*pmask;
+            const float bk = ak*-1.0f + 1.0f;
+            const float bv = av*-1.0f + 1.0f;
+            float ss = 0.0f;
+            for (int d = 0; d < Dh; ++d) {
+                kx[d] = kp[d]*ak + kr[d]*bk;
+                ss += kx[d]*kx[d];
+                out[o_v + (t*Hn + hn)*Dh + d] = vp[d]*av + vr[d]*bv;
+            }
+            const float rs = 1.0f/sqrtf(ss/(float) Dh + eps);
+            for (int d = 0; d < Dh; ++d) {
+                out[o_k + (t*Hn + hn)*Dh + d] = (kx[d]*rs)*kn[d];
+            }
+        }
+        {
+            const float * q = p + h*Dh;
+            float ss = 0.0f;
+            for (int d = 0; d < Dh; ++d) {
+                ss += q[d]*q[d];
+            }
+            const float rs = 1.0f/sqrtf(ss/(float) Dh + eps);
+            for (int d = 0; d < Dh; ++d) {
+                out[(t*H + h)*Dh + d] = (((q[d]*rs)*qn[d])*lp)*sc[h];
+            }
+        }
+        if (h == 0) {
+            for (int i = 0; i < Hn; ++i) {
+                out[o_lam + t*Hn + i] = dragon_sigmoid_f32(p[OLAM + i]);
+            }
+            for (int64_t i = 0; i < (int64_t) Hs*Dh; ++i) {
+                const float g = p[OG + i] + gate_b;
+                out[o_g + t*Hs*Dh + i] = g/(1.0f + expf(-g));
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_dragon_diff_gate(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * attn = dst->src[0];
+    const ggml_tensor * lam  = dst->src[1];
+    const ggml_tensor * gs   = dst->src[2];
+
+    const int64_t Dh = attn->ne[0];
+    const int64_t H  = attn->ne[1];
+    const int64_t T  = attn->ne[2];
+    const int64_t Hn = lam->ne[0];
+    const int64_t Hs = H - Hn;
+    const int64_t snr = Hs/Hn;
+
+    const float * a = (const float *) attn->data;
+    const int64_t lam_s = lam->nb[1]/sizeof(float);
+    const int64_t gs_s  = gs->nb[1]/sizeof(float);
+    float * y = (float *) dst->data;
+
+    const int64_t n = T*Hs*Dh;
+    const int64_t i0 = n*params->ith/params->nth;
+    const int64_t i1 = n*(params->ith + 1)/params->nth;
+    for (int64_t i = i0; i < i1; ++i) {
+        const int64_t t  = i/(Hs*Dh);
+        const int64_t j  = i - t*Hs*Dh;      // (hn*snr + k)*Dh + d
+        const int64_t hs = j/Dh;
+        const int64_t d  = j - hs*Dh;
+        const int64_t hn = hs/snr;
+        const int64_t k  = hs - hn*snr;
+        const float sig = a[(t*H + hn*(snr + 1) + k)*Dh + d];
+        const float noi = a[(t*H + hn*(snr + 1) + snr)*Dh + d];
+        const float l   = ((const float *) lam->data)[t*lam_s + hn];
+        const float g   = ((const float *) gs->data)[t*gs_s + j];
+        y[i] = (sig - noi*l)*g;
     }
 }

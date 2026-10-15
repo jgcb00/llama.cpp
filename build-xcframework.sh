@@ -375,6 +375,7 @@ combine_static_libraries() {
         $min_version_flag \
         -Wl,-force_load,"${temp_dir}/combined.a" \
         -framework Foundation -framework Metal -framework Accelerate \
+        $([[ "$platform" == "macos" ]] && echo "-framework IOKit") \
         -install_name "$install_name" \
         -o "${base_dir}/${output_lib}"
 
