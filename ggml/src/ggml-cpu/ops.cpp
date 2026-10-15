@@ -9198,7 +9198,8 @@ static bool fa_prof_enabled(void) {
     return en == 1;
 }
 #define FA_PROF_DECL  uint64_t fa_c[8] = {0}; uint64_t fa_t0 = 0, fa_t1 = 0; const bool fa_on = fa_prof_enabled(); \
-    if (fa_on) fa_t0 = __rdtsc(); const uint64_t fa_start = fa_t0; (void) fa_t1;
+    if (fa_on) { fa_t0 = __rdtsc(); } \
+    const uint64_t fa_start = fa_t0; (void) fa_t1;
 #define FA_PROF_TIC   if (fa_on) fa_t0 = __rdtsc();
 #define FA_PROF_TOC(i) if (fa_on) { fa_t1 = __rdtsc(); fa_c[i] += fa_t1 - fa_t0; fa_t0 = fa_t1; }
 #define FA_PROF_FLUSH if (fa_on) { fa_c[7] = __rdtsc() - fa_start; for (int fa_i = 0; fa_i < 8; fa_i++) fa_prof_cycles[fa_i] += fa_c[fa_i]; }
