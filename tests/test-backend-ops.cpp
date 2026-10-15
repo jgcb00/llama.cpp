@@ -5044,7 +5044,8 @@ struct test_dragon_moe : public test_case {
     const int64_t n_ff_sh;
     const int     k;
     const float   w_scale;
-    const int     geo; // 1: followed by GGML_OP_GEODESIC(x2, moe), 2: input = GGML_OP_GEODESIC(x0, g) (the Metal backend fuses both for small batches)
+    const int     geo; // bits: 1: followed by GGML_OP_GEODESIC(x2, moe), 2: input = GGML_OP_GEODESIC(x0, g),
+                       // 4: followed by GGML_OP_GEODESIC(input, moe) as in the model (the Metal backend fuses them for small batches)
 
     std::string vars() override {
         return VARS_TO_STR9(type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale) + (geo ? ",geo=" + std::to_string(geo) : "");
@@ -5094,6 +5095,23 @@ struct test_dragon_moe : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             init_tensor_uniform(t, -0.2f, 0.2f);
         }
+        // router bias: a permutation of 0, 2, 4, ... The sigmoid of the logits is in (0, 1), so the bias alone picks
+        // the experts with margins >= 1 and the top-k cannot differ between backends (it only selects: the expert
+        // weights use the logits)
+        ggml_tensor * bias = nullptr;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op == GGML_OP_DRAGON_MOE) {
+                bias = t->src[3];
+            }
+        }
+        GGML_ASSERT(bias != nullptr && bias->type == GGML_TYPE_F32);
+        std::vector<float> b(n_expert);
+        for (int64_t e = 0; e < n_expert; ++e) {
+            b[e] = 2.0f*(float) e;
+        }
+        std::mt19937 gen(1234);
+        std::shuffle(b.begin(), b.end(), gen);
+        ggml_backend_tensor_set(bias, b.data(), 0, b.size()*sizeof(float));
     }
 };
 
@@ -5119,6 +5137,7 @@ struct test_dragon_mmv : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
         ggml_tensor * ws[9];
+        GGML_ASSERT(rows.size() <= 9);
         for (size_t i = 0; i < rows.size(); ++i) {
             ws[i] = ggml_new_tensor_2d(ctx, type_w, n_embd, rows[i]);
         }
@@ -11710,24 +11729,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dragon_tpa_prep(8, 2, 3, 64, 5, 1));      // small dims, gate not divisible by H
     test_cases.emplace_back(new test_dragon_diff_gate(128, 48, 12, 3));
     test_cases.emplace_back(new test_dragon_diff_gate(64, 8, 2, 1));
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384, 256, 768, 1536, 6, 2.45f)); // decode
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384, 256, 768, 1536, 6, 2.45f, 1)); // decode + fused geodesic
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  4, 384, 256, 768, 1536, 6, 2.45f, 1)); // batched + geodesic
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384, 256, 768, 1536, 6, 2.45f, 3)); // decode, geodesic in and out
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  2, 384, 256, 768, 1536, 6, 2.45f, 2)); // 2 tokens, input geodesic
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f)); // decode (the model has 256 experts: perf mode)
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 1)); // decode + fused geodesic
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  4, 384,  32, 768, 1536, 6, 2.45f, 1)); // batched + geodesic
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 3)); // decode, geodesic in and out
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  2, 384,  32, 768, 1536, 6, 2.45f, 2)); // 2 tokens, input geodesic
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F32,   128,  2, 128,  16, 128,  128, 2, 1.5f, 3)); // small dims, both geodesics
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  4, 384, 256, 768, 1536, 6, 2.45f)); // batched decode
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536, 19, 384, 256, 768, 1536, 6, 2.45f)); // odd batch (> 8 tokens per pass)
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  4, 384,  32, 768, 1536, 6, 2.45f)); // batched decode
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536, 19, 384,  32, 768, 1536, 6, 2.45f)); // odd batch (> 8 tokens per pass)
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F16,   256,  3, 128,  32, 128,  256, 4, 1.0f));  // small dims, f16
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F32,   128,  2, 128,  16, 128,  128, 2, 1.5f));  // f32, n_ff_sh < n_embd (CPU reference dsh fix)
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F32,   256,  5, 128,  16, 256,  128, 3, 1.5f));  // f32, 5 tokens (2 passes of kernel a)
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  1, 384, 256, 768, 1536, 6, 2.45f, 3)); // Q8_0 decode, geodesic in and out
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384, 256, 768, 1536, 6, 2.45f, 4)); // decode, output geodesic on the input (model)
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384, 256, 768, 1536, 6, 2.45f, 6)); // decode, both geodesics as in the model
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  1, 384, 256, 768, 1536, 6, 2.45f, 6)); // Q8_0, both geodesics as in the model
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  2, 384, 256, 768, 1536, 6, 2.45f, 2)); // Q8_0, 2 tokens
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  4, 384, 256, 768, 1536, 6, 2.45f));    // Q8_0, b1/b2 path
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536, 19, 384, 256, 768, 1536, 6, 2.45f));    // Q8_0, odd batch
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 3)); // Q8_0 decode, geodesic in and out
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 4)); // decode, output geodesic on the input (model)
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 6)); // decode, both geodesics as in the model
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 6)); // Q8_0, both geodesics as in the model
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  2, 384,  32, 768, 1536, 6, 2.45f, 2)); // Q8_0, 2 tokens
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  4, 384,  32, 768, 1536, 6, 2.45f));    // Q8_0, b1/b2 path
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536, 19, 384,  32, 768, 1536, 6, 2.45f));    // Q8_0, odd batch
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
@@ -12223,6 +12242,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     }
                 }
             }
+        }
+    }
+
+    // Dragon 7A1B MoE block at full size (256 experts)
+    for (ggml_type type_w : { GGML_TYPE_BF16, GGML_TYPE_Q8_0 }) {
+        for (int n_tok : { 1, 4 }) {
+            test_cases.emplace_back(new test_dragon_moe(type_w, 1536, n_tok, 384, 256, 768, 1536, 6, 2.45f, 6));
         }
     }
 

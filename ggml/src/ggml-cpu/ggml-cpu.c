@@ -3061,6 +3061,17 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         cur = ggml_dragon_moe_work_size(node, n_tasks);
                     } break;
+                case GGML_OP_DRAGON_MMV:
+                    {
+                        // one dequantized weight row per thread
+                        cur = sizeof(float)*(node->src[0]->ne[0] + CACHE_LINE_SIZE_F32)*n_tasks;
+                    } break;
+                case GGML_OP_DRAGON_TPA_PREP:
+                    {
+                        // 5 rows of Dh floats per thread
+                        const int64_t Dh = ggml_get_op_params_i32(node, 3);
+                        cur = sizeof(float)*(5*Dh + CACHE_LINE_SIZE_F32)*n_tasks;
+                    } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {
                         const int64_t S_v = node->src[2]->ne[0];

@@ -1836,23 +1836,27 @@ kernel void kernel_dragon_moe_c(
 #define DMOE_F_SPIN 4000000u
 #define DMOE_FC     2 // W_lu rows per simdgroup held in registers (n_embd <= DMOE_FC*8*P)
 
-// sync scratch layout (uint / float units, 128-byte lines)
-#define DMOE_F_B1   0
-#define DMOE_F_R1   32
-#define DMOE_F_B2   64
-#define DMOE_F_R2   96
-#define DMOE_F_B3   128
-#define DMOE_F_R3   160
-#define DMOE_F_EXIT 192
-#define DMOE_F_ERR  224
-#define DMOE_F_ACC  256          // n_lat floats
-#define DMOE_F_DSH  (256 + 1024) // n_embd floats
+// sync scratch layout: GGML_METAL_DMOE_F_* (ggml-metal-impl.h)
+#define DMOE_F_B1   GGML_METAL_DMOE_F_B1
+#define DMOE_F_R1   GGML_METAL_DMOE_F_R1
+#define DMOE_F_B2   GGML_METAL_DMOE_F_B2
+#define DMOE_F_R2   GGML_METAL_DMOE_F_R2
+#define DMOE_F_B3   GGML_METAL_DMOE_F_B3
+#define DMOE_F_R3   GGML_METAL_DMOE_F_R3
+#define DMOE_F_EXIT GGML_METAL_DMOE_F_EXIT
+#define DMOE_F_ERR  GGML_METAL_DMOE_F_ERR
+#define DMOE_F_ACC  GGML_METAL_DMOE_F_ACC
+#define DMOE_F_DSH  GGML_METAL_DMOE_F_DSH
 
+// arrival: the threadgroup barrier orders the device writes of all the threads of the threadgroup before thread 0's
+// device-scope fence (cumulative, as __syncthreads + __threadfence in CUDA), the last threadgroup to arrive fences again
+// before setting the release flag, so that the data published before every arrival is visible once it is set
 static inline void dmoe_f_arrive(device uint * sync, int b, int r, uint ntg, ushort tiitg) {
     threadgroup_barrier(mem_flags::mem_device);
     if (tiitg == 0) {
         atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
         if (atomic_fetch_add_explicit((device atomic_uint *) (sync + b), 1u, memory_order_relaxed) == ntg - 1) {
+            atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
             atomic_store_explicit((device atomic_uint *) (sync + r), 1u, memory_order_relaxed);
         }
     }
@@ -1860,13 +1864,14 @@ static inline void dmoe_f_arrive(device uint * sync, int b, int r, uint ntg, ush
 
 // all_fence: every thread fences after the release, so that its plain loads of data written by other threadgroups
 // are not served by stale lines of this core's cache (without it the first dispatch over reused memory reads stale
-// values)
+// values). The wait gives up after DMOE_F_SPIN polls (~tens of ms) and flags the error for the host: Metal does not
+// guarantee that all the threadgroups of a dispatch are resident, so a timeout means wrong results but no hang.
 static inline void dmoe_f_wait(device uint * sync, int r, ushort tiitg, bool all_fence = false) {
     if (tiitg == 0) {
         uint it = 0;
         while (atomic_load_explicit((device atomic_uint *) (sync + r), memory_order_relaxed) == 0u) {
             if (++it > DMOE_F_SPIN) {
-                sync[DMOE_F_ERR] = 1u; // not all threadgroups resident: give up (wrong results, no hang)
+                atomic_store_explicit((device atomic_uint *) (sync + DMOE_F_ERR), 1u, memory_order_relaxed);
                 break;
             }
         }
@@ -2093,7 +2098,8 @@ kernel void kernel_dragon_moe_f(
             dshs[i] = 0.0f;
         }
         if (tiitg < 7) {
-            sync[32*tiitg] = 0u; // B1 R1 B2 R2 B3 R3 EXIT (ERR is kept for the host)
+            // B1 R1 B2 R2 B3 R3 EXIT (ERR is kept for the host)
+            atomic_store_explicit((device atomic_uint *) (sync + 32*tiitg), 0u, memory_order_relaxed);
         }
     }
 }
@@ -2139,24 +2145,7 @@ template [[host_name("kernel_dragon_moe_f_q8_0")]]   kernel kernel_dragon_moe_f_
 // y = concat_i(W_i^T x): NR rows per simdgroup, the row streamed in groups of U 4-wide chunks per lane (all the loads
 // of a group issued before its dots, few registers -> high occupancy), x read from the cache (no staging, no barrier);
 // args.nsg simdgroups per threadgroup
-// DIFF_GATE input (see kernel_dragon_diff_gate_f32) of token t, elements [j, j+4) (in one head: Dh % 4 == 0)
-static inline float4 dragon_dg_x4(constant ggml_metal_kargs_dragon_mmv & args, device const float * attn,
-        device const float * lam, device const float * gs, int t, int j) {
-    const int Dh  = args.dg_Dh;
-    const int Hs  = args.dg_H - args.dg_Hn;
-    const int snr = Hs/args.dg_Hn;
-    const int hs  = j/Dh;
-    const int d   = j - hs*Dh;
-    const int hn  = hs/snr;
-    const int k   = hs - hn*snr;
-    device const float * a = attn + ((size_t) t*args.dg_H + hn*(snr + 1))*Dh + d;
-    const float4 sig = float4(*(device const packed_float4 *) (a + k*Dh));
-    const float4 noi = float4(*(device const packed_float4 *) (a + snr*Dh));
-    const float4 g   = float4(*(device const packed_float4 *) (gs + (size_t) t*args.dg_gs_s + j));
-    return (sig - noi*lam[(size_t) t*args.dg_lam_s + hn])*g;
-}
-
-template<typename T4, int NR, int U, bool DG = false>
+template<typename T4, int NR, int U>
 kernel void kernel_dragon_mmv(
         constant ggml_metal_kargs_dragon_mmv & args,
         device const float * x,
@@ -2213,8 +2202,7 @@ kernel void kernel_dragon_mmv(
 #pragma unroll
             for (int u = 0; u < U; ++u) {
                 if (c0 + u < nch) {
-                    const float4 xv = DG ? dragon_dg_x4(args, x, (device const float *) w1, (device const float *) w2, t, (tiisg + (c0 + u)*N_SIMDWIDTH)*4)
-                                         : x4[(c0 + u)*N_SIMDWIDTH];
+                    const float4 xv = x4[(c0 + u)*N_SIMDWIDTH];
 #pragma unroll
                     for (int r = 0; r < NR; ++r) {
                         acc[r] += dot(w[r][u], xv);
@@ -2232,230 +2220,15 @@ kernel void kernel_dragon_mmv(
     }
 }
 
-// K-split variant: the nsg simdgroups of a threadgroup share NR rows, simdgroup g takes the 4-wide chunks c = g, g + nsg, ...
-// of every row (all its loads in flight), partial sums reduced through threadgroup memory (nsg*NR floats per token)
-template<typename T4, int NR, int MAXC>
-kernel void kernel_dragon_mmv_ks(
-        constant ggml_metal_kargs_dragon_mmv & args,
-        device const float * x,
-        device const char  * w0,
-        device const char  * w1,
-        device const char  * w2,
-        device const char  * w3,
-        device const char  * w4,
-        device const char  * w5,
-        device const char  * w6,
-        device const char  * w7,
-        device const char  * w8,
-        device       float * y,
-        threadgroup  float * shm [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiitg[[thread_index_in_threadgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]],
-        ushort tiisg[[thread_index_in_simdgroup]]) {
-    const int n    = args.n_embd;
-    const int T    = args.n_tok;
-    const int NSG  = args.nsg;
-    const int nch  = n/(4*N_SIMDWIDTH);
-    const int row0 = tgpig.x*NR;
-
-    device const char * wr[NR];
-    bool ok[NR];
-#pragma unroll
-    for (int r = 0; r < NR; ++r) {
-        const int row = row0 + r;
-        ok[r] = row < args.rows_total;
-        int si = 0;
-        for (int i = 1; i < args.n_ws; ++i) {
-            if (row >= args.off[i]) {
-                si = i;
-            }
-        }
-        device const char * wb = si == 0 ? w0 : si == 1 ? w1 : si == 2 ? w2 : si == 3 ? w3 : si == 4 ? w4 : si == 5 ? w5 : si == 6 ? w6 : si == 7 ? w7 : w8;
-        wr[r] = wb + dmoe_rb<T4>((size_t) (ok[r] ? row - args.off[si] : 0)*n);
-    }
-
-    float4 w[NR][MAXC];
-#pragma unroll
-    for (int r = 0; r < NR; ++r) {
-#pragma unroll
-        for (int u = 0; u < MAXC; ++u) {
-            const int c = sgitg + u*NSG;
-            if (c < nch) {
-                w[r][u] = dmoe_ld<T4>(wr[r], tiisg*4 + c*4*N_SIMDWIDTH);
-            }
-        }
-    }
-
-    for (int t = 0; t < T; ++t) {
-        device const float4 * x4 = (device const float4 *) (x + (size_t) t*n) + tiisg;
-        float acc[NR] = { 0.0f };
-#pragma unroll
-        for (int u = 0; u < MAXC; ++u) {
-            const int c = sgitg + u*NSG;
-            if (c < nch) {
-                const float4 xv = x4[c*N_SIMDWIDTH];
-#pragma unroll
-                for (int r = 0; r < NR; ++r) {
-                    acc[r] += dot(w[r][u], xv);
-                }
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < NR; ++r) {
-            acc[r] = simd_sum(acc[r]);
-        }
-        if (t > 0) {
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        if (tiisg == 0) {
-#pragma unroll
-            for (int r = 0; r < NR; ++r) {
-                shm[r*NSG + sgitg] = acc[r];
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tiitg < NR && ok[tiitg]) {
-            float v = 0.0f;
-            for (int g = 0; g < NSG; ++g) {
-                v += shm[tiitg*NSG + g];
-            }
-            y[(size_t) t*args.rows_total + row0 + tiitg] = v;
-        }
-    }
-}
-
-typedef decltype(kernel_dragon_mmv_ks<float4, 1, 4>) kernel_dragon_mmv_ks_t;
-template [[host_name("kernel_dragon_mmv_ks_f32_nr1_c2")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<float4, 1, 2>;
-template [[host_name("kernel_dragon_mmv_ks_f32_nr1_c3")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<float4, 1, 3>;
-template [[host_name("kernel_dragon_mmv_ks_f32_nr1_c4")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<float4, 1, 4>;
-template [[host_name("kernel_dragon_mmv_ks_f32_nr1_c6")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<float4, 1, 6>;
-template [[host_name("kernel_dragon_mmv_ks_f32_nr2_c2")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<float4, 2, 2>;
-template [[host_name("kernel_dragon_mmv_ks_f32_nr2_c3")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<float4, 2, 3>;
-template [[host_name("kernel_dragon_mmv_ks_f32_nr2_c4")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<float4, 2, 4>;
-template [[host_name("kernel_dragon_mmv_ks_f32_nr2_c6")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<float4, 2, 6>;
-template [[host_name("kernel_dragon_mmv_ks_f32_nr4_c2")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<float4, 4, 2>;
-template [[host_name("kernel_dragon_mmv_ks_f32_nr4_c3")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<float4, 4, 3>;
-template [[host_name("kernel_dragon_mmv_ks_f32_nr4_c4")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<float4, 4, 4>;
-template [[host_name("kernel_dragon_mmv_ks_f32_nr4_c6")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<float4, 4, 6>;
-template [[host_name("kernel_dragon_mmv_ks_f16_nr1_c2")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<half4, 1, 2>;
-template [[host_name("kernel_dragon_mmv_ks_f16_nr1_c3")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<half4, 1, 3>;
-template [[host_name("kernel_dragon_mmv_ks_f16_nr1_c4")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<half4, 1, 4>;
-template [[host_name("kernel_dragon_mmv_ks_f16_nr1_c6")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<half4, 1, 6>;
-template [[host_name("kernel_dragon_mmv_ks_f16_nr2_c2")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<half4, 2, 2>;
-template [[host_name("kernel_dragon_mmv_ks_f16_nr2_c3")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<half4, 2, 3>;
-template [[host_name("kernel_dragon_mmv_ks_f16_nr2_c4")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<half4, 2, 4>;
-template [[host_name("kernel_dragon_mmv_ks_f16_nr2_c6")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<half4, 2, 6>;
-template [[host_name("kernel_dragon_mmv_ks_f16_nr4_c2")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<half4, 4, 2>;
-template [[host_name("kernel_dragon_mmv_ks_f16_nr4_c3")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<half4, 4, 3>;
-template [[host_name("kernel_dragon_mmv_ks_f16_nr4_c4")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<half4, 4, 4>;
-template [[host_name("kernel_dragon_mmv_ks_f16_nr4_c6")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<half4, 4, 6>;
+// one row per simdgroup, chunks loaded 2 at a time (measured best on M3 Ultra for 1-4 tokens)
+typedef decltype(kernel_dragon_mmv<float4, 1, 2>) kernel_dragon_mmv_t;
+template [[host_name("kernel_dragon_mmv_f32")]]  kernel kernel_dragon_mmv_t kernel_dragon_mmv<float4,  1, 2>;
+template [[host_name("kernel_dragon_mmv_f16")]]  kernel kernel_dragon_mmv_t kernel_dragon_mmv<half4,   1, 2>;
 #if defined(GGML_METAL_HAS_BF16)
-template [[host_name("kernel_dragon_mmv_ks_bf16_nr1_c2")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<bfloat4, 1, 2>;
-template [[host_name("kernel_dragon_mmv_ks_bf16_nr1_c3")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<bfloat4, 1, 3>;
-template [[host_name("kernel_dragon_mmv_ks_bf16_nr1_c4")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<bfloat4, 1, 4>;
-template [[host_name("kernel_dragon_mmv_ks_bf16_nr1_c6")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<bfloat4, 1, 6>;
-template [[host_name("kernel_dragon_mmv_ks_bf16_nr2_c2")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<bfloat4, 2, 2>;
-template [[host_name("kernel_dragon_mmv_ks_bf16_nr2_c3")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<bfloat4, 2, 3>;
-template [[host_name("kernel_dragon_mmv_ks_bf16_nr2_c4")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<bfloat4, 2, 4>;
-template [[host_name("kernel_dragon_mmv_ks_bf16_nr2_c6")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<bfloat4, 2, 6>;
-template [[host_name("kernel_dragon_mmv_ks_bf16_nr4_c2")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<bfloat4, 4, 2>;
-template [[host_name("kernel_dragon_mmv_ks_bf16_nr4_c3")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<bfloat4, 4, 3>;
-template [[host_name("kernel_dragon_mmv_ks_bf16_nr4_c4")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<bfloat4, 4, 4>;
-template [[host_name("kernel_dragon_mmv_ks_bf16_nr4_c6")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<bfloat4, 4, 6>;
+template [[host_name("kernel_dragon_mmv_bf16")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<bfloat4, 1, 2>;
 #endif
-template [[host_name("kernel_dragon_mmv_ks_q8_0_nr1_c2")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 1, 2>;
-template [[host_name("kernel_dragon_mmv_ks_q8_0_nr1_c3")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 1, 3>;
-template [[host_name("kernel_dragon_mmv_ks_q8_0_nr1_c4")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 1, 4>;
-template [[host_name("kernel_dragon_mmv_ks_q8_0_nr1_c6")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 1, 6>;
-template [[host_name("kernel_dragon_mmv_ks_q8_0_nr2_c2")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 2, 2>;
-template [[host_name("kernel_dragon_mmv_ks_q8_0_nr2_c3")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 2, 3>;
-template [[host_name("kernel_dragon_mmv_ks_q8_0_nr2_c4")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 2, 4>;
-template [[host_name("kernel_dragon_mmv_ks_q8_0_nr2_c6")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 2, 6>;
-template [[host_name("kernel_dragon_mmv_ks_q8_0_nr4_c2")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 4, 2>;
-template [[host_name("kernel_dragon_mmv_ks_q8_0_nr4_c3")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 4, 3>;
-template [[host_name("kernel_dragon_mmv_ks_q8_0_nr4_c4")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 4, 4>;
-template [[host_name("kernel_dragon_mmv_ks_q8_0_nr4_c6")]] kernel kernel_dragon_mmv_ks_t kernel_dragon_mmv_ks<dmoe_q8, 4, 6>;
+template [[host_name("kernel_dragon_mmv_q8_0")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 1, 2>;
 
-typedef decltype(kernel_dragon_mmv<float4, 1, 4>) kernel_dragon_mmv_t;
-template [[host_name("kernel_dragon_mmv_f32_nr1_u2")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<float4, 1, 2>;
-template [[host_name("kernel_dragon_mmv_f32_nr1_u4")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<float4, 1, 4>;
-template [[host_name("kernel_dragon_mmv_f32_nr1_u6")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<float4, 1, 6>;
-template [[host_name("kernel_dragon_mmv_f32_nr1_u12")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<float4, 1, 12>;
-template [[host_name("kernel_dragon_mmv_f32_nr2_u2")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<float4, 2, 2>;
-template [[host_name("kernel_dragon_mmv_f32_nr2_u4")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<float4, 2, 4>;
-template [[host_name("kernel_dragon_mmv_f32_nr2_u6")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<float4, 2, 6>;
-template [[host_name("kernel_dragon_mmv_f32_nr2_u12")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<float4, 2, 12>;
-template [[host_name("kernel_dragon_mmv_f32_nr4_u2")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<float4, 4, 2>;
-template [[host_name("kernel_dragon_mmv_f32_nr4_u4")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<float4, 4, 4>;
-template [[host_name("kernel_dragon_mmv_f32_nr4_u6")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<float4, 4, 6>;
-template [[host_name("kernel_dragon_mmv_f32_nr4_u12")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<float4, 4, 12>;
-template [[host_name("kernel_dragon_mmv_f16_nr1_u2")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<half4, 1, 2>;
-template [[host_name("kernel_dragon_mmv_f16_nr1_u4")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<half4, 1, 4>;
-template [[host_name("kernel_dragon_mmv_f16_nr1_u6")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<half4, 1, 6>;
-template [[host_name("kernel_dragon_mmv_f16_nr1_u12")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<half4, 1, 12>;
-template [[host_name("kernel_dragon_mmv_f16_nr2_u2")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<half4, 2, 2>;
-template [[host_name("kernel_dragon_mmv_f16_nr2_u4")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<half4, 2, 4>;
-template [[host_name("kernel_dragon_mmv_f16_nr2_u6")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<half4, 2, 6>;
-template [[host_name("kernel_dragon_mmv_f16_nr2_u12")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<half4, 2, 12>;
-template [[host_name("kernel_dragon_mmv_f16_nr4_u2")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<half4, 4, 2>;
-template [[host_name("kernel_dragon_mmv_f16_nr4_u4")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<half4, 4, 4>;
-template [[host_name("kernel_dragon_mmv_f16_nr4_u6")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<half4, 4, 6>;
-template [[host_name("kernel_dragon_mmv_f16_nr4_u12")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<half4, 4, 12>;
-#if defined(GGML_METAL_HAS_BF16)
-template [[host_name("kernel_dragon_mmv_bf16_nr1_u2")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<bfloat4, 1, 2>;
-template [[host_name("kernel_dragon_mmv_bf16_nr1_u4")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<bfloat4, 1, 4>;
-template [[host_name("kernel_dragon_mmv_bf16_nr1_u6")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<bfloat4, 1, 6>;
-template [[host_name("kernel_dragon_mmv_bf16_nr1_u12")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<bfloat4, 1, 12>;
-template [[host_name("kernel_dragon_mmv_bf16_nr2_u2")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<bfloat4, 2, 2>;
-template [[host_name("kernel_dragon_mmv_bf16_nr2_u4")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<bfloat4, 2, 4>;
-template [[host_name("kernel_dragon_mmv_bf16_nr2_u6")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<bfloat4, 2, 6>;
-template [[host_name("kernel_dragon_mmv_bf16_nr2_u12")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<bfloat4, 2, 12>;
-template [[host_name("kernel_dragon_mmv_bf16_nr4_u2")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<bfloat4, 4, 2>;
-template [[host_name("kernel_dragon_mmv_bf16_nr4_u4")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<bfloat4, 4, 4>;
-template [[host_name("kernel_dragon_mmv_bf16_nr4_u6")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<bfloat4, 4, 6>;
-template [[host_name("kernel_dragon_mmv_bf16_nr4_u12")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<bfloat4, 4, 12>;
-#endif
-template [[host_name("kernel_dragon_mmv_q8_0_nr1_u2")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 1, 2>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr1_u4")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 1, 4>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr1_u6")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 1, 6>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr1_u12")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 1, 12>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr2_u2")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 2, 2>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr2_u4")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 2, 4>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr2_u6")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 2, 6>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr2_u12")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 2, 12>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr4_u2")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 4, 2>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr4_u4")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 4, 4>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr4_u6")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 4, 6>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr4_u12")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 4, 12>;
-
-typedef decltype(kernel_dragon_mmv<float4, 1, 4, true>) kernel_dragon_mmv_dg_t;
-template [[host_name("kernel_dragon_mmv_f32_nr1_u2_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<float4, 1, 2, true>;
-template [[host_name("kernel_dragon_mmv_f32_nr1_u4_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<float4, 1, 4, true>;
-template [[host_name("kernel_dragon_mmv_f32_nr2_u2_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<float4, 2, 2, true>;
-template [[host_name("kernel_dragon_mmv_f32_nr2_u4_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<float4, 2, 4, true>;
-template [[host_name("kernel_dragon_mmv_f32_nr4_u2_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<float4, 4, 2, true>;
-template [[host_name("kernel_dragon_mmv_f32_nr4_u4_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<float4, 4, 4, true>;
-template [[host_name("kernel_dragon_mmv_f16_nr1_u2_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<half4, 1, 2, true>;
-template [[host_name("kernel_dragon_mmv_f16_nr1_u4_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<half4, 1, 4, true>;
-template [[host_name("kernel_dragon_mmv_f16_nr2_u2_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<half4, 2, 2, true>;
-template [[host_name("kernel_dragon_mmv_f16_nr2_u4_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<half4, 2, 4, true>;
-template [[host_name("kernel_dragon_mmv_f16_nr4_u2_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<half4, 4, 2, true>;
-template [[host_name("kernel_dragon_mmv_f16_nr4_u4_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<half4, 4, 4, true>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr1_u2_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<dmoe_q8, 1, 2, true>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr1_u4_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<dmoe_q8, 1, 4, true>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr2_u2_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<dmoe_q8, 2, 2, true>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr2_u4_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<dmoe_q8, 2, 4, true>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr4_u2_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<dmoe_q8, 4, 2, true>;
-template [[host_name("kernel_dragon_mmv_q8_0_nr4_u4_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<dmoe_q8, 4, 4, true>;
-#if defined(GGML_METAL_HAS_BF16)
-template [[host_name("kernel_dragon_mmv_bf16_nr1_u2_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<bfloat4, 1, 2, true>;
-template [[host_name("kernel_dragon_mmv_bf16_nr1_u4_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<bfloat4, 1, 4, true>;
-template [[host_name("kernel_dragon_mmv_bf16_nr2_u2_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<bfloat4, 2, 2, true>;
-template [[host_name("kernel_dragon_mmv_bf16_nr2_u4_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<bfloat4, 2, 4, true>;
-template [[host_name("kernel_dragon_mmv_bf16_nr4_u2_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<bfloat4, 4, 2, true>;
-template [[host_name("kernel_dragon_mmv_bf16_nr4_u4_dg")]] kernel kernel_dragon_mmv_dg_t kernel_dragon_mmv<bfloat4, 4, 4, true>;
-#endif
 
 // staged variant for larger batches (T > 4): y = concat_i(W_i^T x): one output row per simdgroup, x staged for tb tokens (same scheme as kernel_dragon_moe_a)
 template<typename T4>

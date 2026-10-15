@@ -1563,7 +1563,9 @@ bool llama_model_loader::load_all_data(
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
         // First determine if the backend supports the necessary features for async uploads.
-        auto * buf = bufs.count(0) ? bufs.find(0)->second : nullptr;
+        // bufs is a multimap, but without mmap there is one buffer per file and only its type matters here
+        const auto it_buf = bufs.find(0);
+        auto * buf = it_buf != bufs.end() ? it_buf->second : nullptr;
         if (!buf) {
             LLAMA_LOG_DEBUG("%s: no buffer found for async uploads\n", func);
             return nullptr;
@@ -1634,7 +1636,7 @@ bool llama_model_loader::load_all_data(
     if (upload_backend) {
         LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
-            ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.find(0)->second)),
+            ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.find(0)->second)), // only the type matters (multimap)
             ggml_backend_name(upload_backend));
     }
 
@@ -1678,12 +1680,17 @@ bool llama_model_loader::load_all_data(
             ggml_backend_buffer_t buf_mmap = nullptr;
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
             // the buffer of this file that contains the tensor (one unless split around lazy tensors)
-            for (auto [it, end] = bufs.equal_range(weight->idx); it != end; ++it) {
+            const auto [buf_beg, buf_end] = bufs.equal_range(weight->idx);
+            for (auto it = buf_beg; it != buf_end; ++it) {
                 const uint8_t * base = (const uint8_t *) ggml_backend_buffer_get_base(it->second);
-                if (buf_mmap == nullptr ||
-                    (data >= base && data + n_size <= base + ggml_backend_buffer_get_size(it->second))) {
+                if (data >= base && data + n_size <= base + ggml_backend_buffer_get_size(it->second)) {
                     buf_mmap = it->second;
+                    break;
                 }
+            }
+            if (buf_mmap == nullptr && buf_beg != buf_end && cur->data == nullptr) {
+                throw std::runtime_error(format("tensor '%s' is not in any of the mapped buffers of file %u",
+                    ggml_get_name(cur), weight->idx));
             }
 
             if (check_tensors) {

@@ -1144,7 +1144,7 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 dev->props.gpu_core_count = 0;
                 {
                     // GPU core count (the fused Dragon MoE kernel needs all its threadgroups resident)
-                    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AGXAccelerator"));
+                    io_service_t svc = IOServiceGetMatchingService(0 /* kIOMainPortDefault, macOS 12+ */, IOServiceMatching("AGXAccelerator"));
                     if (svc) {
                         CFTypeRef v = IORegistryEntryCreateCFProperty(svc, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
                         if (v) {
@@ -1919,9 +1919,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 if (op->src[0]->type != GGML_TYPE_F32 || op->src[2]->type != GGML_TYPE_F32 || op->src[3]->type != GGML_TYPE_F32) {
                     return false;
                 }
-                // one weight type per kernel: (W_ld, W_us), (W_up, W_down), (W_lu, W_ds)
-                if (op->src[1]->type != op->src[7]->type || op->src[4]->type != op->src[5]->type || op->src[6]->type != op->src[8]->type) {
-                    return false;
+                // one weight type for all the projections (kernels b1 and b2 read the shared-expert weights with the type of
+                // the routed ones)
+                for (int i = 4; i < 9; ++i) {
+                    if (op->src[i]->type != op->src[1]->type) {
+                        return false;
+                    }
                 }
                 for (int i = 1; i < 9; ++i) {
                     if (i == 2 || i == 3) {
@@ -1953,10 +1956,20 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     n_embd > 2048 || n_ff_sh > 2048 || n_lat > 1024 || n_ff > 1024) {
                     return false;
                 }
-                for (int which = 0; which < 4; ++which) {
+                for (int which = 0; which < 6; ++which) {
+                    if (which == 4 && !ggml_metal_op_dragon_moe_merged(op)) {
+                        continue;
+                    }
+                    if (which == 5 && ggml_metal_op_dragon_moe_fused_ntg(op, dev->props.gpu_core_count) == 0) {
+                        continue;
+                    }
                     if (ggml_metal_op_dragon_moe_smem(op, which) > dev->props.max_theadgroup_memory_size) {
                         return false;
                     }
+                }
+                // small batches: rows of [W_ld | W_r] 8 per threadgroup in kernel a
+                if (ggml_metal_op_dragon_moe_sh_split(op) && (n_lat + n_expert) % 8 != 0) {
+                    return false;
                 }
                 return n_expert >= 1 && n_expert <= 256 && k >= 1 && k <= n_expert &&
                        n_ff % nsplit == 0 && n_lat % nsplit == 0 && (n_ff/nsplit) % 8 == 0;
@@ -1967,9 +1980,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
                 }
                 const int64_t n = op->src[0]->ne[0];
-                // (> 2048: only the unstaged decode path, the staged one keeps x in threadgroup memory)
-                if (n % 128 != 0 || (n > 2048 && (ggml_metal_op_dragon_mmv_staged(op) || ggml_metal_op_dragon_mmv_ks())) ||
-                    !ggml_is_contiguous(op->src[0])) {
+                if (n % 128 != 0 || n > 2048 || !ggml_is_contiguous(op->src[0])) {
                     return false;
                 }
                 const enum ggml_type wt = op->src[1]->type;

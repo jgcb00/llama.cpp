@@ -1058,6 +1058,21 @@ typedef struct {
     float    inv_depth;
 } ggml_metal_kargs_geodesic;
 
+// fused Dragon MoE kernel (kernel_dragon_moe_f): layout of the device sync scratch (32-bit words, one 128-byte line
+// per barrier word), shared with the host
+#define GGML_METAL_DMOE_F_B1   0
+#define GGML_METAL_DMOE_F_R1   32
+#define GGML_METAL_DMOE_F_B2   64
+#define GGML_METAL_DMOE_F_R2   96
+#define GGML_METAL_DMOE_F_B3   128
+#define GGML_METAL_DMOE_F_R3   160
+#define GGML_METAL_DMOE_F_EXIT 192
+#define GGML_METAL_DMOE_F_ERR  224                 // set when a wait timed out (threadgroups not all resident)
+#define GGML_METAL_DMOE_F_ACC  256                 // n_lat floats
+#define GGML_METAL_DMOE_F_DSH  (256 + GGML_METAL_DMOE_F_MAX_LAT) // n_embd floats
+#define GGML_METAL_DMOE_F_MAX_LAT  1024
+#define GGML_METAL_DMOE_F_MAX_EMBD 2048
+
 // Dragon latent MoE block (kernels/mamba3.metal); workspace offsets in floats, after dst
 typedef struct {
     int32_t n_embd;
@@ -1104,13 +1119,6 @@ typedef struct {
     int32_t off[9];     // first output row of each matrix
     int32_t rows_total;
     int32_t nsg;        // simdgroups per threadgroup
-    // GGML_METAL_FUSION_DIFF_GATE_MMV: x = DRAGON_DIFF_GATE(attn, lam, gs) computed on load (attn in x, lam in w1, gs in w2)
-    int32_t dg_Dh;
-    int32_t dg_H;
-    int32_t dg_Hn;
-    int32_t dg_pad;
-    int64_t dg_lam_s;   // token stride of lam (floats)
-    int64_t dg_gs_s;    // token stride of gs (floats)
 } ggml_metal_kargs_dragon_mmv;
 
 typedef struct {

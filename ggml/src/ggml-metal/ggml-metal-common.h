@@ -51,21 +51,16 @@ void ggml_graph_optimize(struct ggml_cgraph * gf);
 // mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*
 bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op, size_t max_tg_mem);
 bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
-// tunable break-even points (env, read once): GGML_METAL_MM_MIN (default 8), GGML_METAL_MV_EXT_MAX (default 8)
-int ggml_metal_op_mul_mat_mm_min(void);
-int ggml_metal_op_mul_mat_mv_ext_max(void);
 
-// GGML_OP_DRAGON_MOE: FF slices per expert (GGML_METAL_DRAGON_MOE_NSPLIT, default 16), each slice a multiple of 8 columns
-int ggml_metal_op_dragon_moe_nsplit(const struct ggml_tensor * op);
-int ggml_metal_op_dragon_mmv_nr(void);
-int ggml_metal_op_dragon_mmv_nsg(void);
-int ggml_metal_op_dragon_mmv_u(void);
-int ggml_metal_op_dragon_mmv_ks(void);
+// GGML_OP_DRAGON_MMV: x staged in threadgroup memory (larger batches) or read from device memory
 bool ggml_metal_op_dragon_mmv_staged(const struct ggml_tensor * op);
+
+// GGML_OP_DRAGON_MOE: FF slices per expert (up to 32), each slice a multiple of 8 columns
+int ggml_metal_op_dragon_moe_nsplit (const struct ggml_tensor * op);
 int ggml_metal_op_dragon_moe_nsplit2(const struct ggml_tensor * op);
 // threadgroup memory of kernel `which` (0: a, 1: b1, 2: b2, 3: c), keep in sync with kernels/mamba3.metal
 size_t ggml_metal_op_dragon_moe_smem(const struct ggml_tensor * op, int which);
-// shared expert off the critical path (in b1/b2) for batches up to GGML_METAL_DRAGON_MOE_SH_SPLIT_T tokens (default 2)
+// shared expert off the critical path (in b1/b2) for batches up to 2 tokens
 bool ggml_metal_op_dragon_moe_sh_split(const struct ggml_tensor * op);
 int  ggml_metal_op_dragon_moe_msplit (const struct ggml_tensor * op);
 int  ggml_metal_op_dragon_moe_sh_rows(const struct ggml_tensor * op);

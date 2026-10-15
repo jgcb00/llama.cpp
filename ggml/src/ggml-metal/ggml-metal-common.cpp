@@ -1,5 +1,6 @@
 #include "ggml-metal-common.h"
 #include "ggml-metal-fusion.h"
+#include "ggml-metal-impl.h"
 
 #include "ggml.h"
 #include "ggml-impl.h"
@@ -34,60 +35,16 @@ bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op, size_t max_tg
            ggml_metal_fwht_supported_size(op->src[1]->ne[0], max_tg_mem);
 }
 
-// The break-even between the small-batch mat-vec kernels (mul_mv_ext) and the simdgroup-matrix kernel (mul_mm, tiles of
-// 32 src1 rows) depends on the matrix size: for small, memory-bound dense matrices (e.g. Dragon 7A1B: 9 rows cost the same
-// as 32 on the mm path, decode step x1.8 from 8 to 9 sequences) the mat-vec path wins up to ~16-32 rows. Tunable via env.
-static int ggml_metal_env_int(const char * name, int def) {
-    const char * s = getenv(name);
-    const int v = s ? atoi(s) : def;
-    return v > 0 ? v : def;
-}
-
-int ggml_metal_op_mul_mat_mm_min(void) {
-    static const int v = ggml_metal_env_int("GGML_METAL_MM_MIN", 8);
-    return v;
-}
-
-int ggml_metal_op_mul_mat_mv_ext_max(void) {
-    static const int v = ggml_metal_env_int("GGML_METAL_MV_EXT_MAX", 8);
-    return v;
-}
-
-// DRAGON_MMV: rows per simdgroup (1 or 2) and simdgroups per threadgroup
-int ggml_metal_op_dragon_mmv_nr(void) {
-    static const int e = ggml_metal_env_int("GGML_METAL_DRAGON_MMV_NR", 1);
-    static const int v = e >= 4 ? 4 : e >= 2 ? 2 : 1;
-    return v;
-}
-
-// DRAGON_MMV: x staged in threadgroup memory (original kernel, 8 simdgroups, one row each) above this many tokens
+// DRAGON_MMV: x staged in threadgroup memory (8 simdgroups, one row each) above 4 tokens, otherwise read from device
+// memory by 4 simdgroups, one row each
 bool ggml_metal_op_dragon_mmv_staged(const struct ggml_tensor * op) {
-    static const int max_t = ggml_metal_env_int("GGML_METAL_DRAGON_MMV_STAGED_T", 4);
-    return op->src[0]->ne[1] > max_t;
-}
-
-// DRAGON_MMV: K split across the simdgroups of a threadgroup (1) or one row per simdgroup (0)
-int ggml_metal_op_dragon_mmv_ks(void) {
-    static const int v = ggml_metal_env_int("GGML_METAL_DRAGON_MMV_KS", 0) != 0;
-    return v;
-}
-
-// DRAGON_MMV: 4-wide chunks per lane loaded per group (2, 4, 6 or 12)
-int ggml_metal_op_dragon_mmv_u(void) {
-    static const int e = ggml_metal_env_int("GGML_METAL_DRAGON_MMV_U", 2);
-    static const int v = e >= 12 ? 12 : e >= 6 ? 6 : e >= 4 ? 4 : 2;
-    return v;
-}
-
-int ggml_metal_op_dragon_mmv_nsg(void) {
-    static const int v = std::max(1, std::min(32, ggml_metal_env_int("GGML_METAL_DRAGON_MMV_NSG", 4)));
-    return v;
+    return op->src[0]->ne[1] > 4;
 }
 
 int ggml_metal_op_dragon_moe_nsplit(const struct ggml_tensor * op) {
     const int64_t n_ff  = op->src[4]->ne[1];
     const int64_t n_lat = op->src[1]->ne[1];
-    static const int want = ggml_metal_env_int("GGML_METAL_DRAGON_MOE_NSPLIT", 32);
+    const int want = 32;
     for (int ns = (int) std::min<int64_t>(want, n_ff/8); ns >= 1; --ns) {
         if (n_ff % ns == 0 && (n_ff/ns) % 8 == 0 && n_lat % ns == 0) {
             return ns;
@@ -100,7 +57,7 @@ int ggml_metal_op_dragon_moe_nsplit(const struct ggml_tensor * op) {
 int ggml_metal_op_dragon_moe_nsplit2(const struct ggml_tensor * op) {
     const int64_t n_lat = op->src[1]->ne[1];
     const int64_t k     = ggml_get_op_params_i32(op, 0);
-    static const int want_rs = ggml_metal_env_int("GGML_METAL_DRAGON_MOE_RS", 4);
+    const int want_rs = 4;
     for (int64_t rs = std::min<int64_t>(want_rs, 32/std::max<int64_t>(k, 1)); rs >= 1; --rs) {
         if (n_lat % rs == 0) {
             return (int) (n_lat/rs);
@@ -151,7 +108,7 @@ size_t ggml_metal_op_dragon_moe_smem(const struct ggml_tensor * op, int which) {
 // kernel m (merged up + down) FF slices of an expert and shared-expert rows per threadgroup; 0: not usable
 int ggml_metal_op_dragon_moe_msplit(const struct ggml_tensor * op) {
     const int64_t n_ff = op->src[4]->ne[1];
-    static const int want = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_MSPLIT"); return e ? atoi(e) : 24; }();
+    const int want = 24;
     const int64_t n_lat = op->src[1]->ne[1];
     if (n_lat > 2*256) {
         return 0; // DMOE_MD*DMOE_NTH
@@ -166,7 +123,7 @@ int ggml_metal_op_dragon_moe_msplit(const struct ggml_tensor * op) {
 
 int ggml_metal_op_dragon_moe_sh_rows(const struct ggml_tensor * op) {
     const int64_t n_ff_sh = op->src[7]->ne[1];
-    static const int want = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_SH_ROWS"); return e ? atoi(e) : 16; }();
+    const int want = 16;
     const int step = 4;
     for (int r = (std::max(step, want)/step)*step; r >= step; r -= step) {
         if (n_ff_sh % r == 0) {
@@ -176,22 +133,20 @@ int ggml_metal_op_dragon_moe_sh_rows(const struct ggml_tensor * op) {
     return 0;
 }
 
-// kernel m replaces b1 and b2 for T <= GGML_METAL_DRAGON_MOE_MERGE_T (default 2, 0 disables)
+// kernel m replaces b1 and b2 for up to 2 tokens
 bool ggml_metal_op_dragon_moe_merged(const struct ggml_tensor * op) {
-    static const int max_t = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_MERGE_T"); return e ? atoi(e) : 2; }();
     // kernel m reads W_up, W_down, W_us and W_ds with one weight type
     const bool same_type = op->src[4]->type == op->src[7]->type && op->src[4]->type == op->src[8]->type;
-    return same_type && op->src[0]->ne[1] <= std::min(max_t, 4) && ggml_metal_op_dragon_moe_msplit(op) > 0 && ggml_metal_op_dragon_moe_sh_rows(op) > 0;
+    return same_type && op->src[0]->ne[1] <= 2 && ggml_metal_op_dragon_moe_msplit(op) > 0 && ggml_metal_op_dragon_moe_sh_rows(op) > 0;
 }
 
 // fused single-dispatch kernel (decode): number of persistent threadgroups, 0 when not usable. All the threadgroups
 // must be resident at once (they wait for each other): at most 3 per GPU core (measured on M3 Ultra: 240 of 80 cores
 // run, 288 do not), so the kernel is not used when the core count is unknown or too small.
-// GGML_METAL_DRAGON_MOE_FUSED=0 disables it, GGML_METAL_DRAGON_MOE_FUSED_P overrides the threadgroup count.
+// GGML_METAL_DRAGON_MOE_FUSED=0 disables it.
 int ggml_metal_op_dragon_moe_fused_ntg(const struct ggml_tensor * op, int gpu_cores) {
-    static const bool env = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_FUSED"); return !(e && e[0] == '0'); }();
-    static const int  p_env = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_FUSED_P"); return e ? atoi(e) : 0; }();
-    if (!env || op->src[0]->ne[1] != 1 || !ggml_metal_op_dragon_moe_merged(op)) {
+    static const bool enabled = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_FUSED"); return !(e && atoi(e) == 0); }();
+    if (!enabled || gpu_cores <= 0 || op->src[0]->ne[1] != 1 || !ggml_metal_op_dragon_moe_merged(op)) {
         return 0;
     }
     const ggml_type t = op->src[1]->type;
@@ -206,7 +161,7 @@ int ggml_metal_op_dragon_moe_fused_ntg(const struct ggml_tensor * op, int gpu_co
     const int64_t n_ff_sh  = op->src[7]->ne[1];
     const int64_t k        = ggml_get_op_params_i32(op, 0);
     const int64_t R        = k*ggml_metal_op_dragon_moe_msplit(op);
-    if (n_lat > 1024 || n_embd > 2048 || (n_embd/128) % 2 != 0 || (n_lat + n_expert) % 4 != 0) {
+    if (n_lat > GGML_METAL_DMOE_F_MAX_LAT || n_embd > GGML_METAL_DMOE_F_MAX_EMBD || (n_embd/128) % 2 != 0 || (n_lat + n_expert) % 4 != 0) {
         return 0;
     }
     // needed: rows of [W_ld | W_r] 4 per threadgroup, W_lu rows 16 per threadgroup, one shared-expert threadgroup
@@ -214,16 +169,15 @@ int ggml_metal_op_dragon_moe_fused_ntg(const struct ggml_tensor * op, int gpu_co
     const int64_t need = std::max<int64_t>({ (n_lat + n_expert)/4, (n_embd + 15)/16, R + 1 });
     const int64_t want = R + n_ff_sh/ggml_metal_op_dragon_moe_sh_rows(op);
     const int64_t cap  = 3*(int64_t) gpu_cores;
-    const int64_t P    = p_env > 0 ? std::max<int64_t>(need, p_env) : std::min(want, cap);
-    if (P < need || (p_env <= 0 && gpu_cores <= 0)) {
+    const int64_t P    = std::min(want, cap);
+    if (P < need) {
         return 0;
     }
     return (int) P;
 }
 
 bool ggml_metal_op_dragon_moe_sh_split(const struct ggml_tensor * op) {
-    static const int max_t = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_SH_SPLIT_T"); return e ? atoi(e) : 2; }();
-    return op->src[0]->ne[1] <= max_t;
+    return op->src[0]->ne[1] <= 2;
 }
 
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
@@ -232,7 +186,7 @@ bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgr
 
     return !ggml_is_transposed(op->src[0]) &&
            !ggml_is_transposed(op->src[1]) &&
-           has_simdgroup_mm && ne00 >= 64 && ne11 > ggml_metal_op_mul_mat_mm_min();
+           has_simdgroup_mm && ne00 >= 64 && ne11 > 8;
 }
 
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {

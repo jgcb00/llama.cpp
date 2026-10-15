@@ -1,9 +1,7 @@
-#include <cstdlib>
 #include "ggml-metal-fusion.h"
 
 #include "ggml-backend-impl.h"
 #include "ggml-metal-device.h"
-#include "ggml-metal-common.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -271,71 +269,6 @@ static bool ggml_metal_fusion_check_gdn_cache(
     return true;
 }
 
-// MAMBA3_MIMO + CPY: the trailing cpy scatters the new packed state (the tail of the op result)
-// into the recurrent cache, so the kernels write it straight to the cache and the cpy is elided.
-// same structure as the gdn + cache cpy fusion above: the op output has other consumers (the y
-// view), so the structural checks live entirely in this callback (unsafe = true)
-// DRAGON_DIFF_GATE + DRAGON_MMV with one weight, decode path of the GEMV (x read from memory, not staged): the
-// gate output is consumed by the GEMV only and not materialized
-static bool ggml_metal_fusion_check_diff_gate_mmv(
-        const ggml_metal_fusion      * fusion,
-        const ggml_tensor * const    * nodes,
-        const ggml_cgraph            * gf,
-        const int                    * node_idxs,
-              int                      idx,
-              ggml_metal_fusion_mode    mode) {
-    GGML_UNUSED(fusion);
-    GGML_UNUSED(mode);
-
-    // GGML_METAL_DRAGON_DIFF_GATE_FUSE=0 disables this fusion
-    static const bool enabled = [] { const char * e = getenv("GGML_METAL_DRAGON_DIFF_GATE_FUSE"); return !(e && e[0] == '0'); }();
-    if (!enabled) {
-        return false;
-    }
-
-    const ggml_tensor * dg  = nodes[0];
-    const ggml_tensor * mmv = nodes[1];
-
-    if (mmv->src[0] != dg || mmv->src[2] != nullptr || (dg->flags & GGML_TENSOR_FLAG_OUTPUT) ||
-        ggml_metal_op_dragon_mmv_staged(mmv) || ggml_metal_op_dragon_mmv_ks()) {
-        return false;
-    }
-    const int nr = ggml_metal_op_dragon_mmv_nr();
-    const int u  = ggml_metal_op_dragon_mmv_u();
-    if (u != 2 && u != 4) {
-        GGML_UNUSED(nr);
-        return false;
-    }
-
-    const ggml_tensor * attn = dg->src[0];
-    const ggml_tensor * lam  = dg->src[1];
-    const ggml_tensor * gs   = dg->src[2];
-    const int64_t Dh = attn->ne[0];
-    if (Dh % 4 != 0 || attn->nb[0] != sizeof(float) || attn->nb[1] != Dh*sizeof(float) ||
-        attn->nb[2] != attn->ne[1]*Dh*sizeof(float) || lam->nb[0] != sizeof(float) || gs->nb[0] != sizeof(float)) {
-        return false;
-    }
-
-    // no other reader of the gate output
-    const int i_dg = node_idxs[idx];
-    for (int i = i_dg + 1; i < gf->n_nodes; ++i) {
-        const ggml_tensor * n = gf->nodes[i];
-        if (n == mmv) {
-            continue;
-        }
-        if (n->view_src == dg) {
-            return false;
-        }
-        for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            if (n->src[j] == dg) {
-                return false;
-            }
-        }
-    }
-
-    return true;
-}
-
 // DRAGON_TPA_PREP + CPY (pre-shift last K/V -> recurrent cache) + SET_ROWS (K -> KV cache) + SET_ROWS (V -> KV cache),
 // decode only (one token per sequence: the kernel reads the previous K/V of a sequence from the recurrent cache row it
 // then overwrites, in the same thread)
@@ -350,12 +283,6 @@ static bool ggml_metal_fusion_check_tpa_prep_cache(
     GGML_UNUSED(gf);
     GGML_UNUSED(node_idxs);
     GGML_UNUSED(idx);
-
-    // GGML_METAL_DRAGON_TPA_CACHE_FUSE=0 disables this fusion
-    static const bool enabled = [] { const char * e = getenv("GGML_METAL_DRAGON_TPA_CACHE_FUSE"); return !(e && e[0] == '0'); }();
-    if (!enabled) {
-        return false;
-    }
 
     const ggml_tensor * prep = nodes[0];
     const ggml_tensor * cpy  = nodes[1];
@@ -428,6 +355,10 @@ static bool ggml_metal_fusion_check_tpa_prep_cache(
     return has_k && has_v;
 }
 
+// MAMBA3_MIMO + CPY: the trailing cpy scatters the new packed state (the tail of the op result)
+// into the recurrent cache, so the kernels write it straight to the cache and the cpy is elided.
+// same structure as the gdn + cache cpy fusion above: the op output has other consumers (the y
+// view), so the structural checks live entirely in this callback (unsafe = true)
 static bool ggml_metal_fusion_check_mamba3_cache(
         const ggml_metal_fusion      * fusion,
         const ggml_tensor * const    * nodes,
@@ -862,7 +793,6 @@ static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_O
 static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 
 static const std::vector<ggml_op> ops_mamba3_cache = { GGML_OP_MAMBA3_MIMO, GGML_OP_CPY };
-static const std::vector<ggml_op> ops_diff_gate_mmv = { GGML_OP_DRAGON_DIFF_GATE, GGML_OP_DRAGON_MMV };
 static const std::vector<ggml_op> ops_tpa_prep_cache = { GGML_OP_DRAGON_TPA_PREP, GGML_OP_CPY, GGML_OP_SET_ROWS, GGML_OP_SET_ROWS };
 
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
@@ -911,7 +841,6 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_SNAKE,          ops_snake,                  {},     false, ggml_metal_fusion_check_snake },
     { GGML_METAL_FUSION_GDN_CACHE,      ops_gdn_cache,              {},     true,  ggml_metal_fusion_check_gdn_cache },
     { GGML_METAL_FUSION_MAMBA3_CACHE,   ops_mamba3_cache,           {},     true,  ggml_metal_fusion_check_mamba3_cache },
-    { GGML_METAL_FUSION_DIFF_GATE_MMV,  ops_diff_gate_mmv,          {},     true,  ggml_metal_fusion_check_diff_gate_mmv },
     { GGML_METAL_FUSION_TPA_PREP_CACHE, ops_tpa_prep_cache,         {},     true,  ggml_metal_fusion_check_tpa_prep_cache },
     { GGML_METAL_FUSION_TOPK_MOE,       ops_topk_moe,               {1},    true,  ggml_metal_fusion_check_topk_moe },
     { GGML_METAL_FUSION_TOPK_MOE,       ops_topk_moe_scale,         {1},    true,  ggml_metal_fusion_check_topk_moe },

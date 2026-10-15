@@ -72,16 +72,9 @@ static thread_local bool dragon_layer_cpu = true;
 // the layer runs on the Metal backend, which implements GGML_OP_DRAGON_MOE (3 dispatches)
 static thread_local bool dragon_layer_metal = false;
 
-// DRAGON_METAL_FUSED_MOE=0 keeps the graph path (build_moe_ffn) on Metal; the fused op is
-// a decode kernel, so ubatches above DRAGON_METAL_MOE_MAX_T tokens (default 32) use the graph path
-static bool dragon_metal_fused_moe_enabled() {
-    static const bool v = [] { const char * e = std::getenv("DRAGON_METAL_FUSED_MOE"); return !(e && e[0] == '0'); }();
-    return v;
-}
-static int64_t dragon_metal_moe_max_tokens() {
-    static const int64_t v = [] { const char * e = std::getenv("DRAGON_METAL_MOE_MAX_T"); return e ? std::max<int64_t>(0, std::atoll(e)) : (int64_t) 32; }();
-    return v;
-}
+// the Metal Dragon kernels (fused MoE, TPA prep) are decode kernels: ubatches above this many tokens use the graph path
+// (DRAGON_NO_FUSED_MOE forces the graph path for the MoE)
+static constexpr int64_t DRAGON_METAL_MAX_TOKENS = 32;
 
 static ggml_tensor * f32c_static(ggml_context * ctx, ggml_tensor * t) {
     return t->type == GGML_TYPE_F32 ? t : ggml_cast(ctx, t, GGML_TYPE_F32);
@@ -2954,9 +2947,8 @@ static ggml_tensor * build_dragon_m_mixer_real(
     const bool state_inplace = inplace_env_ok && !dragon_use_ggml_op() && dragon_state_mode() == DRAGON_STATE_F32;
     // GPU decode (one token per sequence) when every sequence reads its own cache row: the ggml op reads the state
     // straight from the cache rows it then overwrites (the Metal serial kernel loads the whole state of a (head,
-    // sequence) before writing it), no gather copy. DRAGON_GPU_NO_STATE_VIEW=1 restores the gather.
-    static const bool state_view_env = !dragon_env_on("DRAGON_GPU_NO_STATE_VIEW");
-    const bool state_view = !state_inplace && state_view_env && inplace_env_ok && dragon_use_ggml_op() && dragon_layer_metal &&
+    // sequence) before writing it), no gather copy.
+    const bool state_view = !state_inplace && inplace_env_ok && dragon_use_ggml_op() && dragon_layer_metal &&
                             dragon_state_mode() == DRAGON_STATE_F32 && n_tokens == (int64_t) gctx.ubatch.n_seqs &&
                             inp_rs->s_copy_ident;
     ggml_tensor * rs_states = nullptr, * rs_ids = nullptr;
@@ -3443,9 +3435,7 @@ static ggml_tensor * build_dragon_v_mixer(
 
     // Metal: the whole preparation in 3 ops (9 projections in one GEMV, TPA expand + token shift + norms + scalable softmax
     // + lambda + gate in one kernel, differential combine x gate in one kernel); the attention itself stays in build_attn.
-    // DRAGON_METAL_FUSED_TPA=0 restores the graph path.
-    static const bool metal_tpa = [] { const char * e = std::getenv("DRAGON_METAL_FUSED_TPA"); return !(e && e[0] == '0'); }();
-    if (dragon_layer_metal && metal_tpa && layer.attn_shift_k != nullptr && n_tokens <= dragon_metal_moe_max_tokens()) {
+    if (dragon_layer_metal && layer.attn_shift_k != nullptr && n_tokens <= DRAGON_METAL_MAX_TOKENS) {
         const int64_t n_seqs = gctx.ubatch.n_seqs;
         GGML_ASSERT(n_tokens % n_seqs == 0);
 
@@ -3457,8 +3447,7 @@ static ggml_tensor * build_dragon_v_mixer(
         ggml_tensor * states_all = mctx_recr->get_r_l(il);
         // decode with every sequence on its own cache row: read the rows in place (the prep reads them before the
         // cpy below overwrites them), no gather - as the M layers' state view
-        static const bool state_view_env = !dragon_env_on("DRAGON_GPU_NO_STATE_VIEW");
-        const bool shift_in_place = state_view_env && n_tokens == n_seqs && inp_rs->s_copy_ident;
+        const bool shift_in_place = n_tokens == n_seqs && inp_rs->s_copy_ident;
         ggml_tensor * shift_view = shift_in_place
             ? gctx.build_rs(inp_rs, states_all, hparams.n_embd_r(), n_seqs,
                   [&](ggml_context * c, ggml_tensor * states, ggml_tensor * ids) {
@@ -3499,17 +3488,7 @@ static ggml_tensor * build_dragon_v_mixer(
         attn_out = ggml_reshape_3d(ctx, attn_out, head_dim, n_head, n_tokens);
 
         ggml_tensor * y_attn = ggml_dragon_diff_gate(ctx, attn_out, lam, gs);
-        // DRAGON_V_OUT_MMV=1 (experimental, off: slower on M3 Ultra): the output projection as DRAGON_MMV, which the Metal
-        // backend fuses with the gate (gated input computed while the GEMV loads it: one dispatch and one dependency
-        // level less), but this GEMV is latency-bound at K = n_signal*head_dim (~31 us vs ~19 us for mul_mat)
-        static const bool v_out_mmv = dragon_env_on("DRAGON_V_OUT_MMV");
-        ggml_tensor * v_out = nullptr;
-        if (v_out_mmv && n_tokens <= 4 && y_attn->ne[0] % 128 == 0) {
-            ggml_tensor * wl[1] = { layer.wo };
-            v_out = ggml_dragon_mmv(ctx, y_attn, wl, 1);
-        } else {
-            v_out = ggml_mul_mat(ctx, layer.wo, y_attn);
-        }
+        ggml_tensor * v_out  = ggml_mul_mat(ctx, layer.wo, y_attn);
         ggml_set_name(v_out, "v_out_proj");
         return v_out;
     }
@@ -3778,8 +3757,7 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
         // ubatch size (it processes pairs grouped by expert, fine for prefill too)
         const bool lazy_experts = model.can_prefetch.count(model.layers[il].ffn_up_exps) > 0 &&
                                   model.can_prefetch.count(model.layers[il].ffn_down_exps) > 0;
-        const bool metal_moe = dragon_layer_metal && dragon_metal_fused_moe_enabled() && !lazy_experts &&
-            cur->ne[1] <= dragon_metal_moe_max_tokens();
+        const bool metal_moe = dragon_layer_metal && !lazy_experts && cur->ne[1] <= DRAGON_METAL_MAX_TOKENS;
         // (lazy experts on a GPU layer: the CPU fused op too - the only path that pages the experts in and out)
         const bool use_moe_op = (dragon_layer_cpu || metal_moe || lazy_experts) && !force_no_fused_moe && !dragon_dump_dir() &&
             (cur->ne[1] <= dragon_fused_moe_max_tokens() || lazy_experts || metal_moe) &&
