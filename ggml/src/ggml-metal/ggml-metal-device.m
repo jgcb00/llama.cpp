@@ -9,7 +9,10 @@
 #include <Foundation/Foundation.h>
 
 #include <Metal/Metal.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_OSX
 #include <IOKit/IOKitLib.h>
+#endif
 
 #include <stdatomic.h>
 
@@ -1141,9 +1144,10 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 dev->props.has_simdgroup_mm = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
                 dev->props.has_unified_memory = dev->mtl_device.hasUnifiedMemory;
 
+                // GPU core count (the fused Dragon MoE kernel needs all its threadgroups resident; unknown: not used)
                 dev->props.gpu_core_count = 0;
+#if TARGET_OS_OSX
                 {
-                    // GPU core count (the fused Dragon MoE kernel needs all its threadgroups resident)
                     io_service_t svc = IOServiceGetMatchingService(0 /* kIOMainPortDefault, macOS 12+ */, IOServiceMatching("AGXAccelerator"));
                     if (svc) {
                         CFTypeRef v = IORegistryEntryCreateCFProperty(svc, CFSTR("gpu-core-count"), kCFAllocatorDefault, 0);
@@ -1156,6 +1160,7 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                         IOObjectRelease(svc);
                     }
                 }
+#endif
                 dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
                 dev->props.has_bfloat |= [dev->mtl_device supportsFamily:MTLGPUFamilyApple6];
                 if (getenv("GGML_METAL_BF16_DISABLE") != NULL) {

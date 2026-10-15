@@ -143,9 +143,10 @@ bool ggml_metal_op_dragon_moe_merged(const struct ggml_tensor * op) {
 // fused single-dispatch kernel (decode): number of persistent threadgroups, 0 when not usable. All the threadgroups
 // must be resident at once (they wait for each other): at most 3 per GPU core (measured on M3 Ultra: 240 of 80 cores
 // run, 288 do not), so the kernel is not used when the core count is unknown or too small.
-// GGML_METAL_DRAGON_MOE_FUSED=0 disables it.
+// Opt-in (GGML_METAL_DRAGON_MOE_FUSED=1): Metal does not guarantee that the threadgroups of a dispatch are co-resident,
+// and on M3 Ultra it is on par with the 3-dispatch path for Q8_0 (+3% for BF16).
 int ggml_metal_op_dragon_moe_fused_ntg(const struct ggml_tensor * op, int gpu_cores) {
-    static const bool enabled = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_FUSED"); return !(e && atoi(e) == 0); }();
+    static const bool enabled = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_FUSED"); return e && atoi(e) != 0; }();
     if (!enabled || gpu_cores <= 0 || op->src[0]->ne[1] != 1 || !ggml_metal_op_dragon_moe_merged(op)) {
         return 0;
     }

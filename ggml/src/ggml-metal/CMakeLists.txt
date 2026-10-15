@@ -1,7 +1,6 @@
 find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
 find_library(METAL_FRAMEWORK    Metal      REQUIRED)
 find_library(METALKIT_FRAMEWORK MetalKit   REQUIRED)
-find_library(IOKIT_FRAMEWORK    IOKit      REQUIRED)
 
 message(STATUS "Metal framework found")
 
@@ -18,10 +17,15 @@ ggml_add_backend_library(ggml-metal
 
 target_link_libraries(ggml-metal PRIVATE
                       ${FOUNDATION_LIBRARY}
-                      ${IOKIT_FRAMEWORK}
                       ${METAL_FRAMEWORK}
                       ${METALKIT_FRAMEWORK}
                       )
+
+# GPU core count (IOKit, macOS only)
+if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    find_library(IOKIT_FRAMEWORK IOKit REQUIRED)
+    target_link_libraries(ggml-metal PRIVATE ${IOKIT_FRAMEWORK})
+endif()
 
 if (GGML_METAL_NDEBUG)
     add_compile_definitions(GGML_METAL_NDEBUG)

@@ -2495,7 +2495,7 @@ static int ggml_metal_op_dragon_moe_impl(ggml_metal_op_t ctx, int idx, ggml_tens
         if (!fused_failed.load(std::memory_order_relaxed) && ggml_metal_device_sync_buffer_word(ctx->dev, GGML_METAL_DMOE_F_ERR) != 0) {
             if (!fused_failed.exchange(true)) {
                 GGML_LOG_WARN("%s: fused Dragon MoE kernel: threadgroups not all resident, the last results may be wrong; "
-                              "falling back to 3 dispatches (GGML_METAL_DRAGON_MOE_FUSED=0 disables it)\n", __func__);
+                              "falling back to 3 dispatches\n", __func__);
             }
         }
         const int P = fused_failed.load(std::memory_order_relaxed) ? 0 : ggml_metal_op_dragon_moe_fused_ntg(op, ggml_metal_device_get_props(ctx->dev)->gpu_core_count);

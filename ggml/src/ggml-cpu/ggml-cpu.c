@@ -3117,7 +3117,7 @@ struct ggml_cplan ggml_graph_plan(
 #define GGML_PROF_MAX_NAMES 512
 
 struct ggml_prof_entry {
-    char   name[GGML_MAX_NAME];
+    char   name[2*GGML_MAX_NAME]; // "op(node name)"
     double us;
     int64_t n;
 };
@@ -3182,7 +3182,7 @@ static void ggml_prof_node(const struct ggml_tensor * node, int n_nodes, double 
 
     // normalize name: strip trailing "-<digits>" / "_<digits>" so per-layer
     // tensors aggregate ("ffn_moe_out-31" -> "ffn_moe_out")
-    char key[GGML_MAX_NAME];
+    char key[2*GGML_MAX_NAME];
     snprintf(key, sizeof(key), "%s(%s)", ggml_op_name(node->op), node->name);
     size_t len = strlen(key);
     // (length-1 guard: never strip the leading char)
