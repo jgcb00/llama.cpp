@@ -781,9 +781,6 @@ public:
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;
 
-    // RAM budget (MiB) for the data of those tensors that stays resident, -1 = arch default
-    int32_t lazy_cache_mib = -1;
-
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
 

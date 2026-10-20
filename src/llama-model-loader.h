@@ -16,9 +16,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
-// file index -> buffer(s) mapping it (several when the mapped range is split
-// around lazily read tensors, see get_mapping_ranges)
-using llama_buf_map = std::unordered_multimap<uint32_t, ggml_backend_buffer_t>;
+using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
@@ -245,10 +243,6 @@ struct llama_model_loader {
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
-    // same, split into the ranges that do not overlap the lazily read tensors of
-    // the file: a backend buffer over a lazy range would make it resident (Metal
-    // wires whole buffers)
-    std::vector<std::pair<size_t, size_t>> get_mapping_ranges(void ** addr, int idx, ggml_context * ctx) const;
 
     // release a weight's mmap pages
     void unmap_weight(const llama_tensor_weight & w) const;

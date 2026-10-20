@@ -1463,41 +1463,6 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
     }
 }
 
-std::vector<std::pair<size_t, size_t>> llama_model_loader::get_mapping_ranges(void ** addr, int idx, ggml_context * ctx) const {
-    GGML_ASSERT(!mappings.empty());
-    *addr = mappings.at(idx)->addr();
-
-    std::vector<std::pair<size_t, size_t>> ts;
-    for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
-        const auto * weight = get_weight(ggml_get_name(tensor));
-        if (!weight || weight->idx != (uint32_t) idx) {
-            continue;
-        }
-        ts.emplace_back(weight->offs, weight->offs + ggml_nbytes(tensor));
-    }
-    std::sort(ts.begin(), ts.end());
-
-    const auto & lz = lazy.for_file(idx);
-    auto lazy_between = [&](size_t a, size_t b) {
-        for (const auto & r : lz) {
-            if (r.first < b && r.second > a) {
-                return true;
-            }
-        }
-        return false;
-    };
-
-    std::vector<std::pair<size_t, size_t>> res;
-    for (const auto & t : ts) {
-        if (!res.empty() && !lazy_between(res.back().second, t.first)) {
-            res.back().second = std::max(res.back().second, t.second);
-        } else {
-            res.push_back(t);
-        }
-    }
-    return res;
-}
-
 void llama_model_loader::unmap_weight(const llama_tensor_weight & w) const {
     if (!use_mmap) { return; }
     mappings.at(w.idx)->unmap_fragment(w.offs, w.offs + ggml_nbytes(w.tensor));
@@ -1563,9 +1528,7 @@ bool llama_model_loader::load_all_data(
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
         // First determine if the backend supports the necessary features for async uploads.
-        // bufs is a multimap, but without mmap there is one buffer per file and only its type matters here
-        const auto it_buf = bufs.find(0);
-        auto * buf = it_buf != bufs.end() ? it_buf->second : nullptr;
+        auto * buf = bufs.count(0) ? bufs.at(0) : nullptr;
         if (!buf) {
             LLAMA_LOG_DEBUG("%s: no buffer found for async uploads\n", func);
             return nullptr;
@@ -1636,7 +1599,7 @@ bool llama_model_loader::load_all_data(
     if (upload_backend) {
         LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
-            ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.find(0)->second)), // only the type matters (multimap)
+            ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0))),
             ggml_backend_name(upload_backend));
     }
 
@@ -1678,20 +1641,10 @@ bool llama_model_loader::load_all_data(
         if (from_mapping) {
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;
+            if (bufs.count(weight->idx)) {
+                buf_mmap = bufs.at(weight->idx);
+            }
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
-            // the buffer of this file that contains the tensor (one unless split around lazy tensors)
-            const auto [buf_beg, buf_end] = bufs.equal_range(weight->idx);
-            for (auto it = buf_beg; it != buf_end; ++it) {
-                const uint8_t * base = (const uint8_t *) ggml_backend_buffer_get_base(it->second);
-                if (data >= base && data + n_size <= base + ggml_backend_buffer_get_size(it->second)) {
-                    buf_mmap = it->second;
-                    break;
-                }
-            }
-            if (buf_mmap == nullptr && buf_beg != buf_end && cur->data == nullptr) {
-                throw std::runtime_error(format("tensor '%s' is not in any of the mapped buffers of file %u",
-                    ggml_get_name(cur), weight->idx));
-            }
 
             if (check_tensors) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {

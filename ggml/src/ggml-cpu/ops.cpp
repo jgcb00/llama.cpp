@@ -13446,7 +13446,7 @@ static inline size_t dragon_moe_qrow(enum ggml_type wtype, int64_t n) {
 
 struct dragon_moe_ws {
     // shared (bytes from the start of the work buffer)
-    size_t lat, logits, ush, up, dsh, down, ev_ptr, ev_size, ev_n, s_ptr, s_size, s_copy, c_slab, c_rd, c_n, shared;
+    size_t lat, logits, ush, up, dsh, down, ev_ptr, ev_size, ev_n, s_ptr, s_size, shared;
     // per-thread (bytes from the start of the thread's scratch)
     size_t xq_ld, xq_r, xq_sh, latq, upq, ushq, routedq, routed, tmp, sel, wsel, scores, taken, order, cnt, per_thread;
 };
@@ -13468,10 +13468,6 @@ static dragon_moe_ws dragon_moe_layout(const ggml_tensor * op) {
     w.ev_n    = take(sizeof(int32_t));
     w.s_ptr   = take(2*d.n_expert*sizeof(const char *));          // up/down slabs of the selected experts
     w.s_size  = take(2*d.n_expert*sizeof(size_t));
-    w.s_copy  = take(2*d.n_expert*sizeof(const char *));          // expert cache: their copies
-    w.c_slab  = take(2*d.n_expert*sizeof(const char *));          // expert cache: copy of each up/down slab
-    w.c_rd    = take(2*d.n_expert*sizeof(dragon_pager_read));     // expert cache: reads to do
-    w.c_n     = take(sizeof(int32_t));                            // number of reads, -1 = cache not usable
     w.shared = off;
     off = 0;
     w.xq_ld   = take(T*dragon_moe_qrow(op->src[1]->type, d.n_embd));
@@ -13681,9 +13677,6 @@ static void ggml_compute_forward_dragon_moe_f32(
 
     // low-memory mode: >= 0 = expert weights paged from disk, budget in MiB
     const int32_t cache_mib = ggml_get_op_params_i32(dst, 2);
-    // the experts are read from the explicit cache (c_slab) this call
-    bool cached = false;
-    const char * const * c_slab = (const char * const *) (shared + ws.c_slab);
 
     const size_t qs_ld = dragon_moe_qrow(W_ld->type,   d.n_embd);
     const size_t qs_r  = dragon_moe_qrow(W_r->type,    d.n_embd);
@@ -13775,64 +13768,11 @@ static void ggml_compute_forward_dragon_moe_f32(
             order[cnt[sel[p]]++] = (int32_t) p;
         }
 
-        // low-memory mode, explicit expert cache: thread 0 resolves the selected
-        // slabs to their copies in the cache (pinned until the end of stage C),
-        // then every thread reads a share of the misses (in 128 KiB pieces, so
-        // the SSD sees many requests at once)
-        if (cache_mib >= 0 && dragon_pager_cache_enabled()) {
-            const char ** c_slab_w = (const char **) (shared + ws.c_slab);
-            dragon_pager_read * c_rd = (dragon_pager_read *) (shared + ws.c_rd);
-            int32_t * c_n = (int32_t *) (shared + ws.c_n);
-            if (ith == 0) {
-                for (int64_t e = 0; e < d.n_expert; ++e) {
-                    taken[e] = 0;
-                }
-                for (int64_t p = 0; p < T*k; ++p) {
-                    taken[sel[p]] = 1;
-                }
-                const char ** ptrs   = (const char **) (shared + ws.s_ptr);
-                size_t      * sizes  = (size_t *)      (shared + ws.s_size);
-                const char ** copies = (const char **) (shared + ws.s_copy);
-                const int n = dragon_moe_slabs(W_up, W_down, taken, d.n_expert, ptrs, sizes);
-                int n_rd = 0;
-                if (dragon_pager_cache_get(ptrs, sizes, n, dragon_moe_budget(cache_mib), copies, c_rd, &n_rd)) {
-                    // slabs are listed up then down, each in expert order
-                    int j = 0;
-                    for (int w = 0; w < 2; ++w) {
-                        for (int64_t e = 0; e < d.n_expert; ++e) {
-                            c_slab_w[w*d.n_expert + e] = taken[e] ? copies[j++] : nullptr;
-                        }
-                    }
-                    *c_n = n_rd;
-                } else {
-                    *c_n = -1;
-                }
-            }
-            ggml_barrier(params->threadpool);
-            if (*c_n >= 0) {
-                cached = true;
-                const size_t piece = 128*1024;
-                int64_t idx = 0;
-                for (int32_t j = 0; j < *c_n; ++j) {
-                    for (size_t o = 0; o < c_rd[j].n; o += piece, ++idx) {
-                        if (idx % nth == ith) {
-                            dragon_pager_cache_read(c_rd[j], o, std::min(piece, c_rd[j].n - o));
-                        }
-                    }
-                }
-                // also the slabs another op (context) is reading
-                if (ith == 0) {
-                    dragon_pager_cache_wait(c_slab, (int) (2*d.n_expert));
-                }
-                ggml_barrier(params->threadpool);
-            }
-        }
-
         // low-memory mode, paging the mapping: every thread starts the reads of
         // the expert rows it will compute (up now, down in stage C), so the
         // requests go out in parallel and the shared expert below runs while
         // they are in flight
-        if (cache_mib >= 0 && !cached) {
+        if (cache_mib >= 0) {
             for (int w = 0; w < 2; ++w) {
                 const ggml_tensor * Wx = w == 0 ? W_up : W_down;
                 const int64_t n_r = w == 0 ? d.n_ff : d.n_lat;
@@ -13892,10 +13832,10 @@ static void ggml_compute_forward_dragon_moe_f32(
                 const int64_t r0   = i % d.n_ff;
                 const int64_t r1   = std::min<int64_t>(d.n_ff, r0 + (b - i));
                 const int32_t e    = sel[pair];
-                if (cache_mib >= 0 && !cached) {
+                if (cache_mib >= 0) {
                     pop.rows(W_up, e, r0, r1);
                 }
-                const char * wbase = cached ? c_slab[e] : (const char *) W_up->data + (size_t) e*W_up->nb[2];
+                const char * wbase = (const char *) W_up->data + (size_t) e*W_up->nb[2];
                 const char * xq    = latq + t*qs_up;
                 float * out = up + pair*d.n_ff;
                 for (int64_t r = r0; r < r1; ++r) {
@@ -13919,7 +13859,7 @@ static void ggml_compute_forward_dragon_moe_f32(
             const int64_t pair = order[i/d.n_lat];
             const int64_t r0 = i % d.n_lat;
             const int64_t r1 = std::min<int64_t>(d.n_lat, r0 + (b - i));
-            if (cache_mib >= 0 && !cached) {
+            if (cache_mib >= 0) {
                 pop.rows(W_down, sel[pair], r0, r1);
             }
             if (pair != last_pair) {
@@ -13930,7 +13870,7 @@ static void ggml_compute_forward_dragon_moe_f32(
                 last_pair = pair;
             }
             const int32_t e = sel[pair];
-            const char * wbase = cached ? c_slab[d.n_expert + e] : (const char *) W_down->data + (size_t) e*W_down->nb[2];
+            const char * wbase = (const char *) W_down->data + (size_t) e*W_down->nb[2];
             const char * xq    = upq + pair*qs_dn;
             float * out = down + pair*d.n_lat;
             for (int64_t r = r0; r < r1; ++r) {
@@ -13941,11 +13881,6 @@ static void ggml_compute_forward_dragon_moe_f32(
         }
     }
     ggml_barrier(params->threadpool);
-
-    // explicit expert cache: no thread reads the copies past this point
-    if (cached && ith == 0) {
-        dragon_pager_cache_release(c_slab, (int) (2*d.n_expert));
-    }
 
     // ---- stage D: weighted reduce (redundant per thread), latent up + shared
     {
@@ -13985,7 +13920,7 @@ static void ggml_compute_forward_dragon_moe_f32(
     // barrier. Thread 0 updates the LRU of resident slabs (taken[] still holds
     // the experts of this call, see stage B) and publishes the slabs to drop;
     // all threads then release a share of them. (Explicit cache: released above.)
-    if (cache_mib >= 0 && !cached) {
+    if (cache_mib >= 0) {
         const char ** ev_ptr  = (const char **) (shared + ws.ev_ptr);
         size_t      * ev_size = (size_t *)      (shared + ws.ev_size);
         int32_t     * ev_n    = (int32_t *)     (shared + ws.ev_n);

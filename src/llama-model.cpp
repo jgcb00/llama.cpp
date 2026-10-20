@@ -1277,7 +1277,6 @@ void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model)
 }
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
-    lazy_cache_mib = params.lazy_cache_mib;
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.
@@ -1862,26 +1861,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 //     then we could just use metal for all layers
                 // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
                 void * addr = nullptr;
-                std::vector<std::pair<size_t, size_t>> ranges;
-                if (ml.lazy.any() && !ctx_key.lazy) {
-                    // skip the lazily read tensors in between (e.g. the experts of each layer)
-                    ranges = ml.get_mapping_ranges(&addr, idx, ctx);
-                } else {
-                    size_t first, last; // NOLINT
-                    ml.get_mapping_range(&first, &last, &addr, idx, ctx);
-                    if (first < last) {
-                        ranges.emplace_back(first, last);
-                    }
+                size_t first, last; // NOLINT
+                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
+                if (first >= last) {
+                    continue;
                 }
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
-                for (const auto & [first, last] : ranges) {
-                    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
-                    if (buf == nullptr) {
-                        throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
-                    }
-                    bufs.emplace_back(buf);
-                    buf_map.emplace(idx, buf);
+                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
+                if (buf == nullptr) {
+                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }
+                bufs.emplace_back(buf);
+                buf_map.emplace(idx, buf);
             }
         } else {
             ggml_backend_buffer_t buf;
@@ -2992,7 +2983,6 @@ llama_model_params llama_model_default_params() {
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
-        /*.lazy_cache_mib              =*/ -1,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
         /*.progress_callback           =*/ nullptr,
