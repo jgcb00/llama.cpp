@@ -71,6 +71,7 @@ static bool dragon_state_bf16() { return dragon_state_mode() != DRAGON_STATE_F32
 static thread_local bool dragon_layer_cpu = true;
 // the layer runs on the Metal backend, which implements GGML_OP_DRAGON_MOE (3 dispatches)
 static thread_local bool dragon_layer_metal = false;
+static thread_local ggml_backend_dev_t dragon_layer_dev = nullptr;
 
 // the Metal Dragon kernels (fused MoE, TPA prep) are decode kernels: ubatches above this many tokens use the graph path
 // (DRAGON_NO_FUSED_MOE forces the graph path for the MoE)
@@ -3717,6 +3718,7 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
     for (int il = 0; il < n_layer; ++il) {
         {
             ggml_backend_dev_t dev = model.dev_layer(il);
+            dragon_layer_dev = dev;
             static const bool force_portable = dragon_env_on("DRAGON_PORTABLE");
             dragon_layer_cpu = !force_portable &&
                 (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -3767,10 +3769,11 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
             !dragon_tensor_repacked(model.layers[il].ffn_latent_up) &&
             !dragon_tensor_repacked(model.layers[il].ffn_up_shexp) &&
             !dragon_tensor_repacked(model.layers[il].ffn_down_shexp);
+        ggml_tensor * moe_op = nullptr;
         if (use_moe_op) {
             // Whole MoE block (latent down, router, top-k, experts, latent up,
             // shared expert, sum) as one CPU op: 3 barriers instead of ~14 nodes.
-            y_mlp = ggml_dragon_moe(ctx0, cur,
+            moe_op = ggml_dragon_moe(ctx0, cur,
                     model.layers[il].ffn_latent_down,
                     model.layers[il].ffn_gate_inp,
                     model.layers[il].ffn_exp_probs_b,
@@ -3781,6 +3784,14 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
                     model.layers[il].ffn_down_shexp,
                     (int) n_expert_used, hparams.expert_weights_scale,
                     lazy_experts ? dragon_expert_cache_mib(model) : -1);
+            // a Metal layer whose weights the Metal kernels cannot read (e.g. Q5_K experts) takes the graph path below:
+            // the op would otherwise fall back to the CPU, one round trip per layer
+            if (metal_moe && !lazy_experts && !ggml_backend_dev_supports_op(dragon_layer_dev, moe_op)) {
+                moe_op = nullptr;
+            }
+        }
+        if (moe_op) {
+            y_mlp = moe_op;
             cb(y_mlp, "mlp_out", il);
         } else {
             // n_embd → moe_latent_size bottleneck before the routed experts.

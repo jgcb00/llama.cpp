@@ -814,7 +814,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_moe(ggml_
     const int32_t msplit = ggml_metal_op_dragon_moe_msplit(op);
     const int32_t nf    = msplit > 0 ? (int32_t) (op->src[4]->ne[1]/msplit/4) : 1;
 
-    snprintf(base, 256, "kernel_dragon_moe_%s_%s", kname, ggml_type_name(w->type));
+    const int           is = ggml_metal_op_dragon_moe_sh_src(which);
+    const ggml_tensor * ws = is >= 0 ? op->src[is] : w;
+    const bool m_mixed = which == 4 && (op->src[5]->type != w->type || op->src[7]->type != w->type || op->src[8]->type != w->type);
+    if (m_mixed) {
+        snprintf(base, 256, "kernel_dragon_moe_m_%s_%s_%s_%s", ggml_type_name(w->type), ggml_type_name(op->src[5]->type),
+                 ggml_type_name(op->src[7]->type), ggml_type_name(op->src[8]->type));
+    } else if (ws->type == w->type) {
+        snprintf(base, 256, "kernel_dragon_moe_%s_%s", kname, ggml_type_name(w->type));
+    } else {
+        snprintf(base, 256, "kernel_dragon_moe_%s_%s_%s", kname, ggml_type_name(w->type), ggml_type_name(ws->type));
+    }
     snprintf(name, 256, "%s_e%d_l%d_f%d_s%d_m%d", base, nch_e, nch_l, nch_f, nch_s, nf);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

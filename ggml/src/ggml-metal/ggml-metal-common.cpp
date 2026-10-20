@@ -135,8 +135,15 @@ int ggml_metal_op_dragon_moe_sh_rows(const struct ggml_tensor * op) {
 
 // kernel m replaces b1 and b2 for up to 2 tokens
 bool ggml_metal_op_dragon_moe_merged(const struct ggml_tensor * op) {
-    // kernel m reads W_up, W_down, W_us and W_ds with one weight type
-    const bool same_type = op->src[4]->type == op->src[7]->type && op->src[4]->type == op->src[8]->type;
+    // kernel m reads W_up, W_down, W_us and W_ds with one weight type, or Q8_0 W_up / W_us with a Q8_0 / Q6_K W_down
+    // and a Q8_0 / BF16 W_ds (the instantiations in mamba3.metal)
+    const ggml_type t  = op->src[4]->type;
+    const ggml_type td = op->src[5]->type;
+    const ggml_type tds = op->src[8]->type;
+    const bool uniform = td == t && op->src[7]->type == t && tds == t;
+    const bool q8_mix  = t == GGML_TYPE_Q8_0 && op->src[7]->type == GGML_TYPE_Q8_0 &&
+                         (td == GGML_TYPE_Q8_0 || td == GGML_TYPE_Q6_K) && (tds == GGML_TYPE_Q8_0 || tds == GGML_TYPE_BF16);
+    const bool same_type = uniform || q8_mix;
     return same_type && op->src[0]->ne[1] <= 2 && ggml_metal_op_dragon_moe_msplit(op) > 0 && ggml_metal_op_dragon_moe_sh_rows(op) > 0;
 }
 
@@ -175,6 +182,41 @@ int ggml_metal_op_dragon_moe_fused_ntg(const struct ggml_tensor * op, int gpu_co
         return 0;
     }
     return (int) P;
+}
+
+int ggml_metal_op_dragon_moe_sh_src(int which) {
+    switch (which) {
+        case 0: return 7; // a : W_ld | W_us
+        case 1: return 7; // b1: W_up | W_us (sh_split)
+        case 2: return 8; // b2: W_down | W_ds (sh_split)
+        case 3: return 8; // c : W_lu | W_ds
+        default: return -1;
+    }
+}
+
+// weight types of kernels a, b1, b2 and c (routed-path weight, shared-expert weight), as instantiated in mamba3.metal:
+// one type among F32 / F16 / BF16 / Q8_0, or Q8_0 with BF16 (either way), or Q6_K W_down with a Q8_0 / BF16 W_ds
+bool ggml_metal_op_dragon_moe_types_ok(const struct ggml_tensor * op, bool has_bfloat) {
+    static const int routed[4] = { 1, 4, 5, 6 };
+    for (int which = 0; which < 4; ++which) {
+        const ggml_type tw = op->src[routed[which]]->type;
+        const ggml_type ts = op->src[ggml_metal_op_dragon_moe_sh_src(which)]->type;
+        if ((tw == GGML_TYPE_BF16 || ts == GGML_TYPE_BF16) && !has_bfloat) {
+            return false;
+        }
+        if (tw == ts) {
+            if (tw != GGML_TYPE_F32 && tw != GGML_TYPE_F16 && tw != GGML_TYPE_BF16 && tw != GGML_TYPE_Q8_0) {
+                return false;
+            }
+            continue;
+        }
+        const bool q8_bf16 = (tw == GGML_TYPE_Q8_0 && ts == GGML_TYPE_BF16) || (tw == GGML_TYPE_BF16 && ts == GGML_TYPE_Q8_0);
+        const bool q6_down = which == 2 && tw == GGML_TYPE_Q6_K && (ts == GGML_TYPE_Q8_0 || ts == GGML_TYPE_BF16);
+        if (!q8_bf16 && !q6_down) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool ggml_metal_op_dragon_moe_sh_split(const struct ggml_tensor * op) {
