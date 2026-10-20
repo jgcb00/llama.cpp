@@ -72,6 +72,7 @@ static bool olala_state_bf16() { return olala_state_mode() != OLALA_STATE_F32; }
 static thread_local bool olala_layer_cpu = true;
 // the layer runs on the Metal backend, which implements GGML_OP_OLALA_MOE (3 dispatches)
 static thread_local bool olala_layer_metal = false;
+static thread_local ggml_backend_dev_t olala_layer_dev = nullptr;
 
 // the Metal Olala kernels (fused MoE, TPA prep) are decode kernels: ubatches above this many tokens use the graph path
 // (OLALA_NO_FUSED_MOE forces the graph path for the MoE)
@@ -3820,6 +3821,7 @@ llama_model_olala::graph::graph(const llama_model & model, const llm_graph_param
     for (int il = 0; il < n_layer; ++il) {
         {
             ggml_backend_dev_t dev = model.dev_layer(il);
+            olala_layer_dev = dev;
             static const bool force_portable = olala_env_on("OLALA_PORTABLE");
             olala_layer_cpu = !force_portable &&
                 (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -3870,10 +3872,11 @@ llama_model_olala::graph::graph(const llama_model & model, const llm_graph_param
             !olala_tensor_repacked(model.layers[il].ffn_latent_up) &&
             !olala_tensor_repacked(model.layers[il].ffn_up_shexp) &&
             !olala_tensor_repacked(model.layers[il].ffn_down_shexp);
+        ggml_tensor * moe_op = nullptr;
         if (use_moe_op) {
             // Whole MoE block (latent down, router, top-k, experts, latent up,
             // shared expert, sum) as one CPU op: 3 barriers instead of ~14 nodes.
-            y_mlp = ggml_olala_moe(ctx0, cur,
+            moe_op = ggml_olala_moe(ctx0, cur,
                     model.layers[il].ffn_latent_down,
                     model.layers[il].ffn_gate_inp,
                     model.layers[il].ffn_exp_probs_b,
@@ -3884,6 +3887,14 @@ llama_model_olala::graph::graph(const llama_model & model, const llm_graph_param
                     model.layers[il].ffn_down_shexp,
                     (int) n_expert_used, hparams.expert_weights_scale,
                     lazy_experts ? olala_expert_cache_mib(model) : -1);
+            // a Metal layer whose weights the Metal kernels cannot read (e.g. Q5_K experts) takes the graph path below:
+            // the op would otherwise fall back to the CPU, one round trip per layer
+            if (metal_moe && !lazy_experts && !ggml_backend_dev_supports_op(olala_layer_dev, moe_op)) {
+                moe_op = nullptr;
+            }
+        }
+        if (moe_op) {
+            y_mlp = moe_op;
             cb(y_mlp, "mlp_out", il);
         } else {
             // n_embd → moe_latent_size bottleneck before the routed experts.

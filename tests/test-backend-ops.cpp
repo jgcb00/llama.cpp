@@ -5046,9 +5046,11 @@ struct test_olala_moe : public test_case {
     const float   w_scale;
     const int     geo; // bits: 1: followed by GGML_OP_GEODESIC(x2, moe), 2: input = GGML_OP_GEODESIC(x0, g),
                        // 4: followed by GGML_OP_GEODESIC(input, moe) as in the model (the Metal backend fuses them for small batches)
+    const bool    safe2; // q8_0-safe2 layout: Q6_K W_down, BF16 W_lu and W_ds, type_w for the others
 
     std::string vars() override {
-        return VARS_TO_STR9(type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale) + (geo ? ",geo=" + std::to_string(geo) : "");
+        return VARS_TO_STR9(type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale) + (geo ? ",geo=" + std::to_string(geo) : "") +
+               (safe2 ? ",safe2=1" : "");
     }
 
     double max_nmse_err() override {
@@ -5056,8 +5058,9 @@ struct test_olala_moe : public test_case {
     }
 
     test_olala_moe(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 1536, int64_t n_tok = 1, int64_t n_lat = 384,
-            int64_t n_expert = 256, int64_t n_ff = 768, int64_t n_ff_sh = 1536, int k = 6, float w_scale = 2.45f, int geo = 0)
-        : type_w(type_w), n_embd(n_embd), n_tok(n_tok), n_lat(n_lat), n_expert(n_expert), n_ff(n_ff), n_ff_sh(n_ff_sh), k(k), w_scale(w_scale), geo(geo) {}
+            int64_t n_expert = 256, int64_t n_ff = 768, int64_t n_ff_sh = 1536, int k = 6, float w_scale = 2.45f, int geo = 0, bool safe2 = false)
+        : type_w(type_w), n_embd(n_embd), n_tok(n_tok), n_lat(n_lat), n_expert(n_expert), n_ff(n_ff), n_ff_sh(n_ff_sh), k(k), w_scale(w_scale), geo(geo),
+          safe2(safe2) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
@@ -5071,10 +5074,12 @@ struct test_olala_moe : public test_case {
         ggml_tensor * w_r    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_expert);
         ggml_tensor * bias   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
         ggml_tensor * w_up   = ggml_new_tensor_3d(ctx, type_w,        n_lat, n_ff, n_expert);
-        ggml_tensor * w_down = ggml_new_tensor_3d(ctx, type_w,        n_ff, n_lat, n_expert);
-        ggml_tensor * w_lu   = ggml_new_tensor_2d(ctx, type_w,        n_lat, n_embd);
+        const ggml_type type_dn = safe2 ? GGML_TYPE_Q6_K : type_w;
+        const ggml_type type_bf = safe2 ? GGML_TYPE_BF16 : type_w;
+        ggml_tensor * w_down = ggml_new_tensor_3d(ctx, type_dn,       n_ff, n_lat, n_expert);
+        ggml_tensor * w_lu   = ggml_new_tensor_2d(ctx, type_bf,       n_lat, n_embd);
         ggml_tensor * w_us   = ggml_new_tensor_2d(ctx, type_w,        n_embd, n_ff_sh);
-        ggml_tensor * w_ds   = ggml_new_tensor_2d(ctx, type_w,        n_ff_sh, n_embd);
+        ggml_tensor * w_ds   = ggml_new_tensor_2d(ctx, type_bf,       n_ff_sh, n_embd);
         ggml_tensor * out    = ggml_olala_moe(ctx, x, w_ld, w_r, bias, w_up, w_down, w_lu, w_us, w_ds, k, w_scale, -1);
         if (geo & 4) {
             // as in the model: l_out = GEODESIC(moe input, moe output)
@@ -11861,6 +11866,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  2, 384,  32, 768, 1536, 6, 2.45f, 2)); // Q8_0, 2 tokens
     test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  4, 384,  32, 768, 1536, 6, 2.45f));    // Q8_0, b1/b2 path
     test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536, 19, 384,  32, 768, 1536, 6, 2.45f));    // Q8_0, odd batch
+    // q8_0-safe2 files (Q6_K W_down, BF16 W_lu / W_ds): mixed-type kernels
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 6, true)); // decode as in the model
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  2, 384,  32, 768, 1536, 6, 2.45f, 2, true)); // 2 tokens (sh_split)
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  4, 384,  32, 768, 1536, 6, 2.45f, 0, true)); // b1/b2 path
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  8, 384,  32, 768, 1536, 6, 2.45f, 4, true)); // 8 tokens (-ub 8)
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 0, true)); // Q6_K W_down with BF16 W_ds
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

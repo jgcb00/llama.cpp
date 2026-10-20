@@ -1924,30 +1924,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 if (op->src[0]->type != GGML_TYPE_F32 || op->src[2]->type != GGML_TYPE_F32 || op->src[3]->type != GGML_TYPE_F32) {
                     return false;
                 }
-                // one weight type for all the projections (kernels b1 and b2 read the shared-expert weights with the type of
-                // the routed ones)
-                for (int i = 4; i < 9; ++i) {
-                    if (op->src[i]->type != op->src[1]->type) {
-                        return false;
-                    }
-                }
-                for (int i = 1; i < 9; ++i) {
-                    if (i == 2 || i == 3) {
-                        continue;
-                    }
-                    switch (op->src[i]->type) {
-                        case GGML_TYPE_F32:
-                        case GGML_TYPE_F16:
-                        case GGML_TYPE_Q8_0:
-                            break;
-                        case GGML_TYPE_BF16:
-                            if (!dev->props.has_bfloat) {
-                                return false;
-                            }
-                            break;
-                        default:
-                            return false;
-                    }
+                if (!ggml_metal_op_olala_moe_types_ok(op, dev->props.has_bfloat)) {
+                    return false;
                 }
                 const int64_t n_embd   = op->src[0]->ne[0];
                 const int64_t n_lat    = op->src[1]->ne[1];
