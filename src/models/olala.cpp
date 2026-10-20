@@ -3539,13 +3539,20 @@ static ggml_tensor * build_olala_v_mixer(
 
     // Metal: the whole preparation in 3 ops (9 projections in one GEMV, TPA expand + token shift + norms + scalable softmax
     // + lambda + gate in one kernel, differential combine x gate in one kernel); the attention itself stays in build_attn.
+    ggml_tensor * pr = nullptr;
     if (olala_layer_metal && layer.attn_shift_k != nullptr && n_tokens <= OLALA_METAL_MAX_TOKENS) {
+        ggml_tensor * wlist[9] = { layer.wq, layer.attn_wa_k, layer.attn_wa_v, layer.attn_wb_k, layer.attn_wb_v,
+                                   layer.attn_shift_k, layer.attn_shift_v, layer.attn_lambda, layer.attn_gate };
+        pr = ggml_olala_mmv(ctx, cur, wlist, 9);
+        // weights the Metal kernel cannot read (e.g. mixed types): the portable path below, not a CPU round trip
+        if (!ggml_backend_dev_supports_op(olala_layer_dev, pr)) {
+            pr = nullptr;
+        }
+    }
+    if (pr) {
         const int64_t n_seqs = gctx.ubatch.n_seqs;
         GGML_ASSERT(n_tokens % n_seqs == 0);
 
-        ggml_tensor * wlist[9] = { layer.wq, layer.attn_wa_k, layer.attn_wa_v, layer.attn_wb_k, layer.attn_wb_v,
-                                   layer.attn_shift_k, layer.attn_shift_v, layer.attn_lambda, layer.attn_gate };
-        ggml_tensor * pr = ggml_olala_mmv(ctx, cur, wlist, 9);
         ggml_set_name(pr, "v_proj_fused");
 
         ggml_tensor * states_all = mctx_recr->get_r_l(il);

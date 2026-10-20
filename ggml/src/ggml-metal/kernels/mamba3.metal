@@ -699,10 +699,11 @@ constant int FC_dmoe_nch_s [[function_constant(FC_OLALA_MOE + 3)]];
 constant int FC_dmoe_nf    [[function_constant(FC_OLALA_MOE + 4)]]; // kernel m: float4 per W_down row slice
 
 // weight access of the Olala kernels, by weight type T4: float4 / half4 / bfloat4 (4 elements of the row type),
-// dmoe_q8 for Q8_0 rows (blocks of 32: f16 scale + 32 int8) or dmoe_q6k for Q6_K rows (block_q6_K, 256 elements).
+// dmoe_q8 for Q8_0 rows (blocks of 32: f16 scale + 32 int8), dmoe_q5k / dmoe_q6k for Q5_K / Q6_K rows (256 elements).
 // dmoe_rb: bytes of n elements (n a multiple of the block size: whole rows and block-aligned slices), dmoe_ld:
 // elements e .. e+3 of a row (e a multiple of 4)
 struct dmoe_q8  { char4 v; };
+struct dmoe_q5k { char4 v; };
 struct dmoe_q6k { char4 v; };
 
 template<typename T4>
@@ -714,6 +715,10 @@ inline size_t dmoe_rb<dmoe_q8>(size_t n) {
     return (n/32)*34;
 }
 
+template<>
+inline size_t dmoe_rb<dmoe_q5k>(size_t n) {
+    return (n/256)*176;
+}
 template<>
 inline size_t dmoe_rb<dmoe_q6k>(size_t n) {
     return (n/256)*210;
@@ -729,6 +734,32 @@ inline float4 dmoe_ld<dmoe_q8>(device const char * row, int e) {
     const float d = (float) *(device const half *) b;
     const packed_char4 q = *(device const packed_char4 *) (b + 2 + (e & 31)); // 2-byte aligned
     return float4(q)*d;
+}
+// Q5_K (as dequantize_row_q5_K): element i = 64*g + 32*u + l of a block: low 4 bits in qs[32*g + l] (high nibble when
+// u = 1), 5th bit at bit 2*g + u of qh[l], 6-bit scale / min number 2*g + u (get_scale_min_k4); the 4 elements share g, u
+template<>
+inline float4 dmoe_ld<dmoe_q5k>(device const char * row, int e) {
+    device const uchar * b = (device const uchar *) row + (size_t) (e >> 8)*176;
+    const int i = e & 255;
+    const int j = i >> 5; // 2*g + u
+    const int l = i & 31;
+    device const uchar * sc = b + 4;
+    uchar ls;
+    uchar lm;
+    if (j < 4) {
+        ls = sc[j] & 63;
+        lm = sc[j + 4] & 63;
+    } else {
+        ls = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4);
+        lm = (sc[j + 4] >> 4)  | ((sc[j]     >> 6) << 4);
+    }
+    const uchar4 qs = uchar4(*(device const packed_uchar4 *) (b + 48 + 32*(j >> 1) + l));
+    const uchar4 qh = uchar4(*(device const packed_uchar4 *) (b + 16 + l));
+    const uchar4 lo = (j & 1) ? (qs >> 4) : (qs & (uchar) 0xF);
+    const uchar4 hi = (qh >> (uchar) j) & (uchar) 1;
+    const float  d  = (float) *(device const half *) (b + 0)*(float) ls;
+    const float  m  = (float) *(device const half *) (b + 2)*(float) lm;
+    return float4(lo | (hi << 4))*d - m;
 }
 // Q6_K (as dequantize_row_q6_K): element i = 128*h + 32*q + l of a block: low 4 bits in ql[64*h + 32*(q&1) + l] (high
 // nibble when q >= 2), high 2 bits at bit 2*q of qh[32*h + l], scale scales[8*h + l/16 + 2*q]; the 4 elements share h, q
@@ -2185,6 +2216,17 @@ template [[host_name("kernel_olala_moe_m_q8_0_q8_0_q8_0_bf16")]] kernel kernel_o
 #endif
 template [[host_name("kernel_olala_moe_b2_q6_K_q8_0")]] kernel kernel_olala_moe_b2_t kernel_olala_moe_b2<dmoe_q6k, dmoe_q8>;
 template [[host_name("kernel_olala_moe_m_q8_0_q6_K_q8_0_q8_0")]] kernel kernel_olala_moe_m_t kernel_olala_moe_m<dmoe_q8, dmoe_q6k, dmoe_q8, dmoe_q8>;
+// q5_k_m files with the safe overrides: Q5_K W_ld / W_us, Q8_0 W_up, Q5_K or Q6_K W_down / W_ds (per layer), BF16 W_lu
+template [[host_name("kernel_olala_moe_a_q5_K")]]       kernel kernel_olala_moe_a_t  kernel_olala_moe_a<dmoe_q5k>;
+template [[host_name("kernel_olala_moe_b1_q8_0_q5_K")]] kernel kernel_olala_moe_b1_t kernel_olala_moe_b1<dmoe_q8, dmoe_q5k>;
+template [[host_name("kernel_olala_moe_b2_q5_K")]]      kernel kernel_olala_moe_b2_t kernel_olala_moe_b2<dmoe_q5k>;
+template [[host_name("kernel_olala_moe_b2_q6_K")]]      kernel kernel_olala_moe_b2_t kernel_olala_moe_b2<dmoe_q6k>;
+template [[host_name("kernel_olala_moe_m_q8_0_q5_K_q5_K_q5_K")]] kernel kernel_olala_moe_m_t kernel_olala_moe_m<dmoe_q8, dmoe_q5k, dmoe_q5k, dmoe_q5k>;
+template [[host_name("kernel_olala_moe_m_q8_0_q6_K_q5_K_q6_K")]] kernel kernel_olala_moe_m_t kernel_olala_moe_m<dmoe_q8, dmoe_q6k, dmoe_q5k, dmoe_q6k>;
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_olala_moe_c_bf16_q5_K")]]  kernel kernel_olala_moe_c_t  kernel_olala_moe_c<bfloat4, dmoe_q5k>;
+template [[host_name("kernel_olala_moe_c_bf16_q6_K")]]  kernel kernel_olala_moe_c_t  kernel_olala_moe_c<bfloat4, dmoe_q6k>;
+#endif
 
 
 // ---------------------------------------------------------------------------------------------
@@ -2276,6 +2318,8 @@ template [[host_name("kernel_olala_mmv_f16")]]  kernel kernel_olala_mmv_t kernel
 template [[host_name("kernel_olala_mmv_bf16")]] kernel kernel_olala_mmv_t kernel_olala_mmv<bfloat4, 1, 2>;
 #endif
 template [[host_name("kernel_olala_mmv_q8_0")]] kernel kernel_olala_mmv_t kernel_olala_mmv<dmoe_q8, 1, 2>;
+template [[host_name("kernel_olala_mmv_q5_K")]] kernel kernel_olala_mmv_t kernel_olala_mmv<dmoe_q5k, 1, 2>;
+template [[host_name("kernel_olala_mmv_q6_K")]] kernel kernel_olala_mmv_t kernel_olala_mmv<dmoe_q6k, 1, 2>;
 
 
 // staged variant for larger batches (T > 4): y = concat_i(W_i^T x): one output row per simdgroup, x staged for tb tokens (same scheme as kernel_olala_moe_a)
@@ -2351,6 +2395,8 @@ template [[host_name("kernel_olala_mmv_st_f16")]]  kernel kernel_olala_mmv_st_t 
 template [[host_name("kernel_olala_mmv_st_bf16")]] kernel kernel_olala_mmv_st_t kernel_olala_mmv_st<bfloat4>;
 #endif
 template [[host_name("kernel_olala_mmv_st_q8_0")]] kernel kernel_olala_mmv_st_t kernel_olala_mmv_st<dmoe_q8>;
+template [[host_name("kernel_olala_mmv_st_q5_K")]] kernel kernel_olala_mmv_st_t kernel_olala_mmv_st<dmoe_q5k>;
+template [[host_name("kernel_olala_mmv_st_q6_K")]] kernel kernel_olala_mmv_st_t kernel_olala_mmv_st<dmoe_q6k>;
 
 // one threadgroup per (q head h, token t); the kv head hn = h / (H/Hn) is prepared by the G threadgroups
 // sharing it (only the first writes it). threadgroup memory: [ kk (Dh) | vv (Dh) | red (8) ]
