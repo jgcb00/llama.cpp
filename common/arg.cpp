@@ -1766,6 +1766,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                                    string_format("error: unknown value for --flash-attn: '%s'\n", value.c_str()));
                            }
                        }).set_env("LLAMA_ARG_FLASH_ATTN"));
+    add_opt(common_arg({ "--tpa-cache" }, "[full|factored|auto]",
+                       string_format("KV cache of the TPA attention layers (Dragon): 'full' keeps the expanded K/V, 'factored' the TPA\n"
+                                     "factors (~2.6x less KV memory, more attention compute), 'auto' picks per device (default: '%s')",
+                                     llama_tpa_cache_type_name(params.tpa_cache_type)),
+                       [](common_params & params, const std::string & value) {
+                           if (value == "full") {
+                               params.tpa_cache_type = LLAMA_TPA_CACHE_TYPE_FULL;
+                           } else if (value == "factored") {
+                               params.tpa_cache_type = LLAMA_TPA_CACHE_TYPE_FACTORED;
+                           } else if (is_autoy(value)) {
+                               params.tpa_cache_type = LLAMA_TPA_CACHE_TYPE_AUTO;
+                           } else {
+                               throw std::runtime_error(
+                                   string_format("error: unknown value for --tpa-cache: '%s'\n", value.c_str()));
+                           }
+                       }).set_env("LLAMA_ARG_TPA_CACHE"));
     add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
         "prompt to start generation with; for system message, use -sys",

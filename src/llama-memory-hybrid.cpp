@@ -29,11 +29,12 @@ llama_memory_hybrid::llama_memory_hybrid(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+    const llama_hparams   * attn_hparams) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
-        model.hparams,
+        attn_hparams ? *attn_hparams : model.hparams,
         type_k,
         type_v,
         v_trans,

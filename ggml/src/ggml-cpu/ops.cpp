@@ -14884,12 +14884,16 @@ void ggml_compute_forward_dragon_tpa_prep(const ggml_compute_params * params, gg
     const float eps    = ggml_get_op_params_f32(dst, 6);
     const float wsize  = ggml_get_op_params_f32(dst, 7);
     const float gate_b = ggml_get_op_params_f32(dst, 8);
+    const bool  factored = ggml_get_op_params_i32(dst, 9) != 0;
 
     const int64_t T = pr->ne[1];
     const int64_t n_seq_t = T/n_seqs;
     const int64_t ROW = pr->ne[0];
     const int64_t OAK = (int64_t) H*Dh, OAV = OAK + Hn*R, OBK = OAV + Hn*R, OBV = OBK + R*Dh, OSK = OBV + R*Dh, OSV = OSK + Hn, OLAM = OSV + Hn, OG = OLAM + Hn;
-    const int64_t o_k = T*H*Dh, o_v = o_k + T*Hn*Dh, o_lam = o_v + T*Hn*Dh, o_g = o_lam + T*Hn, o_last = o_g + (int64_t) T*Hs*Dh;
+    // per-token rows of the K / V outputs: expanded (Hn*Dh) or factored (ggml_dragon_tpa_row_k / _v)
+    const int64_t KR = factored ? ggml_dragon_tpa_row_k(Hn, R, Dh) : (int64_t) Hn*Dh;
+    const int64_t VR = factored ? ggml_dragon_tpa_row_v(Hn, R, Dh) : (int64_t) Hn*Dh;
+    const int64_t o_k = T*H*Dh, o_v = o_k + T*KR, o_lam = o_v + T*VR, o_g = o_lam + T*Hn, o_last = o_g + (int64_t) T*Hs*Dh;
 
     const float   * prd  = (const float *) pr->data;
     const int32_t * posd = (const int32_t *) pos->data;
@@ -14954,11 +14958,34 @@ void ggml_compute_forward_dragon_tpa_prep(const ggml_compute_params * params, gg
             for (int d = 0; d < Dh; ++d) {
                 kx[d] = kp[d]*ak + kr[d]*bk;
                 ss += kx[d]*kx[d];
-                out[o_v + (t*Hn + hn)*Dh + d] = vp[d]*av + vr[d]*bv;
+                if (!factored) {
+                    out[o_v + (t*Hn + hn)*Dh + d] = vp[d]*av + vr[d]*bv;
+                }
             }
             const float rs = 1.0f/sqrtf(ss/(float) Dh + eps);
-            for (int d = 0; d < Dh; ++d) {
-                out[o_k + (t*Hn + hn)*Dh + d] = (kx[d]*rs)*kn[d];
+            if (factored) {
+                // the factors of this token (B rows written by the first kv head) and the per-head scalars
+                float * ko = out + o_k + t*KR;
+                float * vo = out + o_v + t*VR;
+                if (hn == 0) {
+                    memcpy(ko, p + OBK, (size_t) R*Dh*sizeof(float));
+                    memcpy(vo, p + OBV, (size_t) R*Dh*sizeof(float));
+                    for (int64_t i = (int64_t) R*Dh + Hn*R + 2*Hn; i < KR; ++i) {
+                        ko[i] = 0.0f;
+                    }
+                    for (int64_t i = (int64_t) R*Dh + Hn*R + Hn; i < VR; ++i) {
+                        vo[i] = 0.0f;
+                    }
+                }
+                memcpy(ko + R*Dh + hn*R, p + OAK + hn*R, R*sizeof(float));
+                memcpy(vo + R*Dh + hn*R, p + OAV + hn*R, R*sizeof(float));
+                ko[R*Dh + Hn*R + hn]      = rs/(float) R;
+                ko[R*Dh + Hn*R + Hn + hn] = ak;
+                vo[R*Dh + Hn*R + hn]      = av;
+            } else {
+                for (int d = 0; d < Dh; ++d) {
+                    out[o_k + (t*Hn + hn)*Dh + d] = (kx[d]*rs)*kn[d];
+                }
             }
         }
         {
@@ -14969,7 +14996,8 @@ void ggml_compute_forward_dragon_tpa_prep(const ggml_compute_params * params, gg
             }
             const float rs = 1.0f/sqrtf(ss/(float) Dh + eps);
             for (int d = 0; d < Dh; ++d) {
-                out[(t*H + h)*Dh + d] = (((q[d]*rs)*qn[d])*lp)*sc[h];
+                // factored: the k_norm weight moves from K to q (q.(w*k) = (q*w).k)
+                out[(t*H + h)*Dh + d] = (((q[d]*rs)*qn[d])*lp)*sc[h]*(factored ? kn[d] : 1.0f);
             }
         }
         if (h == 0) {
@@ -14979,6 +15007,164 @@ void ggml_compute_forward_dragon_tpa_prep(const ggml_compute_params * params, gg
             for (int64_t i = 0; i < (int64_t) Hs*Dh; ++i) {
                 const float g = p[OG + i] + gate_b;
                 out[o_g + t*Hs*Dh + i] = g/(1.0f + expf(-g));
+            }
+        }
+    }
+}
+
+// see ggml_dragon_tpa_attn (ggml.h): reference implementation, one (stream, token, head) row at a time
+void ggml_compute_forward_dragon_tpa_attn(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * prev = dst->src[4];
+
+    const int   Hn      = ggml_get_op_params_i32(dst, 0);
+    const int   R       = ggml_get_op_params_i32(dst, 1);
+    const float scale   = ggml_get_op_params_f32(dst, 2);
+    const float softcap = ggml_get_op_params_f32(dst, 3);
+
+    const int64_t Dh   = q->ne[0];
+    const int64_t H    = q->ne[1];
+    const int64_t T    = q->ne[2];
+    const int64_t ns   = q->ne[3];
+    const int64_t n_kv = k->ne[1];
+    const int64_t G    = H/Hn;
+
+    const bool kf16 = k->type == GGML_TYPE_F16;
+    auto ld = [&](const ggml_tensor * x, int64_t c, int64_t s, int64_t i) -> float {
+        const char * row = (const char *) x->data + c*x->nb[1] + s*x->nb[2];
+        return kf16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) row)[i]) : ((const float *) row)[i];
+    };
+    auto mk = [&](int64_t c, int64_t t, int64_t s) -> float {
+        const char * row = (const char *) mask->data + t*mask->nb[1] + s*mask->nb[3];
+        return mask->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) row)[c]) : ((const float *) row)[c];
+    };
+
+    const int64_t oA = (int64_t) R*Dh, oS = oA + (int64_t) Hn*R; // offsets in a row: A, then the scalars
+
+    float * P  = (float *) params->wdata + ((R + 1)*n_kv + Dh + CACHE_LINE_SIZE_F32)*params->ith; // (n_kv, R): q.B_k
+    float * sc = P + R*n_kv;                                                                       // (n_kv) scores
+    float * o  = sc + n_kv;                                                                        // (Dh)
+
+    const int64_t n_rows = ns*T*H;
+    for (int64_t ir = params->ith; ir < n_rows; ir += params->nth) {
+        const int64_t s = ir/(T*H);
+        const int64_t t = (ir - s*T*H)/H;
+        const int64_t h = ir - s*T*H - t*H;
+        const int64_t g = h/G;
+        const float * qr = (const float *) ((const char *) q->data + h*q->nb[1] + t*q->nb[2] + s*q->nb[3]);
+        const int32_t * pv = (const int32_t *) ((const char *) prev->data + s*prev->nb[1]);
+
+        for (int64_t c = 0; c < n_kv; ++c) {
+            for (int r = 0; r < R; ++r) {
+                float acc = 0.0f;
+                for (int64_t d = 0; d < Dh; ++d) {
+                    acc += qr[d]*ld(k, c, s, r*Dh + d);
+                }
+                P[c*R + r] = acc;
+            }
+        }
+        float mx = -INFINITY;
+        for (int64_t c = 0; c < n_kv; ++c) {
+            const float m = mk(c, t, s);
+            if (m == -INFINITY) {
+                sc[c] = -INFINITY;
+                continue;
+            }
+            const int64_t p = pv[c];
+            const float ak = ld(k, c, s, oS + Hn + g);
+            float cur = 0.0f, prv = 0.0f;
+            for (int r = 0; r < R; ++r) {
+                cur += ld(k, c, s, oA + g*R + r)*P[c*R + r];
+                if (p >= 0) {
+                    prv += ld(k, p, s, oA + g*R + r)*P[p*R + r];
+                }
+            }
+            float x = scale*ld(k, c, s, oS + g)*((1.0f - ak)*cur + ak*prv);
+            if (softcap != 0.0f) {
+                x = softcap*tanhf(x/softcap);
+            }
+            sc[c] = x + m;
+            mx = std::max(mx, sc[c]);
+        }
+        for (int64_t d = 0; d < Dh; ++d) {
+            o[d] = 0.0f;
+        }
+        float sum = 0.0f;
+        if (mx != -INFINITY) {
+            for (int64_t c = 0; c < n_kv; ++c) {
+                if (sc[c] == -INFINITY) {
+                    continue;
+                }
+                const float w = expf(sc[c] - mx);
+                sum += w;
+                const int64_t p = pv[c];
+                const float av = ld(v, c, s, oS + g);
+                for (int r = 0; r < R; ++r) {
+                    const float wc = w*(1.0f - av)*ld(v, c, s, oA + g*R + r);
+                    const float wp = p >= 0 ? w*av*ld(v, p, s, oA + g*R + r) : 0.0f;
+                    for (int64_t d = 0; d < Dh; ++d) {
+                        o[d] += wc*ld(v, c, s, r*Dh + d) + (p >= 0 ? wp*ld(v, p, s, r*Dh + d) : 0.0f);
+                    }
+                }
+            }
+        }
+        float * y = (float *) ((char *) dst->data + h*dst->nb[1] + t*dst->nb[2] + s*dst->nb[3]);
+        const float norm = sum > 0.0f ? 1.0f/(sum*(float) R) : 0.0f;
+        for (int64_t d = 0; d < Dh; ++d) {
+            y[d] = o[d]*norm;
+        }
+    }
+}
+
+// see ggml_dragon_tpa_expand (ggml.h); one (stream, cell) row at a time
+void ggml_compute_forward_dragon_tpa_expand(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * rows = dst->src[0];
+    const ggml_tensor * prev = dst->src[1];
+
+    const int  Hn   = ggml_get_op_params_i32(dst, 0);
+    const int  R    = ggml_get_op_params_i32(dst, 1);
+    const bool is_v = ggml_get_op_params_i32(dst, 2) != 0;
+
+    const int64_t Dh   = dst->ne[0];
+    const int64_t n_kv = dst->ne[2];
+    const int64_t ns   = dst->ne[3];
+    const int64_t oA   = (int64_t) R*Dh, oS = oA + (int64_t) Hn*R;
+
+    const bool f16 = rows->type == GGML_TYPE_F16;
+    auto ld = [&](int64_t c, int64_t s, int64_t i) -> float {
+        const char * row = (const char *) rows->data + c*rows->nb[1] + s*rows->nb[2];
+        return f16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) row)[i]) : ((const float *) row)[i];
+    };
+
+    for (int64_t ir = params->ith; ir < ns*n_kv; ir += params->nth) {
+        const int64_t s = ir/n_kv;
+        const int64_t c = ir - s*n_kv;
+        const int32_t p = ((const int32_t *) ((const char *) prev->data + s*prev->nb[1]))[c];
+        for (int g = 0; g < Hn; ++g) {
+            float w1, w2;
+            if (is_v) {
+                const float av = ld(c, s, oS + g);
+                w1 = (1.0f - av)/(float) R;
+                w2 = av/(float) R;
+            } else {
+                const float ck = ld(c, s, oS + g);
+                const float ak = ld(c, s, oS + Hn + g);
+                w1 = ck*(1.0f - ak);
+                w2 = ck*ak;
+            }
+            ggml_fp16_t * y = (ggml_fp16_t *) ((char *) dst->data + g*dst->nb[1] + c*dst->nb[2] + s*dst->nb[3]);
+            for (int64_t d = 0; d < Dh; ++d) {
+                float x = 0.0f, xp = 0.0f;
+                for (int r = 0; r < R; ++r) {
+                    x += ld(c, s, oA + g*R + r)*ld(c, s, r*Dh + d);
+                    if (p >= 0) {
+                        xp += ld(p, s, oA + g*R + r)*ld(p, s, r*Dh + d);
+                    }
+                }
+                y[d] = GGML_CPU_FP32_TO_FP16(w1*x + w2*xp);
             }
         }
     }

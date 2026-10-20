@@ -2426,7 +2426,40 @@ kernel void kernel_dragon_tpa_prep_f32(
     const float rsk = 1.0f/sqrt(ks/(float) Dh + args.eps);
     const float rsq = 1.0f/sqrt(qs/(float) Dh + args.eps);
 
-    if (d < Dh) {
+    if (args.factored) {
+        // factor rows: B and the pad by the first kv head, A and the scalars by each kv head
+        if (sub == 0) {
+            device float * ko = out + args.o_k + (size_t) t*args.KR;
+            device float * vo = out + args.o_v + (size_t) t*args.VR;
+            if (hn == 0) {
+                for (int i = tiitg; i < R*Dh; i += DMOE_NTH) {
+                    ko[i] = p[OBK + i];
+                    vo[i] = p[OBV + i];
+                }
+                for (int i = R*Dh + Hn*R + 2*Hn + tiitg; i < args.KR; i += DMOE_NTH) {
+                    ko[i] = 0.0f;
+                }
+                for (int i = R*Dh + Hn*R + Hn + tiitg; i < args.VR; i += DMOE_NTH) {
+                    vo[i] = 0.0f;
+                }
+            }
+            if (tiitg < R) {
+                ko[R*Dh + hn*R + tiitg] = p[OAK + hn*R + tiitg];
+                vo[R*Dh + hn*R + tiitg] = p[OAV + hn*R + tiitg];
+            }
+            if (tiitg == 0) {
+                const float alk = (1.0f/(1.0f + exp(-p[OSK + hn])))*pmask;
+                const float alv = (1.0f/(1.0f + exp(-p[OSV + hn])))*pmask;
+                ko[R*Dh + Hn*R + hn]      = rsk/(float) R;
+                ko[R*Dh + Hn*R + Hn + hn] = alk;
+                vo[R*Dh + Hn*R + hn]      = alv;
+            }
+        }
+        if (d < Dh) {
+            // the k_norm weight moves from K to q
+            out[((size_t) t*H + h)*Dh + d] = (((q*rsq)*qn[d])*lp)*sc[h]*kn[d];
+        }
+    } else if (d < Dh) {
         if (sub == 0) {
             const float ko = (kk[d]*rsk)*kn[d];
             const float vo = vv[d];
@@ -2487,6 +2520,373 @@ kernel void kernel_dragon_diff_gate_f32(
     const float sig = attn[((size_t) t*H + hn*(snr + 1) + k)*Dh + d];
     const float noi = attn[((size_t) t*H + hn*(snr + 1) + snr)*Dh + d];
     y[tpig] = (sig - noi*lam[(size_t) t*args.lam_s + hn])*gs[(size_t) t*args.gs_s + j];
+}
+
+// ---------------------------------------------------------------------------------------------
+// attention over the factored TPA cache (semantic reference: ggml_compute_forward_dragon_tpa_attn in ggml-cpu/ops.cpp)
+// one threadgroup per (chunk of cells, token, stream), one simdgroup per kv head g (its G = H/Hn q heads are the rows
+// of 8x8 tiles). The cells are processed in blocks of 8: the block K (then V) of every kv head is expanded from the
+// factors into threadgroup memory as half, then S = Q K^T and O = diag(f) O + W V with simdgroup matrices
+// NE: Dh/32; kv heads and rank are function constants
+constant int FC_tpa_hn [[function_constant(FC_DRAGON_TPA + 0)]];
+constant int FC_tpa_r  [[function_constant(FC_DRAGON_TPA + 1)]];
+
+#define DTPA_NC   8   // cells per block: the columns of the S tile
+
+#define DTPA_MAXR 8   // TPA rank
+
+template<typename KT, typename KT4, int NE>
+kernel void kernel_dragon_tpa_attn(
+        constant ggml_metal_kargs_dragon_tpa_attn & args,
+        device const char * q,
+        device const char * kc,
+        device const char * vc,
+        device const char * mask,
+        device const char * prev,
+        device       float * dst,
+        device       float * tmp,
+        threadgroup  char  * shm [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    constexpr int Dh  = 32*NE;
+    constexpr int DK8 = Dh/8;
+    constexpr int NC  = DTPA_NC;
+    const int Hn  = FC_tpa_hn;
+    const int R   = FC_tpa_r;
+    const int NTH = 32*Hn;
+    const int H   = args.H;
+    const int G   = H/Hn;
+    const int g   = sgitg;
+
+    const int ic = tgpig.x;
+    const int t  = tgpig.y;
+    const int s  = tgpig.z;
+
+    const int c0 = ic*args.chunk;
+    const int c1 = min(c0 + args.chunk, args.n_kv);
+
+    // [ kv (Hn*NC*Dh half, [g][cell][d]) | per simdgroup: S / diag (64 float), W (64 half) | coefficients of the pass
+    //   (NC*(2*Hn*R + 2*Hn) half) | mask (NC float) | prev (NC int) ]
+    const int ncf = 2*Hn*R + 2*Hn;
+    threadgroup half  * kv  = (threadgroup half  *) shm;
+    threadgroup float * sgs = (threadgroup float *) (kv + Hn*NC*Dh) + sgitg*(64 + 32);
+    threadgroup half  * sgw = (threadgroup half  *) (sgs + 64);
+    threadgroup half  * cf  = (threadgroup half  *) ((threadgroup float *) (kv + Hn*NC*Dh) + Hn*(64 + 32));
+    threadgroup float * msk = (threadgroup float *) (cf + ((NC*ncf + 1)/2)*2);
+    threadgroup int   * prv = (threadgroup int   *) (msk + NC);
+
+    device const int32_t * pv = (device const int32_t *) (prev + s*args.nbp1);
+
+    // Q of the kv head (rows: its G q heads, the others zero) -> registers, through the kv buffer
+    simdgroup_half8x8 mq[DK8];
+    {
+        threadgroup half * sq = kv + g*8*Dh;
+        for (int i = tiisg; i < 8*Dh; i += 32) {
+            const int r = i/Dh;
+            const int d = i - r*Dh;
+            sq[i] = r < G ? (half) ((device const float *) (q + (g*G + r)*args.nbq1 + t*args.nbq2 + s*args.nbq3))[d] : (half) 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (int k = 0; k < DK8; ++k) {
+            simdgroup_load(mq[k], sq + 8*k, Dh, 0, false);
+        }
+    }
+
+    simdgroup_float8x8 mo[DK8];
+    for (int k = 0; k < DK8; ++k) {
+        mo[k] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    }
+
+    // lane -> 2 elements of the 8x8 tiles: row ri, columns cj, cj + 1
+    const int ri = tiisg/4;
+    const int cj = 2*(tiisg%4);
+    float M = -INFINITY;
+    float L = 0.0f;
+
+    const int oA = R*Dh;
+    const int oS = oA + Hn*R;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int j0 = c0; j0 < c1; j0 += NC) {
+        const int nb = min(NC, c1 - j0);
+
+        if (tiitg < NC) {
+            const int c = j0 + tiitg;
+            msk[tiitg] = tiitg >= nb ? -INFINITY : (args.mask_f16 ? (float) ((device const half *) (mask + t*args.nbm1 + s*args.nbm3))[c]
+                                                                  : ((device const float *) (mask + t*args.nbm1 + s*args.nbm3))[c]);
+            prv[tiitg] = tiitg >= nb ? -1 : pv[c];
+        }
+
+        for (int pass = 0; pass < 2; ++pass) {
+            device const char * rows = pass == 0 ? kc : vc;
+            const uint64_t nb1 = pass == 0 ? args.nbk1 : args.nbv1;
+            const uint64_t nb2 = pass == 0 ? args.nbk2 : args.nbv2;
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // coefficients: per (cell, kv head) A, A of the previous cell, own and previous weights
+            for (int w = tiitg; w < nb*Hn; w += NTH) {
+                const int i = w/Hn;
+                const int gg = w - i*Hn;
+                const int p = prv[i];
+                device const KT * rr = (device const KT *) (rows + (j0 + i)*nb1 + s*nb2);
+                device const KT * rp = (device const KT *) (rows + max(p, 0)*nb1 + s*nb2);
+                threadgroup half * f = cf + i*ncf;
+                float w1, w2;
+                if (pass == 0) {
+                    const float ck = (float) rr[oS + gg];
+                    const float ak = (float) rr[oS + Hn + gg];
+                    w1 = ck*(1.0f - ak);
+                    w2 = ck*ak;
+                } else {
+                    const float av = (float) rr[oS + gg];
+                    w1 = (1.0f - av)/(float) R;
+                    w2 = av/(float) R;
+                }
+                f[2*Hn*R + gg]      = (half) w1;
+                f[2*Hn*R + Hn + gg] = (half) w2;
+                for (int r = 0; r < R; ++r) {
+                    f[gg*R + r]        = (half) rr[oA + gg*R + r];
+                    f[Hn*R + gg*R + r] = p >= 0 ? (half) rp[oA + gg*R + r] : (half) 0.0f;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // expand the block: thread item (cell i, 4 elements d4), all the kv heads; masked / missing cells are zero
+            for (int w = tiitg; w < NC*(Dh/4); w += NTH) {
+                const int i  = w/(Dh/4);
+                const int d4 = w - i*(Dh/4);
+                if (msk[i] == -INFINITY) {
+                    for (int gg = 0; gg < Hn; ++gg) {
+                        *((threadgroup half4 *) (kv + (gg*NC + i)*Dh) + d4) = (half4) 0.0f;
+                    }
+                    continue;
+                }
+                const int p = prv[i];
+                device const KT4 * br  = (device const KT4 *) (rows + (j0 + i)*nb1 + s*nb2);
+                device const KT4 * bpr = (device const KT4 *) (rows + max(p, 0)*nb1 + s*nb2);
+                float4 b[DTPA_MAXR], bp[DTPA_MAXR];
+                for (int r = 0; r < R; ++r) {
+                    b[r]  = (float4) br[r*(Dh/4) + d4];
+                    bp[r] = p >= 0 ? (float4) bpr[r*(Dh/4) + d4] : 0.0f;
+                }
+                threadgroup const half * f = cf + i*ncf;
+                for (int gg = 0; gg < Hn; ++gg) {
+                    float4 x = 0.0f, xp = 0.0f;
+                    for (int r = 0; r < R; ++r) {
+                        x  += (float) f[gg*R + r]*b[r];
+                        xp += (float) f[Hn*R + gg*R + r]*bp[r];
+                    }
+                    *((threadgroup half4 *) (kv + (gg*NC + i)*Dh) + d4) = (half4) ((float) f[2*Hn*R + gg]*x + (float) f[2*Hn*R + Hn + gg]*xp);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            threadgroup const half * kg = kv + g*NC*Dh;
+            if (pass == 0) {
+                // S = Q K^T (rows: q heads, columns: cells), online softmax per row
+                simdgroup_float8x8 ms = make_filled_simdgroup_matrix<float, 8>(0.0f);
+                for (int k = 0; k < DK8; ++k) {
+                    simdgroup_half8x8 mk;
+                    simdgroup_load(mk, kg + 8*k, Dh, 0, true);
+                    simdgroup_multiply_accumulate(ms, mq[k], mk, ms);
+                }
+                simdgroup_store(ms, sgs, 8, 0, false);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                float x[2];
+                float mb = -INFINITY;
+                for (int u = 0; u < 2; ++u) {
+                    float v = sgs[ri*8 + cj + u]*args.scale;
+                    if (args.softcap != 0.0f) {
+                        v = args.softcap*precise::tanh(v/args.softcap);
+                    }
+                    x[u] = ri < G ? v + msk[cj + u] : -INFINITY;
+                    mb = max(mb, x[u]);
+                }
+                mb = max(mb, simd_shuffle_xor(mb, 1));
+                mb = max(mb, simd_shuffle_xor(mb, 2));
+                const float Mn = max(M, mb);
+                const float f  = Mn == -INFINITY ? 1.0f : exp(M - Mn);
+                float ws = 0.0f;
+                for (int u = 0; u < 2; ++u) {
+                    const float wv = Mn == -INFINITY ? 0.0f : exp(x[u] - Mn);
+                    ws += wv;
+                    sgw[ri*8 + cj + u] = (half) wv;
+                }
+                ws += simd_shuffle_xor(ws, 1);
+                ws += simd_shuffle_xor(ws, 2);
+                L = L*f + ws;
+                M = Mn;
+                // diag(f) for the rescale of O
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                for (int u = 0; u < 2; ++u) {
+                    sgs[ri*8 + cj + u] = (cj + u == ri) ? f : 0.0f;
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                simdgroup_float8x8 md;
+                simdgroup_load(md, sgs, 8, 0, false);
+                for (int k = 0; k < DK8; ++k) {
+                    simdgroup_multiply(mo[k], md, mo[k]);
+                }
+            } else {
+                // O += W V
+                simdgroup_half8x8 mw;
+                simdgroup_load(mw, sgw, 8, 0, false);
+                for (int k = 0; k < DK8; ++k) {
+                    simdgroup_half8x8 mv;
+                    simdgroup_load(mv, kg + 8*k, Dh, 0, false);
+                    simdgroup_multiply_accumulate(mo[k], mw, mv, mo[k]);
+                }
+            }
+        }
+    }
+
+    // output rows of the q heads of this kv head: final when one chunk, else partials [m, l, o]
+    const float inv = L > 0.0f ? 1.0f/L : 0.0f;
+    for (int k = 0; k < DK8; ++k) {
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_store(mo[k], sgs, 8, 0, false);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (ri < G) {
+            const size_t row = ((size_t) s*args.T + t)*H + g*G + ri;
+            for (int u = 0; u < 2; ++u) {
+                const float v = sgs[ri*8 + cj + u];
+                if (args.n_chunk == 1) {
+                    dst[row*Dh + 8*k + cj + u] = v*inv;
+                } else {
+                    tmp[(row*args.n_chunk + ic)*(Dh + 2) + 2 + 8*k + cj + u] = v;
+                }
+            }
+            if (args.n_chunk > 1 && k == 0 && cj == 0) {
+                tmp[(row*args.n_chunk + ic)*(Dh + 2) + 0] = M;
+                tmp[(row*args.n_chunk + ic)*(Dh + 2) + 1] = L;
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_dragon_tpa_attn<half, half4, 4>) kernel_dragon_tpa_attn_t;
+template [[host_name("kernel_dragon_tpa_attn_f16_ne2")]] kernel kernel_dragon_tpa_attn_t kernel_dragon_tpa_attn<half,  half4,  2>;
+template [[host_name("kernel_dragon_tpa_attn_f16_ne4")]] kernel kernel_dragon_tpa_attn_t kernel_dragon_tpa_attn<half,  half4,  4>;
+template [[host_name("kernel_dragon_tpa_attn_f32_ne2")]] kernel kernel_dragon_tpa_attn_t kernel_dragon_tpa_attn<float, float4, 2>;
+template [[host_name("kernel_dragon_tpa_attn_f32_ne4")]] kernel kernel_dragon_tpa_attn_t kernel_dragon_tpa_attn<float, float4, 4>;
+
+// expanded K or V of a factored TPA cache (semantic reference: ggml_compute_forward_dragon_tpa_expand): one
+// threadgroup per (cell, stream), thread item (kv head, 4 elements)
+template<typename KT, typename KT4>
+kernel void kernel_dragon_tpa_expand(
+        constant ggml_metal_kargs_dragon_tpa_attn & args,
+        device const char * rows,
+        device const char * prev,
+        device       half * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]]) {
+    const int Hn = args.Hn;
+    const int R  = args.R;
+    const int Dh = args.Dh;
+    const int c  = tgpig.x;
+    const int s  = tgpig.y;
+    const int g  = tiitg/(Dh/4);
+    const int d4 = tiitg - g*(Dh/4);
+    if (g >= Hn) {
+        return;
+    }
+    const bool is_v = args.is_v != 0;
+
+    const int p  = ((device const int32_t *) (prev + s*args.nbp1))[c];
+    const int oA = R*Dh;
+    const int oS = oA + Hn*R;
+    device const KT * rr = (device const KT *) (rows + c*args.nbk1 + s*args.nbk2);
+    device const KT * rp = (device const KT *) (rows + max(p, 0)*args.nbk1 + s*args.nbk2);
+
+    float w1, w2;
+    if (is_v) {
+        const float av = (float) rr[oS + g];
+        w1 = (1.0f - av)/(float) R;
+        w2 = av/(float) R;
+    } else {
+        const float ck = (float) rr[oS + g];
+        const float ak = (float) rr[oS + Hn + g];
+        w1 = ck*(1.0f - ak);
+        w2 = ck*ak;
+    }
+    float4 x = 0.0f, xp = 0.0f;
+    for (int r = 0; r < R; ++r) {
+        x += (float) rr[oA + g*R + r]*(float4) ((device const KT4 *) rr)[r*(Dh/4) + d4];
+        if (p >= 0) {
+            xp += (float) rp[oA + g*R + r]*(float4) ((device const KT4 *) rp)[r*(Dh/4) + d4];
+        }
+    }
+    ((device half4 *) (dst + (((size_t) s*args.n_kv + c)*Hn + g)*Dh))[d4] = (half4) (w1*x + w2*xp);
+}
+
+typedef decltype(kernel_dragon_tpa_expand<half, half4>) kernel_dragon_tpa_expand_t;
+template [[host_name("kernel_dragon_tpa_expand_f16")]] kernel kernel_dragon_tpa_expand_t kernel_dragon_tpa_expand<half,  half4>;
+template [[host_name("kernel_dragon_tpa_expand_f32")]] kernel kernel_dragon_tpa_expand_t kernel_dragon_tpa_expand<float, float4>;
+
+// combine the chunks of kernel_dragon_tpa_attn: one threadgroup per (head, token, stream), one thread per element
+// (the chunk weights exp(m - max) and the sum are computed once, in threadgroup memory)
+kernel void kernel_dragon_tpa_attn_reduce(
+        constant ggml_metal_kargs_dragon_tpa_attn & args,
+        device const float * tmp,
+        device       float * dst,
+        threadgroup  float * shm [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    const int Dh  = args.Dh;
+    const int ntg = Dh; // dispatched with Dh threads
+    const int nk = args.n_chunk;
+    const size_t row = ((size_t) tgpig.z*args.T + tgpig.y)*args.H + tgpig.x;
+    device const float * pt = tmp + row*nk*(Dh + 2);
+
+    threadgroup float * w   = shm;        // nk
+    threadgroup float * red = shm + nk;   // 32
+
+    float mx = -INFINITY;
+    for (int c = tiitg; c < nk; c += ntg) {
+        mx = max(mx, pt[c*(Dh + 2)]);
+    }
+    mx = simd_max(mx);
+    if (tiisg == 0) {
+        red[sgitg] = mx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mx = -INFINITY;
+    for (int i = 0; i < (ntg + 31)/32; ++i) {
+        mx = max(mx, red[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float ls = 0.0f;
+    for (int c = tiitg; c < nk; c += ntg) {
+        const float m = pt[c*(Dh + 2)];
+        w[c] = m == -INFINITY ? 0.0f : exp(m - mx);
+        ls += w[c]*pt[c*(Dh + 2) + 1];
+    }
+    ls = simd_sum(ls);
+    if (tiisg == 0) {
+        red[sgitg] = ls;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ls = 0.0f;
+    for (int i = 0; i < (ntg + 31)/32; ++i) {
+        ls += red[i];
+    }
+    const float inv = ls > 0.0f ? 1.0f/ls : 0.0f;
+
+    for (int d = tiitg; d < Dh; d += ntg) {
+        float acc = 0.0f;
+        for (int c = 0; c < nk; ++c) {
+            acc += w[c]*pt[c*(Dh + 2) + 2 + d];
+        }
+        dst[row*Dh + d] = acc*inv;
+    }
 }
 
 #if defined(GGML_METAL_HAS_BF16)

@@ -68,6 +68,16 @@ bool ggml_metal_op_dragon_moe_merged (const struct ggml_tensor * op);
 int  ggml_metal_op_dragon_moe_fused_ntg(const struct ggml_tensor * op, int gpu_cores);
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
 
+// GGML_OP_DRAGON_TPA_ATTN: cells per block, cells per chunk and chunks (one threadgroup per chunk and token), and the
+// threadgroup memory of kernel_dragon_tpa_attn
+struct ggml_metal_dragon_tpa_attn_split {
+    int nc;
+    int chunk;
+    int n_chunk;
+};
+struct ggml_metal_dragon_tpa_attn_split ggml_metal_op_dragon_tpa_attn_split(const struct ggml_tensor * op, int gpu_cores);
+size_t ggml_metal_op_dragon_tpa_attn_smem(const struct ggml_tensor * op, int nc);
+
 #ifdef __cplusplus
 }
 #endif

@@ -858,6 +858,39 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_mmv(ggml_
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_tpa_attn(ggml_metal_library_t lib, const ggml_tensor * op, bool reduce) {
+    GGML_ASSERT(op->op == GGML_OP_DRAGON_TPA_ATTN);
+    if (reduce) {
+        return ggml_metal_library_get_pipeline_simple(lib, "kernel_dragon_tpa_attn_reduce");
+    }
+    const int32_t hn = ggml_get_op_params_i32(op, 0);
+    const int32_t r  = ggml_get_op_params_i32(op, 1);
+    const int32_t nc = 8; // DTPA_NC
+
+    char base[256];
+    char name[256];
+    snprintf(base, 256, "kernel_dragon_tpa_attn_%s_ne%d", ggml_type_name(op->src[1]->type), (int) (op->src[0]->ne[0]/32));
+    snprintf(name, 256, "%s_hn%d_r%d", base, hn, r);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int32(cv, hn, FC_DRAGON_TPA + 0);
+        ggml_metal_cv_set_int32(cv, r,  FC_DRAGON_TPA + 1);
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
+    }
+    res.smem = ggml_metal_op_dragon_tpa_attn_smem(op, nc);
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_tpa_expand(ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_DRAGON_TPA_EXPAND);
+    char base[256];
+    snprintf(base, 256, "kernel_dragon_tpa_expand_%s", ggml_type_name(op->src[0]->type));
+    return ggml_metal_library_get_pipeline_simple(lib, base);
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dragon_tpa_prep(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_ASSERT(op->op == GGML_OP_DRAGON_TPA_PREP);
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline_simple(lib, "kernel_dragon_tpa_prep_f32");

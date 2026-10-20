@@ -123,6 +123,7 @@
 #define FC_PAD                         2100
 #define FC_FLASH_ATTN_EXT_TENSOR       2200
 #define FC_DRAGON_MOE                  2300
+#define FC_DRAGON_TPA                  2400
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -1131,7 +1132,7 @@ typedef struct {
     int32_t n_tok;
     int32_t ROW;
     int32_t GS;         // gate elements written per (head, token) threadgroup (0: head 0 writes all)
-    int32_t pad0;
+    int32_t factored;   // ggml_dragon_tpa_prep_factored: rows of TPA factors instead of K/V (KR / VR floats per token)
     float   eps;
     float   wsize;
     float   gate_b;
@@ -1149,7 +1150,34 @@ typedef struct {
     uint64_t kc_nb1;    // KV cache row strides (bytes)
     uint64_t vc_nb1;
     int64_t last_s;     // recurrent cache row stride (floats)
+    int32_t KR;
+    int32_t VR;
 } ggml_metal_kargs_dragon_tpa_prep;
+
+// GGML_OP_DRAGON_TPA_ATTN (kernels/mamba3.metal): one threadgroup per (chunk of cells, token, stream), then a reduce
+// over the chunks when n_chunk > 1 (partials after dst: [m, l, o (Dh)] per (chunk, head, token, stream))
+typedef struct {
+    int32_t H;
+    int32_t Hn;
+    int32_t R;
+    int32_t Dh;
+    int32_t KR;
+    int32_t VR;
+    int32_t n_kv;
+    int32_t T;
+    int32_t ns;
+    int32_t n_chunk;
+    int32_t chunk;      // cells per chunk (multiple of the 8 cells of a block)
+    float   scale;
+    float   softcap;
+    int32_t mask_f16;
+    int32_t is_v;       // kernel_dragon_tpa_expand: 1 for V
+    uint64_t nbq1, nbq2, nbq3;
+    uint64_t nbk1, nbk2;
+    uint64_t nbv1, nbv2;
+    uint64_t nbm1, nbm3;
+    uint64_t nbp1;
+} ggml_metal_kargs_dragon_tpa_attn;
 
 typedef struct {
     int32_t Dh;

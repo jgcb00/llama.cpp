@@ -398,6 +398,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_dragon_diff_gate(ctx, idx);
             } break;
+        case GGML_OP_DRAGON_TPA_ATTN:
+            {
+                n_fuse = ggml_metal_op_dragon_tpa_attn(ctx, idx);
+            } break;
+        case GGML_OP_DRAGON_TPA_EXPAND:
+            {
+                n_fuse = ggml_metal_op_dragon_tpa_expand(ctx, idx);
+            } break;
         case GGML_OP_SOLVE_TRI:
             {
                 n_fuse = ggml_metal_op_solve_tri(ctx, idx);
@@ -2654,16 +2662,19 @@ int ggml_metal_op_dragon_tpa_prep(ggml_metal_op_t ctx, int idx) {
     args.wsize  = ggml_get_op_params_f32(op, 7);
     args.gate_b = ggml_get_op_params_f32(op, 8);
     args.prev_s = (int64_t) (op->src[1]->nb[1]/sizeof(float));
+    args.factored = ggml_get_op_params_i32(op, 9);
+    args.KR     = args.factored ? (int32_t) ggml_dragon_tpa_row_k(Hn, R, Dh) : Hn*Dh;
+    args.VR     = args.factored ? (int32_t) ggml_dragon_tpa_row_v(Hn, R, Dh) : Hn*Dh;
     args.o_k    = T*H*Dh;
-    args.o_v    = args.o_k + T*Hn*Dh;
-    args.o_lam  = args.o_v + T*Hn*Dh;
+    args.o_v    = args.o_k + T*args.KR;
+    args.o_lam  = args.o_v + T*args.VR;
     args.o_g    = args.o_lam + T*Hn;
     args.o_last = args.o_g + T*Hs*Dh;
 
     // decode: also write K/V into the KV cache and the last K/V into the recurrent cache (GGML_METAL_FUSION_TPA_PREP_CACHE)
     int n_fuse = 1;
     const ggml_tensor * f_cpy = nullptr, * f_k = nullptr, * f_v = nullptr;
-    if (ctx->use_fusion()) {
+    if (ctx->use_fusion() && !args.factored) {
         int n = 1;
         const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_TPA_PREP_CACHE) {
@@ -2705,6 +2716,120 @@ int ggml_metal_op_dragon_tpa_prep(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, H, T, 1, nth, 1, 1);
 
     return n_fuse;
+}
+
+size_t ggml_metal_op_dragon_tpa_attn_extra_tmp(const ggml_tensor * op, int gpu_cores) {
+    assert(op->op == GGML_OP_DRAGON_TPA_ATTN);
+
+    const ggml_metal_dragon_tpa_attn_split sp = ggml_metal_op_dragon_tpa_attn_split(op, gpu_cores);
+    if (sp.n_chunk == 1) {
+        return 0;
+    }
+    // partials [m, l, o (Dh)] per (chunk, head, token, stream)
+    return GGML_PAD((size_t) sp.n_chunk*(op->ne[0] + 2)*op->ne[1]*op->ne[2]*op->ne[3]*sizeof(float), 16);
+}
+
+int ggml_metal_op_dragon_tpa_attn(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * q    = op->src[0];
+    const ggml_tensor * k    = op->src[1];
+    const ggml_tensor * v    = op->src[2];
+    const ggml_tensor * mask = op->src[3];
+    const ggml_tensor * prev = op->src[4];
+
+    const ggml_metal_dragon_tpa_attn_split sp = ggml_metal_op_dragon_tpa_attn_split(op, ggml_metal_device_get_props(ctx->dev)->gpu_core_count);
+
+    ggml_metal_kargs_dragon_tpa_attn args = {};
+    args.H       = (int32_t) q->ne[1];
+    args.Hn      = ggml_get_op_params_i32(op, 0);
+    args.R       = ggml_get_op_params_i32(op, 1);
+    args.Dh      = (int32_t) q->ne[0];
+    args.KR      = (int32_t) k->ne[0];
+    args.VR      = (int32_t) v->ne[0];
+    args.n_kv    = (int32_t) k->ne[1];
+    args.T       = (int32_t) q->ne[2];
+    args.ns      = (int32_t) q->ne[3];
+    args.n_chunk = sp.n_chunk;
+    args.chunk   = sp.chunk;
+    args.scale   = ggml_get_op_params_f32(op, 2);
+    args.softcap = ggml_get_op_params_f32(op, 3);
+    args.mask_f16 = mask->type == GGML_TYPE_F16;
+    args.nbq1 = q->nb[1]; args.nbq2 = q->nb[2]; args.nbq3 = q->nb[3];
+    args.nbk1 = k->nb[1]; args.nbk2 = k->nb[2];
+    args.nbv1 = v->nb[1]; args.nbv2 = v->nb[2];
+    args.nbm1 = mask->nb[1]; args.nbm3 = mask->nb[3];
+    args.nbp1 = prev->nb[1];
+
+    ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
+    ggml_metal_buffer_id bid_tmp = bid_dst;
+    bid_tmp.offs += ggml_nbytes(op);
+
+    auto pipeline = ggml_metal_library_get_pipeline_dragon_tpa_attn(lib, op, false);
+    const int nth = 32*args.Hn; // one simdgroup per kv head
+    GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(q),    1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(k),    2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(v),    3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(mask), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(prev), 5);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst, 6);
+    ggml_metal_encoder_set_buffer  (enc, sp.n_chunk > 1 ? bid_tmp : bid_dst, 7);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+    ggml_metal_encoder_dispatch_threadgroups(enc, sp.n_chunk, q->ne[2], q->ne[3], nth, 1, 1);
+
+    if (sp.n_chunk > 1) {
+        ggml_metal_op_concurrency_reset(ctx);
+
+        auto pipeline_r = ggml_metal_library_get_pipeline_dragon_tpa_attn(lib, op, true);
+        ggml_metal_encoder_set_pipeline(enc, pipeline_r);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
+        ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD((sp.n_chunk + 32)*sizeof(float), 16), 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, q->ne[1], q->ne[2], q->ne[3], q->ne[0], 1, 1);
+    }
+
+    return 1;
+}
+
+int ggml_metal_op_dragon_tpa_expand(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * rows = op->src[0];
+    const ggml_tensor * prev = op->src[1];
+
+    ggml_metal_kargs_dragon_tpa_attn args = {};
+    args.Hn   = ggml_get_op_params_i32(op, 0);
+    args.R    = ggml_get_op_params_i32(op, 1);
+    args.is_v = ggml_get_op_params_i32(op, 2);
+    args.Dh   = (int32_t) op->ne[0];
+    args.n_kv = (int32_t) op->ne[2];
+    args.nbk1 = rows->nb[1];
+    args.nbk2 = rows->nb[2];
+    args.nbp1 = prev->nb[1];
+
+    auto pipeline = ggml_metal_library_get_pipeline_dragon_tpa_expand(lib, op);
+    const int nth = GGML_PAD(args.Hn*args.Dh/4, 32);
+    GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(rows), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(prev), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),   3);
+    ggml_metal_encoder_dispatch_threadgroups(enc, op->ne[2], op->ne[3], 1, nth, 1, 1);
+
+    return 1;
 }
 
 int ggml_metal_op_dragon_diff_gate(ggml_metal_op_t ctx, int idx) {

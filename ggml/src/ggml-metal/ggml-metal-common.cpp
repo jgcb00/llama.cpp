@@ -181,6 +181,30 @@ bool ggml_metal_op_dragon_moe_sh_split(const struct ggml_tensor * op) {
     return op->src[0]->ne[1] <= 2;
 }
 
+size_t ggml_metal_op_dragon_tpa_attn_smem(const struct ggml_tensor * op, int nc) {
+    const int64_t Dh = op->src[0]->ne[0];
+    const int64_t Hn = ggml_get_op_params_i32(op, 0);
+    const int64_t R  = ggml_get_op_params_i32(op, 1);
+    // [ kv (Hn*nc*Dh half) | per simdgroup: 64 float + 64 half | coefficients (nc*(2*Hn*R + 2*Hn) half) | mask, prev (nc) ]
+    return Hn*nc*Dh*2 + Hn*(64*4 + 64*2) + (nc*(2*Hn*R + 2*Hn) + 1)/2*2*2 + 2*nc*4;
+}
+
+struct ggml_metal_dragon_tpa_attn_split ggml_metal_op_dragon_tpa_attn_split(const struct ggml_tensor * op, int gpu_cores) {
+    const int64_t n_kv = op->src[1]->ne[1];
+    const int64_t T    = op->src[0]->ne[2]*op->src[0]->ne[3];
+
+    ggml_metal_dragon_tpa_attn_split res;
+    res.nc = 8; // DTPA_NC
+    // decode: one threadgroup per GPU core (a single wave: one threadgroup fits per core), fewer chunks per token for
+    // batches; unknown core count: 64
+    const int64_t ntg  = gpu_cores > 0 ? gpu_cores : 64;
+    const int64_t want = std::max<int64_t>(1, std::min<int64_t>((ntg + T - 1)/T, (n_kv + 4*res.nc - 1)/(4*res.nc)));
+    const int64_t chunk = ((n_kv + want - 1)/want + res.nc - 1)/res.nc*res.nc;
+    res.chunk   = (int) std::max<int64_t>(chunk, res.nc);
+    res.n_chunk = (int) ((n_kv + res.chunk - 1)/res.chunk);
+    return res;
+}
+
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne11 = op->src[1]->ne[1];

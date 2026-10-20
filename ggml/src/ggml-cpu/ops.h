@@ -116,6 +116,8 @@ size_t ggml_dragon_moe_work_size(const struct ggml_tensor * op, int n_threads);
 void ggml_compute_forward_dragon_mmv(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dragon_tpa_prep(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dragon_diff_gate(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_dragon_tpa_attn(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_dragon_tpa_expand(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);

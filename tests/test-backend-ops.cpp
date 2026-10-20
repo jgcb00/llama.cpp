@@ -5148,17 +5148,18 @@ struct test_dragon_mmv : public test_case {
 // GGML_OP_DRAGON_TPA_PREP
 struct test_dragon_tpa_prep : public test_case {
     const int H, Hn, R, Dh, n_tok, n_seqs;
+    const bool factored;
 
     std::string vars() override {
-        return VARS_TO_STR6(H, Hn, R, Dh, n_tok, n_seqs);
+        return VARS_TO_STR7(H, Hn, R, Dh, n_tok, n_seqs, factored);
     }
 
     double max_nmse_err() override {
         return 1e-6;
     }
 
-    test_dragon_tpa_prep(int H = 48, int Hn = 12, int R = 4, int Dh = 128, int n_tok = 1, int n_seqs = 1)
-        : H(H), Hn(Hn), R(R), Dh(Dh), n_tok(n_tok), n_seqs(n_seqs) {}
+    test_dragon_tpa_prep(int H = 48, int Hn = 12, int R = 4, int Dh = 128, int n_tok = 1, int n_seqs = 1, bool factored = false)
+        : H(H), Hn(Hn), R(R), Dh(Dh), n_tok(n_tok), n_seqs(n_seqs), factored(factored) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int Hs = H - Hn;
@@ -5170,6 +5171,9 @@ struct test_dragon_tpa_prep : public test_case {
         ggml_tensor * q_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, Dh);
         ggml_tensor * k_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, Dh);
         ggml_tensor * scaler = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
+        if (factored) {
+            return ggml_dragon_tpa_prep_factored(ctx, pr, prev, pos, q_norm, k_norm, scaler, H, Hn, R, Dh, Hs, n_seqs, 1e-6f, 4096.0f, 0.5f);
+        }
         return ggml_dragon_tpa_prep(ctx, pr, prev, pos, q_norm, k_norm, scaler, H, Hn, R, Dh, Hs, n_seqs, 1e-6f, 4096.0f, 0.5f);
     }
 
@@ -5183,6 +5187,101 @@ struct test_dragon_tpa_prep : public test_case {
                     v[i] = (i/n_seq_t == 0) ? i % n_seq_t : 100 + i % n_seq_t;
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, n_tok*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            }
+        }
+    }
+};
+
+// GGML_OP_DRAGON_TPA_ATTN
+struct test_dragon_tpa_attn : public test_case {
+    const int H, Hn, R, Dh, n_kv, T, ns;
+    const ggml_type type_kv;
+
+    std::string vars() override {
+        return VARS_TO_STR8(H, Hn, R, Dh, n_kv, T, ns, type_kv);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_dragon_tpa_attn(int H = 48, int Hn = 12, int R = 4, int Dh = 128, int n_kv = 256, int T = 1, int ns = 1, ggml_type type_kv = GGML_TYPE_F16)
+        : H(H), Hn(Hn), R(R), Dh(Dh), n_kv(n_kv), T(T), ns(ns), type_kv(type_kv) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, Dh, H, T, ns);
+        ggml_tensor * k    = ggml_new_tensor_3d(ctx, type_kv, ggml_dragon_tpa_row_k(Hn, R, Dh), n_kv, ns);
+        ggml_tensor * v    = ggml_new_tensor_3d(ctx, type_kv, ggml_dragon_tpa_row_v(Hn, R, Dh), n_kv, ns);
+        ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, GGML_PAD(T, 8), 1, ns);
+        ggml_tensor * prev = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, ns);
+        ggml_set_name(mask, "mask");
+        ggml_set_name(prev, "prev");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        return ggml_dragon_tpa_attn(ctx, q, k, v, mask, prev, Hn, R, 1.0f/Dh, 150.0f);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(7);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "prev") == 0) {
+                // mostly the cell before, some cells elsewhere, some without a previous token
+                std::vector<int32_t> p(n_kv*ns);
+                for (int i = 0; i < n_kv*ns; ++i) {
+                    const int c = i % n_kv;
+                    const int r = rng() % 16;
+                    p[i] = c == 0 || r == 0 ? -1 : (r == 1 ? (int) (rng() % n_kv) : c - 1);
+                }
+                ggml_backend_tensor_set(t, p.data(), 0, p.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "mask") == 0) {
+                // a few masked cells per row, the rest causal-like
+                std::vector<ggml_fp16_t> m(ggml_nelements(t));
+                for (size_t i = 0; i < m.size(); ++i) {
+                    m[i] = ggml_fp32_to_fp16(rng() % 7 == 0 ? -INFINITY : 0.0f);
+                }
+                ggml_backend_tensor_set(t, m.data(), 0, m.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "k") == 0 || strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -1.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            }
+        }
+    }
+};
+
+// GGML_OP_DRAGON_TPA_EXPAND
+struct test_dragon_tpa_expand : public test_case {
+    const int Hn, R, Dh, n_kv, ns;
+    const bool is_v;
+    const ggml_type type_kv;
+
+    std::string vars() override {
+        return VARS_TO_STR7(Hn, R, Dh, n_kv, ns, is_v, type_kv);
+    }
+
+    test_dragon_tpa_expand(int Hn = 12, int R = 4, int Dh = 128, int n_kv = 64, int ns = 1, bool is_v = false, ggml_type type_kv = GGML_TYPE_F16)
+        : Hn(Hn), R(R), Dh(Dh), n_kv(n_kv), ns(ns), is_v(is_v), type_kv(type_kv) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n = is_v ? ggml_dragon_tpa_row_v(Hn, R, Dh) : ggml_dragon_tpa_row_k(Hn, R, Dh);
+        ggml_tensor * rows = ggml_new_tensor_3d(ctx, type_kv, n, n_kv, ns);
+        ggml_tensor * prev = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, ns);
+        ggml_set_name(prev, "prev");
+        return ggml_dragon_tpa_expand(ctx, rows, prev, Hn, R, Dh, is_v);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(11);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "prev") == 0) {
+                std::vector<int32_t> p(n_kv*ns);
+                for (int i = 0; i < n_kv*ns; ++i) {
+                    const int c = i % n_kv;
+                    p[i] = c == 0 || rng() % 8 == 0 ? -1 : (int) (rng() % n_kv);
+                }
+                ggml_backend_tensor_set(t, p.data(), 0, p.size()*sizeof(int32_t));
             } else {
                 init_tensor_uniform(t, -1.0f, 1.0f);
             }
@@ -11727,6 +11826,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 4, 4));   // batched decode
     test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 6, 2));   // 3 tokens per sequence (in-batch shift)
     test_cases.emplace_back(new test_dragon_tpa_prep(8, 2, 3, 64, 5, 1));      // small dims, gate not divisible by H
+    test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 1, 1, true)); // factored
+    test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 6, 2, true));
+    test_cases.emplace_back(new test_dragon_tpa_prep(8, 2, 3, 64, 5, 1, true));
+    for (ggml_type type_kv : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        for (bool is_v : { false, true }) {
+            test_cases.emplace_back(new test_dragon_tpa_expand(12, 4, 128, 100, 2, is_v, type_kv));
+            test_cases.emplace_back(new test_dragon_tpa_expand(4,  3, 64,  37,  1, is_v, type_kv));
+        }
+    }
+    for (ggml_type type_kv : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
+        test_cases.emplace_back(new test_dragon_tpa_attn(48, 12, 4, 128, 256,  1, 1, type_kv));  // decode
+        test_cases.emplace_back(new test_dragon_tpa_attn(48, 12, 4, 128, 1000, 1, 2, type_kv));  // 2 streams, partial chunk
+        test_cases.emplace_back(new test_dragon_tpa_attn(48, 12, 4, 128, 96,   7, 1, type_kv));  // several tokens
+        test_cases.emplace_back(new test_dragon_tpa_attn(16, 4,  3, 64,  37,   3, 1, type_kv));  // small dims
+    }
     test_cases.emplace_back(new test_dragon_diff_gate(128, 48, 12, 3));
     test_cases.emplace_back(new test_dragon_diff_gate(64, 8, 2, 1));
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f)); // decode (the model has 256 experts: perf mode)
@@ -11785,6 +11899,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // Dragon factored TPA attention, decode at 8k and 32k cells
+    for (int n_kv : { 8192, 32768 }) {
+        test_cases.emplace_back(new test_dragon_tpa_attn(48, 12, 4, 128, n_kv, 1, 1, GGML_TYPE_F16));
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

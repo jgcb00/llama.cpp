@@ -26,6 +26,8 @@ int main(int argc, char ** argv) {
     std::string prompt    = "Hello world";
     int n_threads     = -1;
     int n_gpu_layers  = 0;
+    llama_tpa_cache_type tpa_cache = LLAMA_TPA_CACHE_TYPE_AUTO;
+    bool f32_cache    = false;
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) {
@@ -36,6 +38,11 @@ int main(int argc, char ** argv) {
             n_threads = atoi(argv[++i]);
         } else if ((!strcmp(argv[i], "-ngl") || !strcmp(argv[i], "--n-gpu-layers")) && i + 1 < argc) {
             n_gpu_layers = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--tpa-cache") && i + 1 < argc) {
+            ++i;
+            tpa_cache = !strcmp(argv[i], "factored") ? LLAMA_TPA_CACHE_TYPE_FACTORED : LLAMA_TPA_CACHE_TYPE_FULL;
+        } else if (!strcmp(argv[i], "--f32-cache")) {
+            f32_cache = true;
         } else if (!strcmp(argv[i], "-p") && i + 1 < argc) {
             // Consume only the next arg as the prompt; trailing flags (-n, -ngl, ...)
             // still get parsed by the outer loop.
@@ -55,7 +62,7 @@ int main(int argc, char ** argv) {
     }
 
     if (model_path.empty()) {
-        fprintf(stderr, "usage: %s -m model.gguf -o out.bin [-t threads] [-ngl N] \"prompt\"\n", argv[0]);
+        fprintf(stderr, "usage: %s -m model.gguf -o out.bin [-t threads] [-ngl N] [--tpa-cache full|factored] [--f32-cache] \"prompt\"\n", argv[0]);
         return 1;
     }
 
@@ -87,6 +94,11 @@ int main(int argc, char ** argv) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx     = n_tokens;
     cp.n_batch   = n_tokens;
+    cp.tpa_cache_type = tpa_cache;
+    if (f32_cache) {
+        cp.type_k = GGML_TYPE_F32;
+        cp.type_v = GGML_TYPE_F32;
+    }
     cp.no_perf   = true;
     if (n_threads > 0) {
         cp.n_threads       = n_threads;

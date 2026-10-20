@@ -8,6 +8,7 @@
 #include "llama-vocab.h"
 
 #include <map>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -671,6 +672,12 @@ struct llama_model {
     std::string name = "n/a";
 
     llama_hparams hparams = {};
+
+private:
+    mutable std::once_flag                 hparams_tpa_once;
+    mutable std::unique_ptr<llama_hparams> hparams_tpa;
+
+public:
     llama_vocab   vocab;
 
     // per-tensor activation precision policy
@@ -823,6 +830,11 @@ struct llama_model {
     ggml_tensor * get_rope_factors(const llama_cparams & cparams, int il) const;
 
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
+
+    // TPA attention (Dragon): whether a context with this llama_tpa_cache_type keeps the TPA factors in its KV cache,
+    // and the hparams of that cache layout (the attention layers' K/V rows are the factor rows)
+    bool tpa_cache_factored(llama_tpa_cache_type type) const;
+    const llama_hparams & hparams_tpa_factored() const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 

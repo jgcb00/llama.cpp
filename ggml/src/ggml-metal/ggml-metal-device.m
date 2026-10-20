@@ -2008,6 +2008,24 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return Dh <= 256 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) &&
                        (2*Dh + 8)*sizeof(float) <= dev->props.max_theadgroup_memory_size;
             }
+        case GGML_OP_DRAGON_TPA_ATTN:
+            {
+                const struct ggml_tensor * q = op->src[0];
+                const int64_t Dh = q->ne[0];
+                const int64_t H  = q->ne[1];
+                const int64_t R  = ggml_get_op_params_i32(op, 1);
+                const int64_t Hn = ggml_get_op_params_i32(op, 0);
+                return has_simdgroup_reduction && has_simdgroup_mm && (Dh == 64 || Dh == 128) && H/Hn <= 8 && Hn <= 16 && R <= 8 &&
+                       (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
+                       ggml_metal_op_dragon_tpa_attn_smem(op, 1) <= dev->props.max_theadgroup_memory_size;
+            }
+        case GGML_OP_DRAGON_TPA_EXPAND:
+            {
+                const int64_t Dh = op->ne[0];
+                const int64_t Hn = op->ne[1];
+                return Dh % 4 == 0 && ggml_is_contiguous(op) && Hn*Dh/4 <= 1024 &&
+                       (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32);
+            }
         case GGML_OP_DRAGON_DIFF_GATE:
             return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous_rows(op->src[1]) && ggml_is_contiguous_rows(op->src[2]);

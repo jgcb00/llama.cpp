@@ -47,6 +47,18 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
     GGML_ABORT("fatal error");
 }
 
+const char * llama_tpa_cache_type_name(enum llama_tpa_cache_type tpa_cache_type) {
+    switch (tpa_cache_type) {
+        case LLAMA_TPA_CACHE_TYPE_AUTO:
+            return "auto";
+        case LLAMA_TPA_CACHE_TYPE_FULL:
+            return "full";
+        case LLAMA_TPA_CACHE_TYPE_FACTORED:
+            return "factored";
+    }
+    GGML_ABORT("fatal error");
+}
+
 const char * llama_load_mode_name(enum llama_load_mode load_mode) {
     switch (load_mode) {
         case LLAMA_LOAD_MODE_AUTO:

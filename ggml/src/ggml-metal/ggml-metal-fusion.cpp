@@ -287,6 +287,10 @@ static bool ggml_metal_fusion_check_tpa_prep_cache(
     const ggml_tensor * prep = nodes[0];
     const ggml_tensor * cpy  = nodes[1];
 
+    if (ggml_get_op_params_i32(prep, 9) != 0) {
+        return false; // factored rows: written by SET_ROWS
+    }
+
     const int64_t H      = ggml_get_op_params_i32(prep, 0);
     const int64_t Hn     = ggml_get_op_params_i32(prep, 1);
     const int64_t Dh     = ggml_get_op_params_i32(prep, 3);

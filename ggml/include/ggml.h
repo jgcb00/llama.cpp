@@ -591,6 +591,8 @@ extern "C" {
         GGML_OP_DRAGON_MMV,
         GGML_OP_DRAGON_TPA_PREP,
         GGML_OP_DRAGON_DIFF_GATE,
+        GGML_OP_DRAGON_TPA_ATTN,
+        GGML_OP_DRAGON_TPA_EXPAND,
 
         GGML_OP_UNARY,
 
@@ -2849,6 +2851,53 @@ extern "C" {
             struct ggml_tensor  * scaler,
             int H, int Hn, int R, int Dh, int Hs, int n_seqs,
             float eps, float wsize, float gate_b);
+
+    //   factored variant (the KV cache keeps the TPA factors instead of the expanded K/V): same inputs, out: flat f32
+    //   [q~ (Dh,H,T) normed+scaled, times k_norm | krow (KR,T) | vrow (VR,T) | lam | gs | kvlast] with
+    //   krow = [B_k (R*Dh) | A_k (Hn*R) | ck (Hn) | ak (Hn) | 0 pad], vrow = [B_v (R*Dh) | A_v (Hn*R) | av (Hn) | 0 pad],
+    //   ck = 1/(R*rms(shifted raw K)), ak / av the token-shift weights (0 at position 0), KR / VR multiples of Hn
+    //   (ggml_dragon_tpa_row_k / ggml_dragon_tpa_row_v); see ggml_dragon_tpa_attn for how the rows are read back
+    GGML_API struct ggml_tensor * ggml_dragon_tpa_prep_factored(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * pr,
+            struct ggml_tensor  * prev,
+            struct ggml_tensor  * pos,
+            struct ggml_tensor  * q_norm,
+            struct ggml_tensor  * k_norm,
+            struct ggml_tensor  * scaler,
+            int H, int Hn, int R, int Dh, int Hs, int n_seqs,
+            float eps, float wsize, float gate_b);
+
+    GGML_API int64_t ggml_dragon_tpa_row_k(int Hn, int R, int Dh);
+    GGML_API int64_t ggml_dragon_tpa_row_v(int Hn, int R, int Dh);
+
+    //   attention over a factored Dragon TPA cache (semantic reference: ggml_compute_forward_dragon_tpa_attn_f32):
+    //   q (Dh, H, T, n_stream) f32 (q~ of ggml_dragon_tpa_prep_factored), k (KR, n_kv, n_stream) / v (VR, n_kv, n_stream)
+    //   rows of the cache, mask (n_kv, T_pad >= T, 1, n_stream) f16/f32, prev (n_kv, n_stream) i32 = cell of the previous
+    //   token of the same sequence (-1: none). For kv head g = h/(H/Hn), cell c, p = prev[c]:
+    //     K[c] = ck[c,g]*((1-ak[c,g])*sum_r A_k[c,g,r]*B_k[c,r] + ak[c,g]*sum_r A_k[p,g,r]*B_k[p,r])   (k_norm is in q~)
+    //     V[c] = ((1-av[c,g])*sum_r A_v[c,g,r]*B_v[c,r] + av[c,g]*sum_r A_v[p,g,r]*B_v[p,r])/R
+    //     out[h,t] = softmax_c(softcap*tanh(scale*q[h,t].K[c]/softcap) + mask[c,t]) . V      (softcap 0: no tanh)
+    //   -> (Dh, H, T, n_stream) f32
+    GGML_API struct ggml_tensor * ggml_dragon_tpa_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * prev,
+            int Hn, int R,
+            float scale, float softcap);
+
+    //   expanded K (is_v = false) or V of a factored Dragon TPA cache, for the attention of long batches:
+    //   rows (KR or VR, n_kv, n_stream), prev (n_kv, n_stream) -> (Dh, Hn, n_kv, n_stream) f16, K[c] / V[c] as in
+    //   ggml_dragon_tpa_attn (K without the k_norm weight, which is in q~)
+    GGML_API struct ggml_tensor * ggml_dragon_tpa_expand(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * rows,
+            struct ggml_tensor  * prev,
+            int Hn, int R, int Dh,
+            bool is_v);
 
     //   differential combine + gate: attn (Dh, H, T), lam (Hn, T), gs (Hs*Dh, T) -> (Hs*Dh, T)
     //   out[(hn*snr+i)*Dh+d] = (attn[(hn*(snr+1)+i)*Dh+d] - lam[hn]*attn[(hn*(snr+1)+snr)*Dh+d]) * gs[(hn*snr+i)*Dh+d]

@@ -52,6 +52,7 @@ size_t ggml_metal_op_mamba3_mimo_extra_ws(const struct ggml_tensor * op);
 
 // GGML_OP_DRAGON_MOE workspace: [lat | logits | ush | weighted partial expert outputs] after dst
 size_t ggml_metal_op_dragon_moe_extra_ws(const struct ggml_tensor * op);
+size_t ggml_metal_op_dragon_tpa_attn_extra_tmp(const struct ggml_tensor * op, int gpu_cores);
 
 int ggml_metal_op_concat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_repeat            (ggml_metal_op_t ctx, int idx);
@@ -76,6 +77,8 @@ int ggml_metal_op_geodesic          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dragon_moe        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dragon_mmv        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dragon_tpa_prep   (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dragon_tpa_attn   (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_dragon_tpa_expand (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dragon_diff_gate  (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_solve_tri         (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_set               (ggml_metal_op_t ctx, int idx);

@@ -1,5 +1,6 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
+#include "llama-kv-cache.h"
 
 #include <algorithm>
 #include <atomic>
@@ -75,6 +76,9 @@ static thread_local bool dragon_layer_metal = false;
 // the Metal Dragon kernels (fused MoE, TPA prep) are decode kernels: ubatches above this many tokens use the graph path
 // (DRAGON_NO_FUSED_MOE forces the graph path for the MoE)
 static constexpr int64_t DRAGON_METAL_MAX_TOKENS = 32;
+
+// factored TPA cache: batches above this many tokens per sequence expand the cache for the attention
+static constexpr int64_t DRAGON_TPA_FACTORED_MAX_T = 8;
 
 static ggml_tensor * f32c_static(ggml_context * ctx, ggml_tensor * t) {
     return t->type == GGML_TYPE_F32 ? t : ggml_cast(ctx, t, GGML_TYPE_F32);
@@ -3432,6 +3436,105 @@ static ggml_tensor * build_dragon_v_mixer(
     const int64_t rank     = (int64_t) hparams.dragon_tpa_rank;
     const float   gate_b   = hparams.dragon_gate_bias;
     const auto  & layer    = model.layers[il];
+
+    // factored TPA cache (cparams.tpa_factored, any backend): the KV cache rows are the TPA factors of each token
+    // (ggml_dragon_tpa_prep_factored) and the attention reads them back (ggml_dragon_tpa_attn); about 2.6x less KV memory
+    if (gctx.cparams.tpa_factored) {
+        GGML_ASSERT(layer.attn_shift_k != nullptr);
+        const int64_t n_seqs = gctx.ubatch.n_seqs;
+        GGML_ASSERT(n_tokens % n_seqs == 0);
+
+        ggml_tensor * wlist[9] = { layer.wq, layer.attn_wa_k, layer.attn_wa_v, layer.attn_wb_k, layer.attn_wb_v,
+                                   layer.attn_shift_k, layer.attn_shift_v, layer.attn_lambda, layer.attn_gate };
+        bool repacked = false;
+        for (ggml_tensor * w : wlist) {
+            repacked = repacked || dragon_tensor_repacked(w);
+        }
+        ggml_tensor * pr = nullptr;
+        if (n_tokens <= DRAGON_METAL_MAX_TOKENS && (dragon_layer_metal || !repacked)) {
+            pr = ggml_dragon_mmv(ctx, cur, wlist, 9);
+        } else {
+            // long batches (matrix-matrix kernels) or CPU repacked weights (not read by DRAGON_MMV): the 9 projections
+            // one by one, concatenated
+            for (ggml_tensor * w : wlist) {
+                ggml_tensor * y = ggml_mul_mat(ctx, w, cur);
+                pr = pr ? ggml_concat(ctx, pr, y, 0) : y;
+            }
+        }
+        ggml_set_name(pr, "v_proj_fused");
+
+        ggml_tensor * states_all = mctx_recr->get_r_l(il);
+        ggml_tensor * shift_view = gctx.build_rs(inp_rs, states_all, hparams.n_embd_r(), n_seqs);       // (n_embd_r, n_seqs)
+
+        const float slw_wsize_f = (float) std::max<uint32_t>(hparams.dragon_slw_wsize, 1u);
+        ggml_tensor * prep = ggml_dragon_tpa_prep_factored(ctx, pr, shift_view, gctx.build_inp_pos(),
+                layer.attn_q_norm, layer.attn_k_norm, layer.attn_softmax_scaler,
+                (int) n_head, (int) n_kv, (int) rank, (int) head_dim, (int) n_signal, (int) n_seqs,
+                hparams.f_norm_rms_eps, slw_wsize_f, gate_b);
+        ggml_set_name(prep, "v_tpa_prep");
+
+        const size_t  f      = sizeof(float);
+        const int64_t KR     = ggml_dragon_tpa_row_k((int) n_kv, (int) rank, (int) head_dim);
+        const int64_t VR     = ggml_dragon_tpa_row_v((int) n_kv, (int) rank, (int) head_dim);
+        const int64_t o_k    = n_tokens*n_head*head_dim;
+        const int64_t o_v    = o_k + n_tokens*KR;
+        const int64_t o_lam  = o_v + n_tokens*VR;
+        const int64_t o_g    = o_lam + n_tokens*n_kv;
+        const int64_t o_last = o_g + n_tokens*n_signal*head_dim;
+
+        ggml_tensor * Qf   = ggml_view_3d(ctx, prep, head_dim, n_head, n_tokens, head_dim*f, head_dim*n_head*f, 0);
+        // factor rows as (KR/n_kv, n_kv, T): the cache merges the first two dims into its rows
+        ggml_tensor * Kr   = ggml_view_3d(ctx, prep, KR/n_kv, n_kv, n_tokens, (KR/n_kv)*f, KR*f, o_k*f);
+        ggml_tensor * Vr   = ggml_view_3d(ctx, prep, VR/n_kv, n_kv, n_tokens, (VR/n_kv)*f, VR*f, o_v*f);
+        ggml_tensor * lam  = ggml_view_2d(ctx, prep, n_kv, n_tokens, n_kv*f, o_lam*f);
+        ggml_tensor * gs   = ggml_view_2d(ctx, prep, n_signal*head_dim, n_tokens, n_signal*head_dim*f, o_g*f);
+        ggml_tensor * last = ggml_view_2d(ctx, prep, hparams.n_embd_r(), n_seqs, hparams.n_embd_r()*f, o_last*f);
+
+        // pre-shift K/V of each sequence's last token -> recurrent cache (the next token's shift and key norm)
+        const auto kv_head = mctx_recr->get_head();
+        const size_t row_size = hparams.n_embd_r() * ggml_element_size(states_all);
+        ggml_build_forward_expand(gctx.gf, ggml_cpy(ctx, last,
+                ggml_view_2d(ctx, states_all, hparams.n_embd_r(), n_seqs, states_all->nb[1], kv_head * row_size)));
+
+        const auto * mctx_kv = inp_attn->mctx;
+        ggml_build_forward_expand(gctx.gf, Qf);
+        ggml_build_forward_expand(gctx.gf, mctx_kv->cpy_k(ctx, Kr, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gctx.gf, mctx_kv->cpy_v(ctx, Vr, inp_attn->get_v_idxs(), il));
+
+        ggml_tensor * k4   = mctx_kv->get_k(ctx, il);                                    // (KR/n_kv, n_kv, n_kv_cells, ns)
+        ggml_tensor * v4   = mctx_kv->get_v(ctx, il);
+        ggml_tensor * mask = inp_attn->get_kq_mask();                                    // (n_kv_cells, T/ns, 1, ns)
+        const int64_t n_cells = k4->ne[2];
+        const int64_t ns      = mask->ne[3];
+        ggml_tensor * kc = ggml_view_3d(ctx, k4, KR, n_cells, ns, k4->nb[2], k4->nb[3], 0);
+        ggml_tensor * vc = ggml_view_3d(ctx, v4, VR, n_cells, ns, v4->nb[2], v4->nb[3], 0);
+        if (inp_attn->self_prev_cell == nullptr) {
+            inp_attn->self_prev_cell = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, mask->ne[0], ns);
+            ggml_set_input(inp_attn->self_prev_cell);
+        }
+
+        const float kq_scale = 1.0f / (float) head_dim;
+        const float softcap  = hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f;
+        ggml_tensor * attn_out = nullptr;
+        if (n_tokens/ns > DRAGON_TPA_FACTORED_MAX_T) {
+            // long batches: K / V expanded once (one layer at a time) and the usual attention
+            ggml_tensor * ke = ggml_dragon_tpa_expand(ctx, kc, inp_attn->self_prev_cell, (int) n_kv, (int) rank, (int) head_dim, false);
+            ggml_tensor * ve = ggml_dragon_tpa_expand(ctx, vc, inp_attn->self_prev_cell, (int) n_kv, (int) rank, (int) head_dim, true);
+            ggml_set_name(ke, "v_tpa_k");
+            ggml_set_name(ve, "v_tpa_v");
+            attn_out = gctx.build_attn_mha(Qf, ke, ve, nullptr, mask, nullptr, nullptr, 0, kq_scale, il);
+        } else {
+            ggml_tensor * q4 = ggml_reshape_4d(ctx, Qf, head_dim, n_head, n_tokens/ns, ns);
+            attn_out = ggml_dragon_tpa_attn(ctx, q4, kc, vc, mask, inp_attn->self_prev_cell, (int) n_kv, (int) rank, kq_scale, softcap);
+            ggml_set_name(attn_out, "v_tpa_attn");
+        }
+        attn_out = ggml_reshape_3d(ctx, attn_out, head_dim, n_head, n_tokens);
+
+        ggml_tensor * y_attn = ggml_dragon_diff_gate(ctx, attn_out, lam, gs);
+        ggml_tensor * v_out  = ggml_mul_mat(ctx, layer.wo, y_attn);
+        ggml_set_name(v_out, "v_out_proj");
+        return v_out;
+    }
 
     // Metal: the whole preparation in 3 ops (9 projections in one GEMV, TPA expand + token shift + norms + scalable softmax
     // + lambda + gate in one kernel, differential combine x gate in one kernel); the attention itself stays in build_attn.

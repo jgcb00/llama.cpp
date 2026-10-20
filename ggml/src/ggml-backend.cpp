@@ -2271,6 +2271,7 @@ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
         case GGML_OP_TOP_K:
         case GGML_OP_MAMBA3_MIMO:
         case GGML_OP_DRAGON_MOE:
+        case GGML_OP_DRAGON_TPA_ATTN:
             return true;
         default:
             return false;

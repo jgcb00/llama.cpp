@@ -25,6 +25,9 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    // TPA attention layers (Dragon): the KV cache keeps the TPA factors (llama_tpa_cache_type)
+    bool tpa_factored;
 };
 
 enum llama_memory_status {
