@@ -1,4 +1,4 @@
-// Low-RAM mode of the Dragon fused MoE op (GGML_OP_DRAGON_MOE, expert_cache_mib >= 0):
+// Low-RAM mode of the Olala fused MoE op (GGML_OP_OLALA_MOE, expert_cache_mib >= 0):
 // the expert tensors live in a read-only file mapping, as with llama --lazy-mode on.
 // Checks, at the real Olala dimensions (256 experts, ~150 MB of expert weights):
 //   1. the output is bitwise identical to the same op on in-RAM weights
@@ -144,7 +144,7 @@ struct weights {
 static std::vector<float> run_op(const weights & w, ggml_tensor * x, ggml_tensor * up, ggml_tensor * down, int cache_mib, int n_threads) {
     ggml_init_params ip = { (size_t) 256*1024*1024, nullptr, false };
     ggml_context * ctx = ggml_init(ip);
-    ggml_tensor * out = ggml_dragon_moe(ctx, x, w.ld, w.r, w.bias, up, down, w.lu, w.us, w.ds, (int) K, 2.45f, cache_mib);
+    ggml_tensor * out = ggml_olala_moe(ctx, x, w.ld, w.r, w.bias, up, down, w.lu, w.us, w.ds, (int) K, 2.45f, cache_mib);
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
     ggml_graph_compute_with_ctx(ctx, gf, n_threads);
@@ -162,7 +162,7 @@ int main() {
     const size_t up_bytes   = ggml_row_size(T_EXP, N_LAT)*N_FF*N_EXPERT;
     const size_t down_bytes = ggml_row_size(T_EXP, N_FF)*N_LAT*N_EXPERT;
     const size_t up_off = 0, down_off = GGML_PAD(up_bytes, 65536), file_size = down_off + GGML_PAD(down_bytes, 65536);
-    const std::string path = (std::filesystem::temp_directory_path() / ("test-dragon-moe-paging-" + std::to_string(rng()) + ".bin")).string();
+    const std::string path = (std::filesystem::temp_directory_path() / ("test-olala-moe-paging-" + std::to_string(rng()) + ".bin")).string();
     std::vector<uint8_t> up_q   = random_quantized(rng, T_EXP, N_LAT, N_FF*N_EXPERT, 0.05f);
     std::vector<uint8_t> down_q = random_quantized(rng, T_EXP, N_FF, N_LAT*N_EXPERT, 0.05f);
     {

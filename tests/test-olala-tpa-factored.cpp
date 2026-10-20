@@ -1,5 +1,5 @@
-// Dragon TPA factored KV cache: the factored path (ggml_dragon_tpa_prep_factored + rows in a cache +
-// ggml_dragon_tpa_attn) must match the expanded one (ggml_dragon_tpa_prep + softmax attention over the expanded K/V).
+// Olala TPA factored KV cache: the factored path (ggml_olala_tpa_prep_factored + rows in a cache +
+// ggml_olala_tpa_attn) must match the expanded one (ggml_olala_tpa_prep + softmax attention over the expanded K/V).
 // The cache rows are stored out of order with a cell permutation and a few unused cells, so the previous-token
 // indirection and the mask are exercised; two sequences of different lengths share the cache.
 
@@ -46,8 +46,8 @@ int main() {
     ggml_set_name(pr, "pr");
 
     // ---- expanded reference
-    ggml_tensor * full = ggml_dragon_tpa_prep(ctx, pr, prev, pos, q_norm, k_norm, scaler, H, Hn, R, Dh, Hs, 1, eps, wsize, gate_b);
-    ggml_tensor * fact = ggml_dragon_tpa_prep_factored(ctx, pr, prev, pos, q_norm, k_norm, scaler, H, Hn, R, Dh, Hs, 1, eps, wsize, gate_b);
+    ggml_tensor * full = ggml_olala_tpa_prep(ctx, pr, prev, pos, q_norm, k_norm, scaler, H, Hn, R, Dh, Hs, 1, eps, wsize, gate_b);
+    ggml_tensor * fact = ggml_olala_tpa_prep_factored(ctx, pr, prev, pos, q_norm, k_norm, scaler, H, Hn, R, Dh, Hs, 1, eps, wsize, gate_b);
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, full);
     ggml_build_forward_expand(gf, fact);
@@ -85,7 +85,7 @@ int main() {
     }
 
     // ---- factored: rows scattered into a cache of n_kv cells (cell of token t: perm[t]), the others unused
-    const int64_t KR = ggml_dragon_tpa_row_k(Hn, R, Dh), VR = ggml_dragon_tpa_row_v(Hn, R, Dh);
+    const int64_t KR = ggml_olala_tpa_row_k(Hn, R, Dh), VR = ggml_olala_tpa_row_v(Hn, R, Dh);
     const int n_kv = T + 5;
     std::vector<int> perm(n_kv);
     for (int i = 0; i < n_kv; ++i) {
@@ -137,14 +137,14 @@ int main() {
         // the first token's shift partner is the previous ubatch (prev state): with p0 == 0 its weight is 0
         ggml_tensor * q = ggml_view_4d(ctx, fact, Dh, H, T, 1, Dh*sizeof(float), (size_t) H*Dh*sizeof(float),
                 (size_t) T*H*Dh*sizeof(float), 0);
-        ggml_tensor * out = ggml_dragon_tpa_attn(ctx, ggml_cont(ctx, q), kc, vc, mask, pv, Hn, R, scale, softcap);
+        ggml_tensor * out = ggml_olala_tpa_attn(ctx, ggml_cont(ctx, q), kc, vc, mask, pv, Hn, R, scale, softcap);
         ggml_cgraph * g2 = ggml_new_graph(ctx);
         ggml_build_forward_expand(g2, out);
         ggml_graph_compute_with_ctx(ctx, g2, n_threads);
 
         // the same attention over the K / V expanded back from the factors (the path of long batches)
-        ggml_tensor * ke = ggml_dragon_tpa_expand(ctx, kc, pv, Hn, R, Dh, false);
-        ggml_tensor * ve = ggml_dragon_tpa_expand(ctx, vc, pv, Hn, R, Dh, true);
+        ggml_tensor * ke = ggml_olala_tpa_expand(ctx, kc, pv, Hn, R, Dh, false);
+        ggml_tensor * ve = ggml_olala_tpa_expand(ctx, vc, pv, Hn, R, Dh, true);
         ggml_cgraph * g3 = ggml_new_graph(ctx);
         ggml_build_forward_expand(g3, ke);
         ggml_build_forward_expand(g3, ve);
@@ -191,7 +191,7 @@ int main() {
         const double nmse   = nmse_of((const float *) out->data);
         const double nmse_e = nmse_of(oe.data());
         const double tol    = type == GGML_TYPE_F16 ? 1e-5 : 1e-10;
-        printf("factored %s cache vs expanded: nmse = %.3g %s, through ggml_dragon_tpa_expand: nmse = %.3g %s\n", ggml_type_name(type),
+        printf("factored %s cache vs expanded: nmse = %.3g %s, through ggml_olala_tpa_expand: nmse = %.3g %s\n", ggml_type_name(type),
                 nmse, nmse < tol ? "OK" : "FAIL", nmse_e, nmse_e < 1e-5 ? "OK" : "FAIL");
         ok = ok && nmse < tol && nmse_e < 1e-5;
     }

@@ -1033,7 +1033,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_SOLVE_TRI:
             case GGML_OP_MAMBA3_MIMO:
             case GGML_OP_GEODESIC:
-            case GGML_OP_DRAGON_MOE: {
+            case GGML_OP_OLALA_MOE: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
             case GGML_OP_GATED_DELTA_NET: {

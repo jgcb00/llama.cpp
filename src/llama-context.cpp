@@ -314,7 +314,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: n_ubatch              = %u\n",   __func__, cparams.n_ubatch);
     LLAMA_LOG_INFO("%s: causal_attn           = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn            = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
-    if (model.arch == LLM_ARCH_DRAGON) {
+    if (model.arch == LLM_ARCH_OLALA) {
         LLAMA_LOG_INFO("%s: tpa_cache             = %s (%s)\n", __func__, llama_tpa_cache_type_name(params.tpa_cache_type),
                 cparams.tpa_factored ? "factored" : "full");
     }
@@ -2420,7 +2420,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_MINIMAX_01 ||
         model.arch == LLM_ARCH_MINIMAX_M3 ||
         model.arch == LLM_ARCH_HY_V4 ||
-        model.arch == LLM_ARCH_DRAGON) {
+        model.arch == LLM_ARCH_OLALA) {
         res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
         // DFlash2's convolutions and selector are shape work rather than matmuls,

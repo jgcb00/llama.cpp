@@ -238,7 +238,7 @@ public:
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // I32 (n_kv, n_stream): for each cell, the cell of the previous position of the same sequence (-1: none), for
-    // attention layers whose keys depend on the previous token (Dragon TPA factored cache)
+    // attention layers whose keys depend on the previous token (Olala TPA factored cache)
     void set_input_prev_cell(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -439,7 +439,7 @@ public:
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // I32 (n_kv, n_stream): for each cell, the cell of the previous position of the same sequence (-1: none), for
-    // attention layers whose keys depend on the previous token (Dragon TPA factored cache)
+    // attention layers whose keys depend on the previous token (Olala TPA factored cache)
     void set_input_prev_cell(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

@@ -2862,11 +2862,11 @@ class TensorNameMap:
                 "model.layers.{bid}.ple.conv1d",
             ),
         },
-        # Dragon: all per-block tensors live under model.layers.{bid}.
+        # Olala: all per-block tensors live under model.layers.{bid}.
         # M and V layers share the mixer namespace (model.layers.{bid}.mixer.*)
         # but the mixer field names differ. Mixers are dispatched by layer type
         # in the converter; this map is the union of both flavors' tensors.
-        MODEL_ARCH.DRAGON: {
+        MODEL_ARCH.OLALA: {
             # Block-level: mixer_proj (the post-mixer down-projection to hidden).
             MODEL_TENSOR.ATTN_OUT: (
                 "model.layers.{bid}.mixer_proj",

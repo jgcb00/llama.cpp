@@ -240,13 +240,13 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             {
                 res += ggml_metal_op_mamba3_mimo_extra_ws(tensor);
             } break;
-        case GGML_OP_DRAGON_MOE:
+        case GGML_OP_OLALA_MOE:
             {
-                res += ggml_metal_op_dragon_moe_extra_ws(tensor);
+                res += ggml_metal_op_olala_moe_extra_ws(tensor);
             } break;
-        case GGML_OP_DRAGON_TPA_ATTN:
+        case GGML_OP_OLALA_TPA_ATTN:
             {
-                res += ggml_metal_op_dragon_tpa_attn_extra_tmp(tensor, ggml_metal_device_get_props((ggml_metal_device_t) buft->device->context)->gpu_core_count);
+                res += ggml_metal_op_olala_tpa_attn_extra_tmp(tensor, ggml_metal_device_get_props((ggml_metal_device_t) buft->device->context)->gpu_core_count);
             } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:

@@ -1,6 +1,6 @@
 #include "mamba3-mimo.cuh"
 
-// Fused Dragon Mamba3-MIMO mixer core (see ggml_mamba3_mimo in ggml.h).
+// Fused Olala Mamba3-MIMO mixer core (see ggml_mamba3_mimo in ggml.h).
 // semantic reference: ggml_compute_forward_mamba3_mimo (ggml/src/ggml-cpu/ops.cpp).
 //
 // One block per (head, seq[, chunk]). Every token step builds its own operands

@@ -196,7 +196,7 @@ extern "C" {
 
     LLAMA_API const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type);
 
-    // KV cache layout of the TPA attention layers (Dragon): the expanded K/V (full) or the TPA factors (factored: ~2.6x
+    // KV cache layout of the TPA attention layers (Olala): the expanded K/V (full) or the TPA factors (factored: ~2.6x
     // less memory per token, more compute in the attention). auto: factored on devices with matrix units (Metal: M5 / A19),
     // full otherwise
     enum llama_tpa_cache_type {
@@ -390,7 +390,7 @@ extern "C" {
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id
         enum llama_attention_type    attention_type;    // attention type to use for embeddings
         enum llama_flash_attn_type   flash_attn_type;   // when to enable Flash Attention
-        enum llama_tpa_cache_type    tpa_cache_type;    // KV cache layout of TPA attention layers (Dragon)
+        enum llama_tpa_cache_type    tpa_cache_type;    // KV cache layout of TPA attention layers (Olala)
 
         // ref: https://github.com/ggml-org/llama.cpp/pull/2054
         float    rope_freq_base;   // RoPE base frequency, 0 = from model

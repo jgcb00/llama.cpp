@@ -597,7 +597,7 @@ struct llama_layer {
     // gemma4 layer output scale, reused for talkie embedding skip scale
     struct ggml_tensor * out_scale = nullptr;
 
-    // Dragon Mamba3-MIMO (M layer)
+    // Olala Mamba3-MIMO (M layer)
     struct ggml_tensor * ssm_in_dyn  = nullptr; // in_proj_dyn (hidden, 2·R·d_state + num_rope_angles)
     struct ggml_tensor * ssm_b_bias  = nullptr; // per-head bias on B  (n_head, R, d_state)
     struct ggml_tensor * ssm_c_bias  = nullptr; // per-head bias on C  (n_head, R, d_state)
@@ -611,7 +611,7 @@ struct llama_layer {
     struct ggml_tensor * ssm_m3_norms = nullptr;
     struct ggml_tensor * ssm_m3_misc  = nullptr;
 
-    // Dragon Diff-TPA-V2 (V layer)
+    // Olala Diff-TPA-V2 (V layer)
     struct ggml_tensor * attn_wa_k           = nullptr; // (hidden, n_kv · rank)
     struct ggml_tensor * attn_wa_v           = nullptr; // (hidden, n_kv · rank)
     struct ggml_tensor * attn_wb_k           = nullptr; // (hidden, rank · head_dim)
@@ -622,7 +622,7 @@ struct llama_layer {
     struct ggml_tensor * attn_softmax_scaler = nullptr; // (n_head,)
     struct ggml_tensor * attn_gate           = nullptr; // (hidden, n_signal · head_dim)  block-level gate, V-only
 
-    // Dragon geodesic-residual (two pairs per block, each is a scalar tensor of size 1)
+    // Olala geodesic-residual (two pairs per block, each is a scalar tensor of size 1)
     struct ggml_tensor * geo_mixer_scale = nullptr;
     struct ggml_tensor * geo_mixer_bias  = nullptr;
     struct ggml_tensor * geo_mlp_scale   = nullptr;
@@ -831,7 +831,7 @@ public:
 
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
 
-    // TPA attention (Dragon): whether a context with this llama_tpa_cache_type keeps the TPA factors in its KV cache,
+    // TPA attention (Olala): whether a context with this llama_tpa_cache_type keeps the TPA factors in its KV cache,
     // and the hparams of that cache layout (the attention layers' K/V rows are the factor rows)
     bool tpa_cache_factored(llama_tpa_cache_type type) const;
     const llama_hparams & hparams_tpa_factored() const;

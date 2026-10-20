@@ -1,7 +1,7 @@
-# Olala / Dragon 7A1B in llama.cpp — conversion, quantization & usage
+# Olala 7A1B in llama.cpp — conversion, quantization & usage
 
-Olala (architecture name `dragon` in GGUF; HF classes `OlalaForCausalLM` /
-`DragonForCausalLM`) is a hybrid LLM: 36 blocks in an `MMMMV` pattern — 29
+Olala (architecture name `olala` in GGUF; HF classes `OlalaForCausalLM` /
+`OlalaForCausalLM`) is a hybrid LLM: 36 blocks in an `MMMMV` pattern — 29
 **Mamba3-MIMO** recurrent mixers (rank-4 MIMO, trapezoid state update, rotary phase
 state), 7 **Differential-TPA** attention mixers (48 q-heads / 12 kv-heads, head_dim
 128, logit softcap 150, token shift, scalable softmax), a **256-expert / 6-active
@@ -19,7 +19,7 @@ Branch: **`olala-master`** (rebased on upstream master of 2026-10-02).
 | target | command | notes |
 |---|---|---|
 | CPU (x86 / ARM) | `cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j` | fast kernels are ggml-cpu ops: AVX-512, AVX2 and NEON paths, runtime ISA dispatch in multi-variant builds |
-| Apple (Metal) | `cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j` | validated on an M5 Pro (see [olala-setup.md](olala-setup.md) §2b); checklist in [dragon-metal-testing.md](dragon-metal-testing.md) |
+| Apple (Metal) | `cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j` | validated on an M5 Pro (see [olala-setup.md](olala-setup.md) §2b); checklist in [olala-metal-testing.md](olala-metal-testing.md) |
 | NVIDIA (CUDA) | `cmake -B build-cuda -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build-cuda -j` | on boxes with several CUDA toolkits pin `-DCMAKE_CUDA_COMPILER=… -DCMAKE_CUDA_HOST_COMPILER=…` |
 
 No environment variables are needed: layers whose weights sit on a GPU automatically
@@ -42,10 +42,10 @@ the MoE router stay F32 and are never quantized.
 
 ## 3. Quantization — read before running llama-quantize
 
-Dragon has **massive outlier activations** (up to ~1e14 at two M-mixer outputs,
+Olala has **massive outlier activations** (up to ~1e14 at two M-mixer outputs,
 ~1e9 after the MoE ReLU²). Quantized matmuls quantize activations on the fly:
 
-| weight type | activation format | scale type | on Dragon |
+| weight type | activation format | scale type | on Olala |
 |---|---|---|---|
 | K-quants (q3_K…q6_K), iq4_xs | q8_K | fp32 | safe |
 | type-0 (q4_0/q5_0/q8_0, iq4_nl) | q8_0 | fp16 | overflows → NaN where the input has outliers |
@@ -93,7 +93,7 @@ below), and the fused MoE op cannot read repacked weights. q5_K/q6_K/q8_0 files 
 not repacked on x86 anyway.
 
 **CPU kernels** (2026-10-06): the whole MoE block of a layer runs as one ggml-cpu op
-(`GGML_OP_DRAGON_MOE`: latent down, f32 router, top-k, experts, latent up, shared
+(`GGML_OP_OLALA_MOE`: latent down, f32 router, top-k, experts, latent up, shared
 expert; 3 thread barriers instead of ~14 nodes) for ubatches of ≤ 8 tokens, i.e.
 decode and up to 8 concurrent slots (tg 92.6 → 109 t/s). The Mamba3-MIMO prefill sweep
 is d-major with the trapezoid term folded into the state (shifted-γ identity of the
@@ -121,7 +121,7 @@ Long context / multi-user (q5_k_m, 16 threads): pp8192 405 t/s; decode 86 t/s at
   single-request output (batch-shape rounding in the CPU GEMMs), never corrupted.
 - Recurrent state: kept in **f32** (a reduced-precision state degrades long
   generations into repetition loops); the rotary phase is kept wrapped to [-π, π].
-  `DRAGON_BF16_STATE=1` stores the K/V sections bf16 (not recommended).
+  `OLALA_BF16_STATE=1` stores the K/V sections bf16 (not recommended).
 - Low RAM: `--lazy-mode on` keeps the routed experts and the token embeddings
   on disk and pages the selected experts in per layer (CPU fused MoE op: read-ahead
   after routing, release after use). ≈ 1.2 GiB RSS for q5_k_m; 27 t/s decode under a
@@ -138,16 +138,16 @@ Long context / multi-user (q5_k_m, 16 threads): pp8192 405 t/s; decode 86 t/s at
 
 | variable | effect |
 |---|---|
-| `DRAGON_PORTABLE=1` | force the GPU graph on CPU (reference for backend checks) |
-| `DRAGON_CPU_CUSTOM_M=1`, `DRAGON_CPU_CUSTOM_GEO=1` | legacy libllama custom-op CPU kernels |
-| `DRAGON_NO_INPLACE_STATE=1` | gather + copy the recurrent state instead of updating it in place |
-| `DRAGON_NO_FUSED_MOE/SHIFT/GEO=1` | ggml-primitive MoE / token shift / geodesic on CPU |
-| `DRAGON_FUSED_MOE_MAX_T=N` | largest ubatch handled by the fused MoE op (default 8, 0 disables) |
+| `OLALA_PORTABLE=1` | force the GPU graph on CPU (reference for backend checks) |
+| `OLALA_CPU_CUSTOM_M=1`, `OLALA_CPU_CUSTOM_GEO=1` | legacy libllama custom-op CPU kernels |
+| `OLALA_NO_INPLACE_STATE=1` | gather + copy the recurrent state instead of updating it in place |
+| `OLALA_NO_FUSED_MOE/SHIFT/GEO=1` | ggml-primitive MoE / token shift / geodesic on CPU |
+| `OLALA_FUSED_MOE_MAX_T=N` | largest ubatch handled by the fused MoE op (default 8, 0 disables) |
 | `GGML_M3_LEGACY=1` | previous (blocked, p-major) Mamba3 CPU kernel for every ubatch size |
-| `DRAGON_EXPERT_CACHE_MB=N` | low-RAM mode: keep the N MiB of most recently used experts mapped (default 0) |
-| `DRAGON_EXPERT_DROP_CACHE=1` | low-RAM mode, Linux: also drop released experts from the OS page cache (strict, slower) |
-| `DRAGON_BF16_STATE=1` | bf16 K/V state sections |
-| `DRAGON_M_PRIM=1` / `DRAGON_M_CHUNK_SIZE=N` / `DRAGON_M_DECODE_PRIM=1` | closed-form primitive reference paths (single sequence) |
+| `OLALA_EXPERT_CACHE_MB=N` | low-RAM mode: keep the N MiB of most recently used experts mapped (default 0) |
+| `OLALA_EXPERT_DROP_CACHE=1` | low-RAM mode, Linux: also drop released experts from the OS page cache (strict, slower) |
+| `OLALA_BF16_STATE=1` | bf16 K/V state sections |
+| `OLALA_M_PRIM=1` / `OLALA_M_CHUNK_SIZE=N` / `OLALA_M_DECODE_PRIM=1` | closed-form primitive reference paths (single sequence) |
 | `GGML_OP_PROFILE=1` (`GGML_OP_PROFILE_TOP=N`) | per-op CPU time tables at exit |
 
 ## 6. Known limitations
@@ -155,7 +155,7 @@ Long context / multi-user (q5_k_m, 16 threads): pp8192 405 t/s; decode 86 t/s at
 - Low-RAM mode (`--lazy-mode on`) is CPU-only and untested with GPU offload
   (`-ngl`): lazy experts always live in host memory and only the CPU MoE op
   releases them.
-- Quantized weights on GPUs: fp16 activation scales overflow on Dragon's outliers.
+- Quantized weights on GPUs: fp16 activation scales overflow on Olala's outliers.
 - Recurrent models cannot context-shift; prompts beyond the context fail.
 - Truncated tool calls at `max_tokens` are returned partially (shared llama.cpp
   behaviour; vLLM drops them).

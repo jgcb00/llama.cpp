@@ -29,7 +29,7 @@
 
 // Fused: out1[i] += a1*in1[i] ; out2[i] += a2*in2[i]
 // Used to update curr_kv and prev_kv in one pass (shared p, d iteration).
-static inline float dragon_sigmoidf(float x) {
+static inline float olala_sigmoidf(float x) {
     return 1.0f / (1.0f + expf(-x));
 }
 
@@ -38,58 +38,58 @@ static inline float dragon_sigmoidf(float x) {
 //   F32  — default: plain f32 everywhere. Long generations drift into
 //          repetition loops with a reduced-precision state, so this is what
 //          the reference stacks (training, vLLM) run.
-//   BF16 — DRAGON_BF16_STATE=1 (opt-in). K/V trapezoid sections packed to bf16
+//   BF16 — OLALA_BF16_STATE=1 (opt-in). K/V trapezoid sections packed to bf16
 //          (low half of their f32 sections); the ssm S-matrix and angle scalars
 //          stay f32. Ignored by the paths that read the cache as raw f32
 //          (prim/chunked/mega/colsplit).
-//   Q8   — DRAGON_STATE_Q8=1 (experiment). ssm S-matrix AND K/V trapezoids
+//   Q8   — OLALA_STATE_Q8=1 (experiment). ssm S-matrix AND K/V trapezoids
 //          stored as per-32-block int8 with an f32 scale ([scale][32xint8]
 //          in each 32-float slot); angles stay f32. Recurrent feedback of the
 //          quantization error accumulates over t — validate before adopting.
-enum dragon_state_prec { DRAGON_STATE_F32, DRAGON_STATE_BF16, DRAGON_STATE_Q8 };
-static dragon_state_prec dragon_state_mode() {
-    static const dragon_state_prec v = [] {
-        if (std::getenv("DRAGON_F32_STATE"))     return DRAGON_STATE_F32;
-        if (std::getenv("DRAGON_M_PRIM"))        return DRAGON_STATE_F32;
-        if (std::getenv("DRAGON_M_DECODE_PRIM")) return DRAGON_STATE_F32;
-        if (std::getenv("DRAGON_M_CHUNK_SIZE"))  return DRAGON_STATE_F32;
-        if (std::getenv("DRAGON_MEGA_DECODE"))   return DRAGON_STATE_F32;
-        if (std::getenv("DRAGON_M_COLSPLIT"))    return DRAGON_STATE_F32; // q8/bf16 slots assume unsplit 32-aligned runs
-        if (std::getenv("DRAGON_STATE_Q8"))      return DRAGON_STATE_Q8;
-        if (std::getenv("DRAGON_BF16_STATE"))    return DRAGON_STATE_BF16;
-        return DRAGON_STATE_F32;
+enum olala_state_prec { OLALA_STATE_F32, OLALA_STATE_BF16, OLALA_STATE_Q8 };
+static olala_state_prec olala_state_mode() {
+    static const olala_state_prec v = [] {
+        if (std::getenv("OLALA_F32_STATE"))     return OLALA_STATE_F32;
+        if (std::getenv("OLALA_M_PRIM"))        return OLALA_STATE_F32;
+        if (std::getenv("OLALA_M_DECODE_PRIM")) return OLALA_STATE_F32;
+        if (std::getenv("OLALA_M_CHUNK_SIZE"))  return OLALA_STATE_F32;
+        if (std::getenv("OLALA_MEGA_DECODE"))   return OLALA_STATE_F32;
+        if (std::getenv("OLALA_M_COLSPLIT"))    return OLALA_STATE_F32; // q8/bf16 slots assume unsplit 32-aligned runs
+        if (std::getenv("OLALA_STATE_Q8"))      return OLALA_STATE_Q8;
+        if (std::getenv("OLALA_BF16_STATE"))    return OLALA_STATE_BF16;
+        return OLALA_STATE_F32;
     }();
     return v;
 }
-static bool dragon_state_bf16() { return dragon_state_mode() != DRAGON_STATE_F32; }
+static bool olala_state_bf16() { return olala_state_mode() != OLALA_STATE_F32; }
 
 // Backend selection, decided per layer while the graph is built. Layers whose
 // weights live on the CPU use the fused CPU custom ops (fastest there, CPU-only);
 // layers on a GPU (CUDA, Metal, ...) use standard ggml ops + GGML_OP_MAMBA3_MIMO
-// so the whole layer stays on that device. The DRAGON_GGML_OP / DRAGON_NO_FUSED_*
-// env vars still force parts of the portable path on CPU; DRAGON_PORTABLE=1
+// so the whole layer stays on that device. The OLALA_GGML_OP / OLALA_NO_FUSED_*
+// env vars still force parts of the portable path on CPU; OLALA_PORTABLE=1
 // forces all of it (validates the GPU graph against the CPU one).
-static thread_local bool dragon_layer_cpu = true;
-// the layer runs on the Metal backend, which implements GGML_OP_DRAGON_MOE (3 dispatches)
-static thread_local bool dragon_layer_metal = false;
+static thread_local bool olala_layer_cpu = true;
+// the layer runs on the Metal backend, which implements GGML_OP_OLALA_MOE (3 dispatches)
+static thread_local bool olala_layer_metal = false;
 
-// the Metal Dragon kernels (fused MoE, TPA prep) are decode kernels: ubatches above this many tokens use the graph path
-// (DRAGON_NO_FUSED_MOE forces the graph path for the MoE)
-static constexpr int64_t DRAGON_METAL_MAX_TOKENS = 32;
+// the Metal Olala kernels (fused MoE, TPA prep) are decode kernels: ubatches above this many tokens use the graph path
+// (OLALA_NO_FUSED_MOE forces the graph path for the MoE)
+static constexpr int64_t OLALA_METAL_MAX_TOKENS = 32;
 
 // factored TPA cache: batches above this many tokens per sequence expand the cache for the attention
-static constexpr int64_t DRAGON_TPA_FACTORED_MAX_T = 8;
+static constexpr int64_t OLALA_TPA_FACTORED_MAX_T = 8;
 
 static ggml_tensor * f32c_static(ggml_context * ctx, ggml_tensor * t) {
     return t->type == GGML_TYPE_F32 ? t : ggml_cast(ctx, t, GGML_TYPE_F32);
 }
 
-static bool dragon_env_on(const char * name) {
+static bool olala_env_on(const char * name) {
     const char * e = std::getenv(name);
     return e && e[0] && e[0] != '0';
 }
 
-static inline void dragon_simd_fma_inplace_dual(
+static inline void olala_simd_fma_inplace_dual(
         float * GGML_RESTRICT out1, const float * GGML_RESTRICT in1, float a1,
         float * GGML_RESTRICT out2, const float * GGML_RESTRICT in2, float a2,
         int64_t n) {
@@ -129,7 +129,7 @@ static inline void dragon_simd_fma_inplace_dual(
 }
 
 // state[i] = alpha * state[i] + beta * prev[i] + gamma * curr[i]
-static inline void dragon_simd_state_update(float * GGML_RESTRICT state,
+static inline void olala_simd_state_update(float * GGML_RESTRICT state,
                                             const float * GGML_RESTRICT prev,
                                             const float * GGML_RESTRICT curr,
                                             float alpha, float beta, float gamma,
@@ -180,7 +180,7 @@ static inline void dragon_simd_state_update(float * GGML_RESTRICT state,
 // fma; chunk-sequential dot with one final reduce), so results are
 // bit-identical on the AVX-512 path.
 template <int RC>
-static inline void dragon_simd_fused_step_r(
+static inline void olala_simd_fused_step_r(
         float * GGML_RESTRICT st,           // (Dv_sl, D_qk)
         const float * GGML_RESTRICT K_st,   // (RC, D_qk)  previous-step k_rot
         const float * GGML_RESTRICT V_st,   // (RC, Dv_sl) previous-step v
@@ -228,7 +228,7 @@ static inline void dragon_simd_fused_step_r(
                 float acc = _mm512_reduce_add_ps(qacc[r]);
                 acc += D_h * v_loc[r * Dv_sl + p];
                 const float zv = z_loc[r * Dv_sl + p];
-                acc *= zv * dragon_sigmoidf(zv);
+                acc *= zv * olala_sigmoidf(zv);
                 yp += acc * mo[r * m_s1 + p];
             }
             y_row[p] = yp;
@@ -255,14 +255,14 @@ static inline void dragon_simd_fused_step_r(
             }
             acc += D_h * v_loc[r * Dv_sl + p];
             const float zv = z_loc[r * Dv_sl + p];
-            acc *= zv * dragon_sigmoidf(zv);
+            acc *= zv * olala_sigmoidf(zv);
             yp += acc * mo[r * m_s1 + p];
         }
         y_row[p] = yp;
     }
 }
 
-static inline void dragon_simd_fused_step(
+static inline void olala_simd_fused_step(
         float * st, const float * K_st, const float * V_st,
         const float * k_rot, const float * q_rot,
         const float * v_loc, const float * z_loc,
@@ -270,11 +270,11 @@ static inline void dragon_simd_fused_step(
         float alpha, float beta, float gamma, float D_h,
         int64_t R, int64_t D_qk, int64_t Dv_sl) {
     switch (R) {
-        case 4:  dragon_simd_fused_step_r<4>(st, K_st, V_st, k_rot, q_rot, v_loc, z_loc, mo, m_s1, y_row, alpha, beta, gamma, D_h, D_qk, Dv_sl); break;
-        case 2:  dragon_simd_fused_step_r<2>(st, K_st, V_st, k_rot, q_rot, v_loc, z_loc, mo, m_s1, y_row, alpha, beta, gamma, D_h, D_qk, Dv_sl); break;
-        case 1:  dragon_simd_fused_step_r<1>(st, K_st, V_st, k_rot, q_rot, v_loc, z_loc, mo, m_s1, y_row, alpha, beta, gamma, D_h, D_qk, Dv_sl); break;
-        case 8:  dragon_simd_fused_step_r<8>(st, K_st, V_st, k_rot, q_rot, v_loc, z_loc, mo, m_s1, y_row, alpha, beta, gamma, D_h, D_qk, Dv_sl); break;
-        default: GGML_ABORT("dragon: unsupported MIMO rank %d", (int) R);
+        case 4:  olala_simd_fused_step_r<4>(st, K_st, V_st, k_rot, q_rot, v_loc, z_loc, mo, m_s1, y_row, alpha, beta, gamma, D_h, D_qk, Dv_sl); break;
+        case 2:  olala_simd_fused_step_r<2>(st, K_st, V_st, k_rot, q_rot, v_loc, z_loc, mo, m_s1, y_row, alpha, beta, gamma, D_h, D_qk, Dv_sl); break;
+        case 1:  olala_simd_fused_step_r<1>(st, K_st, V_st, k_rot, q_rot, v_loc, z_loc, mo, m_s1, y_row, alpha, beta, gamma, D_h, D_qk, Dv_sl); break;
+        case 8:  olala_simd_fused_step_r<8>(st, K_st, V_st, k_rot, q_rot, v_loc, z_loc, mo, m_s1, y_row, alpha, beta, gamma, D_h, D_qk, Dv_sl); break;
+        default: GGML_ABORT("olala: unsupported MIMO rank %d", (int) R);
     }
 }
 
@@ -286,7 +286,7 @@ static inline void dragon_simd_fused_step(
 // results are bit-identical on the AVX-512 path. prev_kv for token tt comes
 // from K_st/V_st for tt==0 and from token tt-1's k/v buffers otherwise.
 template <int RC, int TB>
-static inline void dragon_simd_fused_step_tb(
+static inline void olala_simd_fused_step_tb(
         float * GGML_RESTRICT st,
         const float * K_st, const float * V_st,
         const float * const * k_rot,   // TB pointers, each (RC, D_qk)
@@ -335,7 +335,7 @@ static inline void dragon_simd_fused_step_tb(
                     float acc = _mm512_reduce_add_ps(qacc[tt][r]);
                     acc += D_h * v_loc[tt][r * Dv_sl + p];
                     const float zv = z_loc[tt][r * Dv_sl + p];
-                    acc *= zv * dragon_sigmoidf(zv);
+                    acc *= zv * olala_sigmoidf(zv);
                     yp += acc * mo[r * m_s1 + p];
                 }
                 y_rows[tt][p] = yp;
@@ -349,15 +349,15 @@ static inline void dragon_simd_fused_step_tb(
     for (int tt = 0; tt < TB; ++tt) {
         const float * kp = (tt == 0) ? K_st : k_rot[tt - 1];
         const float * vp = (tt == 0) ? V_st : v_loc[tt - 1];
-        dragon_simd_fused_step_r<RC>(st, kp, vp, k_rot[tt], q_rot[tt], v_loc[tt], z_loc[tt],
+        olala_simd_fused_step_r<RC>(st, kp, vp, k_rot[tt], q_rot[tt], v_loc[tt], z_loc[tt],
                                      mo, m_s1, y_rows[tt], alpha[tt], beta[tt], gamma[tt], D_h,
                                      D_qk, Dv_sl);
     }
 }
 
-// Runtime dispatch over TB (1/2/4) for rank 4 (Dragon); other ranks fall back
+// Runtime dispatch over TB (1/2/4) for rank 4 (Olala); other ranks fall back
 // to sequential single-token steps.
-static inline void dragon_simd_fused_step_group(
+static inline void olala_simd_fused_step_group(
         float * st, const float * K_st, const float * V_st,
         const float * const * k_rot, const float * const * q_rot,
         const float * const * v_loc, const float * const * z_loc,
@@ -366,17 +366,17 @@ static inline void dragon_simd_fused_step_group(
         int64_t R, int64_t TB, int64_t D_qk, int64_t Dv_sl) {
     if (R == 4) {
         switch (TB) {
-            case 4: dragon_simd_fused_step_tb<4, 4>(st, K_st, V_st, k_rot, q_rot, v_loc, z_loc, mo, m_s1, y_rows, alpha, beta, gamma, D_h, D_qk, Dv_sl); return;
-            case 3: dragon_simd_fused_step_tb<4, 3>(st, K_st, V_st, k_rot, q_rot, v_loc, z_loc, mo, m_s1, y_rows, alpha, beta, gamma, D_h, D_qk, Dv_sl); return;
-            case 2: dragon_simd_fused_step_tb<4, 2>(st, K_st, V_st, k_rot, q_rot, v_loc, z_loc, mo, m_s1, y_rows, alpha, beta, gamma, D_h, D_qk, Dv_sl); return;
-            case 1: dragon_simd_fused_step_tb<4, 1>(st, K_st, V_st, k_rot, q_rot, v_loc, z_loc, mo, m_s1, y_rows, alpha, beta, gamma, D_h, D_qk, Dv_sl); return;
+            case 4: olala_simd_fused_step_tb<4, 4>(st, K_st, V_st, k_rot, q_rot, v_loc, z_loc, mo, m_s1, y_rows, alpha, beta, gamma, D_h, D_qk, Dv_sl); return;
+            case 3: olala_simd_fused_step_tb<4, 3>(st, K_st, V_st, k_rot, q_rot, v_loc, z_loc, mo, m_s1, y_rows, alpha, beta, gamma, D_h, D_qk, Dv_sl); return;
+            case 2: olala_simd_fused_step_tb<4, 2>(st, K_st, V_st, k_rot, q_rot, v_loc, z_loc, mo, m_s1, y_rows, alpha, beta, gamma, D_h, D_qk, Dv_sl); return;
+            case 1: olala_simd_fused_step_tb<4, 1>(st, K_st, V_st, k_rot, q_rot, v_loc, z_loc, mo, m_s1, y_rows, alpha, beta, gamma, D_h, D_qk, Dv_sl); return;
             default: break;
         }
     }
     for (int64_t tt = 0; tt < TB; ++tt) {
         const float * kp = (tt == 0) ? K_st : k_rot[tt - 1];
         const float * vp = (tt == 0) ? V_st : v_loc[tt - 1];
-        dragon_simd_fused_step(st, kp, vp, k_rot[tt], q_rot[tt], v_loc[tt], z_loc[tt],
+        olala_simd_fused_step(st, kp, vp, k_rot[tt], q_rot[tt], v_loc[tt], z_loc[tt],
                                mo, m_s1, y_rows[tt], alpha[tt], beta[tt], gamma[tt], D_h,
                                R, D_qk, Dv_sl);
     }
@@ -385,7 +385,7 @@ static inline void dragon_simd_fused_step_group(
 // ---- vector math for the M-kernel prep (AVX-512, scalar elsewhere) ----
 #if defined(__AVX512F__)
 // same polynomial as ggml_v_expf (ggml-cpu/vec.h)
-static inline __m512 dragon_v_expf(__m512 x) {
+static inline __m512 olala_v_expf(__m512 x) {
     const __m512 r = _mm512_set1_ps(0x1.8p23f);
     const __m512 z = _mm512_fmadd_ps(x, _mm512_set1_ps(0x1.715476p+0f), r);
     const __m512 n = _mm512_sub_ps(z, r);
@@ -407,7 +407,7 @@ static inline __m512 dragon_v_expf(__m512 x) {
 }
 
 // sin/cos for |x| <= ~pi (Cephes minimax on [-pi/4, pi/4] + quadrant fix-up)
-static inline void dragon_v_sincos(__m512 x, __m512 * s_out, __m512 * c_out) {
+static inline void olala_v_sincos(__m512 x, __m512 * s_out, __m512 * c_out) {
     const __m512 j  = _mm512_roundscale_ps(_mm512_mul_ps(x, _mm512_set1_ps(0.63661977236758134f)),
                                            _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
     __m512 r = _mm512_fnmadd_ps(j, _mm512_set1_ps(1.5703125f), x);
@@ -436,12 +436,12 @@ static inline void dragon_v_sincos(__m512 x, __m512 * s_out, __m512 * c_out) {
 }
 #endif
 
-static inline void dragon_sincos_n(const float * x, float * s, float * c, int64_t n) {
+static inline void olala_sincos_n(const float * x, float * s, float * c, int64_t n) {
     int64_t i = 0;
 #if defined(__AVX512F__)
     for (; i + 16 <= n; i += 16) {
         __m512 vs, vc;
-        dragon_v_sincos(_mm512_loadu_ps(x + i), &vs, &vc);
+        olala_v_sincos(_mm512_loadu_ps(x + i), &vs, &vc);
         _mm512_storeu_ps(s + i, vs);
         _mm512_storeu_ps(c + i, vc);
     }
@@ -453,12 +453,12 @@ static inline void dragon_sincos_n(const float * x, float * s, float * c, int64_
 }
 
 // out[i] = silu(a[i]*b[i]) * m[i]
-static inline void dragon_silu_mul_n(const float * a, const float * b, const float * m, float * out, int64_t n) {
+static inline void olala_silu_mul_n(const float * a, const float * b, const float * m, float * out, int64_t n) {
     int64_t i = 0;
 #if defined(__AVX512F__)
     for (; i + 16 <= n; i += 16) {
         const __m512 z = _mm512_mul_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i));
-        const __m512 e = dragon_v_expf(_mm512_sub_ps(_mm512_setzero_ps(), z));
+        const __m512 e = olala_v_expf(_mm512_sub_ps(_mm512_setzero_ps(), z));
         const __m512 g = _mm512_div_ps(z, _mm512_add_ps(_mm512_set1_ps(1.0f), e));
         _mm512_storeu_ps(out + i, _mm512_mul_ps(g, _mm512_loadu_ps(m + i)));
     }
@@ -475,7 +475,7 @@ static inline void dragon_silu_mul_n(const float * a, const float * b, const flo
 // one horizontal reduction per row instead of one per rank, and no gate math
 // in the sweep. Within a token group, token tt's kv is token tt+1's kv_prev.
 template <int RC, int TB>
-static inline void dragon_step_v2(
+static inline void olala_step_v2(
         float * GGML_RESTRICT st,
         const float * K_st, const float * V_st,
         const float * const * k_rot, const float * const * q_rot,
@@ -547,38 +547,38 @@ static inline void dragon_step_v2(
 }
 
 template <int RC>
-static inline void dragon_step_v2_group(
+static inline void olala_step_v2_group(
         float * st, const float * K_st, const float * V_st,
         const float * const * k_rot, const float * const * q_rot,
         const float * const * v_loc, const float * const * w_loc,
         float * const * y_rows, const float * alpha, const float * beta, const float * gamma,
         int64_t TB, int64_t D_qk, int64_t Dv_sl) {
     switch (TB) {
-        case 4: dragon_step_v2<RC, 4>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, D_qk, Dv_sl); break;
-        case 3: dragon_step_v2<RC, 3>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, D_qk, Dv_sl); break;
-        case 2: dragon_step_v2<RC, 2>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, D_qk, Dv_sl); break;
-        case 1: dragon_step_v2<RC, 1>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, D_qk, Dv_sl); break;
-        default: GGML_ABORT("dragon: unsupported token group %d", (int) TB);
+        case 4: olala_step_v2<RC, 4>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, D_qk, Dv_sl); break;
+        case 3: olala_step_v2<RC, 3>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, D_qk, Dv_sl); break;
+        case 2: olala_step_v2<RC, 2>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, D_qk, Dv_sl); break;
+        case 1: olala_step_v2<RC, 1>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, D_qk, Dv_sl); break;
+        default: GGML_ABORT("olala: unsupported token group %d", (int) TB);
     }
 }
 
-static inline void dragon_step_v2_dispatch(
+static inline void olala_step_v2_dispatch(
         float * st, const float * K_st, const float * V_st,
         const float * const * k_rot, const float * const * q_rot,
         const float * const * v_loc, const float * const * w_loc,
         float * const * y_rows, const float * alpha, const float * beta, const float * gamma,
         int64_t R, int64_t TB, int64_t D_qk, int64_t Dv_sl) {
     switch (R) {
-        case 4: dragon_step_v2_group<4>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, TB, D_qk, Dv_sl); break;
-        case 2: dragon_step_v2_group<2>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, TB, D_qk, Dv_sl); break;
-        case 1: dragon_step_v2_group<1>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, TB, D_qk, Dv_sl); break;
-        case 8: dragon_step_v2_group<8>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, TB, D_qk, Dv_sl); break;
-        default: GGML_ABORT("dragon: unsupported MIMO rank %d", (int) R);
+        case 4: olala_step_v2_group<4>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, TB, D_qk, Dv_sl); break;
+        case 2: olala_step_v2_group<2>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, TB, D_qk, Dv_sl); break;
+        case 1: olala_step_v2_group<1>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, TB, D_qk, Dv_sl); break;
+        case 8: olala_step_v2_group<8>(st, K_st, V_st, k_rot, q_rot, v_loc, w_loc, y_rows, alpha, beta, gamma, TB, D_qk, Dv_sl); break;
+        default: GGML_ABORT("olala: unsupported MIMO rank %d", (int) R);
     }
 }
 
 // dot product
-static inline float dragon_simd_dot(const float * GGML_RESTRICT a,
+static inline float olala_simd_dot(const float * GGML_RESTRICT a,
                                     const float * GGML_RESTRICT b,
                                     int64_t n) {
     int64_t i = 0;
@@ -613,19 +613,19 @@ static inline float dragon_simd_dot(const float * GGML_RESTRICT a,
     return acc;
 }
 
-// ---- per-layer hidden-state dump (DRAGON_DUMP_DIR env var to enable) -------
+// ---- per-layer hidden-state dump (OLALA_DUMP_DIR env var to enable) -------
 // When set, each block writes its INPUT hidden state and the final output
 // hidden state as raw fp32 bytes to {dir}/block_{il}_in.bin and {dir}/final.bin.
 // Header per file: int32 n_embd, int32 n_tokens, then n_embd*n_tokens fp32 values.
-struct dragon_dump_userdata {
+struct olala_dump_userdata {
     char filename[1024];
 };
-static void dragon_dump_kernel(ggml_tensor * dst, int ith, int /*nth*/, void * userdata) {
+static void olala_dump_kernel(ggml_tensor * dst, int ith, int /*nth*/, void * userdata) {
     if (ith != 0) return;
     if (dst != dst->src[0] && dst->data && dst->src[0]->data) {
         std::memcpy(dst->data, dst->src[0]->data, ggml_nbytes(dst));
     }
-    auto * ud = (dragon_dump_userdata *) userdata;
+    auto * ud = (olala_dump_userdata *) userdata;
     FILE * f = std::fopen(ud->filename, "wb");
     if (!f) return;
     // dst here is fp32 contiguous (we cast/ensure before calling).
@@ -636,19 +636,19 @@ static void dragon_dump_kernel(ggml_tensor * dst, int ith, int /*nth*/, void * u
     std::fclose(f);
 }
 
-static const char * dragon_dump_dir() {
-    const char * d = std::getenv("DRAGON_DUMP_DIR");
+static const char * olala_dump_dir() {
+    const char * d = std::getenv("OLALA_DUMP_DIR");
     return (d && d[0]) ? d : nullptr;
 }
 
 // Insert a dump-pass on `t` into the graph; returns a tensor with the same
 // values as `t` (an identity passthrough that side-effects to disk).
 // Allocates a userdata struct heap-side so the filename outlives graph build.
-static ggml_tensor * dragon_maybe_dump(ggml_context * ctx, ggml_tensor * t,
+static ggml_tensor * olala_maybe_dump(ggml_context * ctx, ggml_tensor * t,
                                        const char * name_fmt, int il) {
-    const char * dir = dragon_dump_dir();
+    const char * dir = olala_dump_dir();
     if (!dir) return t;
-    auto * ud = (dragon_dump_userdata *) std::malloc(sizeof(dragon_dump_userdata));
+    auto * ud = (olala_dump_userdata *) std::malloc(sizeof(olala_dump_userdata));
     std::snprintf(ud->filename, sizeof(ud->filename), "%s/", dir);
     int n = (int) std::strlen(ud->filename);
     std::snprintf(ud->filename + n, sizeof(ud->filename) - n, name_fmt, il);
@@ -657,21 +657,21 @@ static ggml_tensor * dragon_maybe_dump(ggml_context * ctx, ggml_tensor * t,
     ggml_tensor * args[1] = { t32 };
     return ggml_custom_4d(ctx, GGML_TYPE_F32,
                           t32->ne[0], t32->ne[1], t32->ne[2], t32->ne[3],
-                          args, 1, dragon_dump_kernel, /*n_tasks=*/1, ud);
+                          args, 1, olala_dump_kernel, /*n_tasks=*/1, ud);
 }
 
-// Dragon 7A1B — hybrid Mamba3-MIMO ("M") + Differential-TPA-V2 ("V") + MoE,
+// Olala 7A1B — hybrid Mamba3-MIMO ("M") + Differential-TPA-V2 ("V") + MoE,
 // with a geodesic-rotation residual on every block.
 
-void llama_model_dragon::load_arch_hparams(llama_model_loader & ml) {
+void llama_model_olala::load_arch_hparams(llama_model_loader & ml) {
     const std::string arch = arch_name();
 
     // ---- standard hparams ----
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     // SWA window is used by the scalable-softmax pre-multiply only (see the V
     // mixer). We don't forward it into hparams.n_swa: llama.cpp's iswa cache
-    // requires at least one full-attention layer, which Dragon doesn't have.
-    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.dragon_slw_wsize, false);
+    // requires at least one full-attention layer, which Olala doesn't have.
+    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.olala_slw_wsize, false);
     ml.get_key(LLM_KV_ATTN_LOGIT_SOFTCAPPING, hparams.f_attn_logit_softcapping, false);
     if (hparams.f_attn_logit_softcapping > 0.0f) {
         hparams.attn_soft_cap = true;
@@ -691,27 +691,27 @@ void llama_model_dragon::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
     ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
 
-    // ---- Dragon-specific ----
-    ml.get_key(arch + ".mamba_mimo_dim",   hparams.dragon_mamba_mimo_dim);
-    ml.get_key(arch + ".mamba_headdim",    hparams.dragon_mamba_headdim);
-    ml.get_key(arch + ".num_signal_heads", hparams.dragon_n_signal_heads);
-    ml.get_key(arch + ".num_noise_heads",  hparams.dragon_n_noise_heads);
-    ml.get_key(arch + ".tpa_rank",         hparams.dragon_tpa_rank);
-    ml.get_key(arch + ".num_rope_angles",  hparams.dragon_num_rope_angles);
-    ml.get_key(arch + ".gate_bias",        hparams.dragon_gate_bias, false);
+    // ---- Olala-specific ----
+    ml.get_key(arch + ".mamba_mimo_dim",   hparams.olala_mamba_mimo_dim);
+    ml.get_key(arch + ".mamba_headdim",    hparams.olala_mamba_headdim);
+    ml.get_key(arch + ".num_signal_heads", hparams.olala_n_signal_heads);
+    ml.get_key(arch + ".num_noise_heads",  hparams.olala_n_noise_heads);
+    ml.get_key(arch + ".tpa_rank",         hparams.olala_tpa_rank);
+    ml.get_key(arch + ".num_rope_angles",  hparams.olala_num_rope_angles);
+    ml.get_key(arch + ".gate_bias",        hparams.olala_gate_bias, false);
 
     // Layer-types string: 'M' for Mamba3-MIMO (recurrent), 'V' for Diff-TPA-V2 (attention).
     std::string layer_types;
     ml.get_key(arch + ".layer_types", layer_types);
     if (layer_types.size() != hparams.n_layer()) {
-        throw std::runtime_error("dragon: layer_types length (" + std::to_string(layer_types.size()) +
+        throw std::runtime_error("olala: layer_types length (" + std::to_string(layer_types.size()) +
                                  ") != n_layer (" + std::to_string(hparams.n_layer()) + ")");
     }
     for (uint32_t i = 0; i < hparams.n_layer(); ++i) {
         const bool is_M = (layer_types[i] == 'M');
         hparams.is_recr_impl[i] = is_M;
-        hparams.n_head_arr[i]    = hparams.dragon_n_signal_heads + hparams.dragon_n_noise_heads;
-        hparams.n_head_kv_arr[i] = is_M ? 0u : hparams.dragon_n_noise_heads;
+        hparams.n_head_arr[i]    = hparams.olala_n_signal_heads + hparams.olala_n_noise_heads;
+        hparams.n_head_kv_arr[i] = is_M ? 0u : hparams.olala_n_noise_heads;
         hparams.n_ff_arr[i]      = 0u; // no dense FFN — MoE per block
         hparams.is_swa_impl[i]   = 0;     // see SLW comment above
     }
@@ -719,7 +719,7 @@ void llama_model_dragon::load_arch_hparams(llama_model_loader & ml) {
     type = LLM_TYPE_UNKNOWN;
 }
 
-void llama_model_dragon::load_arch_tensors(llama_model_loader & ml) {
+void llama_model_olala::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
     auto is_M = [&](int il) { return hparams.is_recr(il); };
@@ -728,25 +728,25 @@ void llama_model_dragon::load_arch_tensors(llama_model_loader & ml) {
     const int64_t H_ssm    = (int64_t) hparams.ssm_d_inner / (int64_t) hparams.ssm_dt_rank; // 48
     const int64_t Hdim_ssm = (int64_t) hparams.ssm_dt_rank;                                 // 64
     const int64_t d_state  = (int64_t) hparams.ssm_d_state;                                 // 128
-    const int64_t R        = (int64_t) hparams.dragon_mamba_mimo_dim;                       // 4
+    const int64_t R        = (int64_t) hparams.olala_mamba_mimo_dim;                       // 4
     const int64_t G        = (int64_t) hparams.ssm_n_group;                                 // 1
-    const int64_t angles_d = (int64_t) hparams.dragon_num_rope_angles;                      // 32
+    const int64_t angles_d = (int64_t) hparams.olala_num_rope_angles;                      // 32
     const int64_t d_in_static = H_ssm * (2 * Hdim_ssm + 3);                                 // 6288
     const int64_t d_in_dyn    = 2 * G * d_state * R + angles_d;                             // 1056
 
     // Attention (Diff-TPA-V2) constants. `n_head_attn` avoids LLAMA_LOAD_LOCALS' n_head.
-    const int64_t n_head_attn = (int64_t) hparams.dragon_n_signal_heads + (int64_t) hparams.dragon_n_noise_heads; // 48
-    const int64_t n_kv      = (int64_t) hparams.dragon_n_noise_heads;                                              // 12
-    const int64_t n_signal  = (int64_t) hparams.dragon_n_signal_heads;                                             // 36
+    const int64_t n_head_attn = (int64_t) hparams.olala_n_signal_heads + (int64_t) hparams.olala_n_noise_heads; // 48
+    const int64_t n_kv      = (int64_t) hparams.olala_n_noise_heads;                                              // 12
+    const int64_t n_signal  = (int64_t) hparams.olala_n_signal_heads;                                             // 36
     const int64_t head_dim  = (int64_t) hparams.n_embd_head_k_full;                                                // 128
-    const int64_t tpa_rank  = (int64_t) hparams.dragon_tpa_rank;                                                   // 4
+    const int64_t tpa_rank  = (int64_t) hparams.olala_tpa_rank;                                                   // 4
 
     // MoE constants
     const int64_t moe_n_embd = hparams.moe_latent_size > 0 ? (int64_t) hparams.moe_latent_size : (int64_t) n_embd;
     const int64_t ff_exp     = (int64_t) hparams.n_ff_exp();
     const int64_t ff_shexp   = (int64_t) hparams.n_ff_shexp;
 
-    // ---- embeddings + LM head (no final norm: dragon.final_norm == false) ----
+    // ---- embeddings + LM head (no final norm: olala.final_norm == false) ----
     // Low-memory mode (--lazy-mode on): the routed experts (~82% of the file) and the
     // token embeddings stay on disk and are paged in on demand; the fused MoE op then
     // prefetches the selected experts after routing and releases them after use
@@ -824,7 +824,7 @@ void llama_model_dragon::load_arch_tensors(llama_model_loader & ml) {
     }
 }
 
-std::unique_ptr<llm_graph_context> llama_model_dragon::build_arch_graph(const llm_graph_params & params) const {
+std::unique_ptr<llm_graph_context> llama_model_olala::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(*this, params);
 }
 
@@ -839,12 +839,12 @@ std::unique_ptr<llm_graph_context> llama_model_dragon::build_arch_graph(const ll
 // expands to ~22 ggml nodes per call (x2 per block x 36 blocks ~ 1.6k nodes per
 // token); at decode each node is a 1536-float op whose cost is pure thread-
 // barrier latency. The fused kernel does the same math in one node.
-struct dragon_geodesic_userdata {
+struct olala_geodesic_userdata {
     int il;
 };
 
-static void dragon_geodesic_kernel(ggml_tensor * dst, int ith, int nth, void * userdata) {
-    const auto * ud = (const dragon_geodesic_userdata *) userdata;
+static void olala_geodesic_kernel(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    const auto * ud = (const olala_geodesic_userdata *) userdata;
     const float kPi4 = 0.785398163f; // π/4
 
     const ggml_tensor * x_t = dst->src[0]; // (n_embd, T)
@@ -897,7 +897,7 @@ static void dragon_geodesic_kernel(ggml_tensor * dst, int ith, int nth, void * u
     }
 }
 
-static ggml_tensor * build_dragon_geodesic_fused(
+static ggml_tensor * build_olala_geodesic_fused(
         ggml_context * ctx,
         ggml_tensor  * x,
         ggml_tensor  * g,
@@ -905,16 +905,16 @@ static ggml_tensor * build_dragon_geodesic_fused(
         ggml_tensor  * bias_scalar,
         int            il) {
     ggml_tensor * args[4] = { x, g, scale_scalar, bias_scalar };
-    auto * ud = (dragon_geodesic_userdata *) std::malloc(sizeof(dragon_geodesic_userdata));
+    auto * ud = (olala_geodesic_userdata *) std::malloc(sizeof(olala_geodesic_userdata));
     ud->il = il;
     ggml_tensor * geo = ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], 1, 1,
-                          args, 4, dragon_geodesic_kernel,
+                          args, 4, olala_geodesic_kernel,
                           /*n_tasks=*/ GGML_N_TASKS_MAX, ud);
     ggml_set_name(geo, "geodesic");
     return geo;
 }
 
-static ggml_tensor * build_dragon_geodesic_ref(
+static ggml_tensor * build_olala_geodesic_ref(
         ggml_context * ctx,
         ggml_tensor  * x,           // (n_embd, n_tokens)
         ggml_tensor  * g,           // (n_embd, n_tokens)
@@ -959,24 +959,24 @@ static ggml_tensor * build_dragon_geodesic_ref(
     return ggml_add(ctx, left, right);
 }
 
-static ggml_tensor * build_dragon_geodesic(
+static ggml_tensor * build_olala_geodesic(
         ggml_context * ctx,
         ggml_tensor  * x,
         ggml_tensor  * g,
         ggml_tensor  * scale_scalar,
         ggml_tensor  * bias_scalar,
         int            il) {
-    // DRAGON_NO_FUSED_GEO=1 selects the pure-ggml reference path (also the
+    // OLALA_NO_FUSED_GEO=1 selects the pure-ggml reference path (also the
     // path for non-CPU backends if this graph is ever offloaded).
-    static const bool force_ref = std::getenv("DRAGON_NO_FUSED_GEO") != nullptr;
+    static const bool force_ref = std::getenv("OLALA_NO_FUSED_GEO") != nullptr;
     if (force_ref) {
-        return build_dragon_geodesic_ref(ctx, x, g, scale_scalar, bias_scalar, il);
+        return build_olala_geodesic_ref(ctx, x, g, scale_scalar, bias_scalar, il);
     }
-    static const bool cpu_custom_geo = dragon_env_on("DRAGON_CPU_CUSTOM_GEO");
-    if (!dragon_layer_cpu || !cpu_custom_geo) {
+    static const bool cpu_custom_geo = olala_env_on("OLALA_CPU_CUSTOM_GEO");
+    if (!olala_layer_cpu || !cpu_custom_geo) {
         return ggml_geodesic(ctx, x, g, scale_scalar, bias_scalar, 1.0f / (float) (il + 1));
     }
-    return build_dragon_geodesic_fused(ctx, x, g, scale_scalar, bias_scalar, il);
+    return build_olala_geodesic_fused(ctx, x, g, scale_scalar, bias_scalar, il);
 }
 
 // Mamba3-MIMO CPU kernel. O(L · H · D_qk · D_v · R) per layer; wired in via
@@ -1011,7 +1011,7 @@ static ggml_tensor * build_dragon_geodesic(
 // per process. Rebuilding these packs as graph ops (casts + concats of frozen
 // tensors) cost ~16 barrier-floor nodes per layer per token. Keyed by the
 // b_bias tensor's data pointer; entries live until process exit.
-struct dragon_packed_weights {
+struct olala_packed_weights {
     std::vector<float> buf;
     const float * bias;   // (D_qk, 2R, H)  rows [b_bias | c_bias]
     const float * mxz;    // (D_v, 2R, H)   rows [mimo_x | mimo_z]
@@ -1020,7 +1020,7 @@ struct dragon_packed_weights {
     const float * misc;   // (H, 2)         cols [dt_bias | D_skip]
 };
 
-static float dragon_weight_f32(const ggml_tensor * t, int64_t i) {
+static float olala_weight_f32(const ggml_tensor * t, int64_t i) {
     switch (t->type) {
         case GGML_TYPE_F32:  return ((const float *) t->data)[i];
         case GGML_TYPE_BF16: {
@@ -1031,31 +1031,31 @@ static float dragon_weight_f32(const ggml_tensor * t, int64_t i) {
             return f;
         }
         case GGML_TYPE_F16:  return ggml_fp16_to_fp32(((const ggml_fp16_t *) t->data)[i]);
-        default: GGML_ABORT("dragon: unsupported weight type %s", ggml_type_name(t->type));
+        default: GGML_ABORT("olala: unsupported weight type %s", ggml_type_name(t->type));
     }
 }
 
-static const dragon_packed_weights * dragon_get_packed_weights(
+static const olala_packed_weights * olala_get_packed_weights(
         const llama_layer & layer, int64_t D_qk, int64_t D_v, int64_t R, int64_t H) {
     static std::mutex mtx;
-    static std::unordered_map<const void *, std::unique_ptr<dragon_packed_weights>> cache;
+    static std::unordered_map<const void *, std::unique_ptr<olala_packed_weights>> cache;
 
     std::lock_guard<std::mutex> lock(mtx);
     auto it = cache.find(layer.ssm_b_bias->data);
     if (it != cache.end()) {
         // the key is a data address: a model loaded later in the same process
         // (server model swap) may reuse it, so check the contents still match
-        const dragon_packed_weights * pw = it->second.get();
-        if (pw->bias[0] == dragon_weight_f32(layer.ssm_b_bias, 0) &&
-            pw->bias[R*D_qk] == dragon_weight_f32(layer.ssm_c_bias, 0) &&
-            pw->mimo_o[0] == dragon_weight_f32(layer.ssm_mimo_o, 0) &&
-            pw->misc[H] == dragon_weight_f32(layer.ssm_d, 0)) {
+        const olala_packed_weights * pw = it->second.get();
+        if (pw->bias[0] == olala_weight_f32(layer.ssm_b_bias, 0) &&
+            pw->bias[R*D_qk] == olala_weight_f32(layer.ssm_c_bias, 0) &&
+            pw->mimo_o[0] == olala_weight_f32(layer.ssm_mimo_o, 0) &&
+            pw->misc[H] == olala_weight_f32(layer.ssm_d, 0)) {
             return pw;
         }
         cache.erase(it);
     }
 
-    auto pw = std::make_unique<dragon_packed_weights>();
+    auto pw = std::make_unique<olala_packed_weights>();
     const int64_t n_bias = D_qk*2*R*H, n_mxz = D_v*2*R*H, n_mo = D_v*R*H;
     pw->buf.resize((size_t) (n_bias + n_mxz + n_mo + 2*D_qk + 2*H));
     float * p = pw->buf.data();
@@ -1065,8 +1065,8 @@ static const dragon_packed_weights * dragon_get_packed_weights(
         for (int64_t r = 0; r < R; ++r) {
             for (int64_t d = 0; d < D_qk; ++d) {
                 const int64_t src = d + r*D_qk + h*R*D_qk;
-                p[d + r*D_qk       + h*2*R*D_qk] = dragon_weight_f32(layer.ssm_b_bias, src);
-                p[d + (R + r)*D_qk + h*2*R*D_qk] = dragon_weight_f32(layer.ssm_c_bias, src);
+                p[d + r*D_qk       + h*2*R*D_qk] = olala_weight_f32(layer.ssm_b_bias, src);
+                p[d + (R + r)*D_qk + h*2*R*D_qk] = olala_weight_f32(layer.ssm_c_bias, src);
             }
         }
     }
@@ -1076,40 +1076,40 @@ static const dragon_packed_weights * dragon_get_packed_weights(
         for (int64_t r = 0; r < R; ++r) {
             for (int64_t d = 0; d < D_v; ++d) {
                 const int64_t src = d + r*D_v + h*R*D_v;
-                p[d + r*D_v       + h*2*R*D_v] = dragon_weight_f32(layer.ssm_mimo_x, src);
-                p[d + (R + r)*D_v + h*2*R*D_v] = dragon_weight_f32(layer.ssm_mimo_z, src);
+                p[d + r*D_v       + h*2*R*D_v] = olala_weight_f32(layer.ssm_mimo_x, src);
+                p[d + (R + r)*D_v + h*2*R*D_v] = olala_weight_f32(layer.ssm_mimo_z, src);
             }
         }
     }
     p += n_mxz;
     pw->mimo_o = p;
     for (int64_t i = 0; i < n_mo; ++i) {
-        p[i] = dragon_weight_f32(layer.ssm_mimo_o, i);
+        p[i] = olala_weight_f32(layer.ssm_mimo_o, i);
     }
     p += n_mo;
     pw->norms = p;
     for (int64_t d = 0; d < D_qk; ++d) {
-        p[d]        = dragon_weight_f32(layer.ssm_b_norm, d);
-        p[D_qk + d] = dragon_weight_f32(layer.ssm_c_norm, d);
+        p[d]        = olala_weight_f32(layer.ssm_b_norm, d);
+        p[D_qk + d] = olala_weight_f32(layer.ssm_c_norm, d);
     }
     p += 2*D_qk;
     pw->misc = p;
     for (int64_t h = 0; h < H; ++h) {
-        p[h]     = dragon_weight_f32(layer.ssm_dt_bias, h);
-        p[H + h] = dragon_weight_f32(layer.ssm_d, h);
+        p[h]     = olala_weight_f32(layer.ssm_dt_bias, h);
+        p[H + h] = olala_weight_f32(layer.ssm_d, h);
     }
 
-    const dragon_packed_weights * ret = pw.get();
+    const olala_packed_weights * ret = pw.get();
     cache.emplace(layer.ssm_b_bias->data, std::move(pw));
     return ret;
 }
 
 // Userdata struct passed via ggml_custom_4d. NULL → n_seqs = 1 (legacy).
-struct dragon_m_kernel_userdata {
+struct olala_m_kernel_userdata {
     int64_t n_seqs;
     float   rms_eps;
     int64_t D_qk, D_v, R, H;
-    const dragon_packed_weights * w;   // null when built without weight data (dry runs)
+    const olala_packed_weights * w;   // null when built without weight data (dry runs)
     const llama_layer * layer;
     // in-place mode: src[2] is the whole recurrent cache (n_embd_s, rs_size),
     // src[4] the I32 source-row ids of the n_seqs sequences, src[3] the
@@ -1130,19 +1130,19 @@ struct dragon_m_kernel_userdata {
 // a small follow-up custom op reduces the slabs.
 
 #if defined(__AVX512F__)
-static inline __m512 dragon_bf16_load16(const uint16_t * p) {
+static inline __m512 olala_bf16_load16(const uint16_t * p) {
     return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256((const __m256i *) p)), 16));
 }
 #endif
 
-static void dragon_m_mega_decode_kernel(ggml_tensor * dst, int ith, int nth, void * userdata) {
+static void olala_m_mega_decode_kernel(ggml_tensor * dst, int ith, int nth, void * userdata) {
     const ggml_tensor * cur   = dst->src[0]; // (n_embd, L) f32
     const ggml_tensor * pdyn  = dst->src[1]; // (2·R·D_qk + num_angles, L) f32
     const ggml_tensor * state_in = dst->src[2]; // (n_embd_s, n_seqs) gathered
     ggml_tensor * state_dst      = dst->src[3]; // cache view, written in-place
 
-    const auto * ud = (const dragon_m_kernel_userdata *) userdata;
-    const dragon_packed_weights * W = ud->w ? ud->w : dragon_get_packed_weights(*ud->layer, ud->D_qk, ud->D_v, ud->R, ud->H);
+    const auto * ud = (const olala_m_kernel_userdata *) userdata;
+    const olala_packed_weights * W = ud->w ? ud->w : olala_get_packed_weights(*ud->layer, ud->D_qk, ud->D_v, ud->R, ud->H);
     const int64_t D_qk = ud->D_qk, D_v = ud->D_v, R = ud->R, H = ud->H;
     const int64_t L = cur->ne[1];           // == n_seqs (one token per seq)
     const int64_t n_embd = cur->ne[0];
@@ -1175,9 +1175,9 @@ static void dragon_m_mega_decode_kernel(ggml_tensor * dst, int ith, int nth, voi
     const int64_t off_V_glob   = off_K_glob + H * R * D_qk;
     const int64_t off_ang_glob = off_V_glob + H * R * D_v;
 
-    // dragon_state_bf16() returns false whenever DRAGON_MEGA_DECODE is set,
+    // olala_state_bf16() returns false whenever OLALA_MEGA_DECODE is set,
     // so this kernel always sees an f32 state cache.
-    GGML_ASSERT(!dragon_state_bf16() && "mega decode kernel does not support bf16 state");
+    GGML_ASSERT(!olala_state_bf16() && "mega decode kernel does not support bf16 state");
 
     const int64_t h_per = (H + nth - 1) / nth;
     const int64_t h0 = std::min<int64_t>((int64_t) ith * h_per, H);
@@ -1215,7 +1215,7 @@ static void dragon_m_mega_decode_kernel(ggml_tensor * dst, int ith, int nth, voi
 #if defined(__AVX512F__)
                 __m512 acc = _mm512_setzero_ps();
                 for (int64_t d = 0; d < n_embd; d += 16) {
-                    acc = _mm512_fmadd_ps(dragon_bf16_load16(wrow + d), _mm512_loadu_ps(x + d), acc);
+                    acc = _mm512_fmadd_ps(olala_bf16_load16(wrow + d), _mm512_loadu_ps(x + d), acc);
                 }
                 ph_buf[seq * per_head + j] = _mm512_reduce_add_ps(acc);
 #else
@@ -1255,7 +1255,7 @@ static void dragon_m_mega_decode_kernel(ggml_tensor * dst, int ith, int nth, voi
             float a_neg        = -sp(ph[2*D_v + 1]);
             if (a_neg > -1e-4f) a_neg = -1e-4f;
             const float a_h    = expf(a_neg * dt_sp);
-            const float trap_h = dragon_sigmoidf(ph[2*D_v + 2]);
+            const float trap_h = olala_sigmoidf(ph[2*D_v + 2]);
             const float beta_h  = (1.0f - trap_h) * dt_sp * a_h;
             const float gamma_h = trap_h * dt_sp;
 
@@ -1298,7 +1298,7 @@ static void dragon_m_mega_decode_kernel(ggml_tensor * dst, int ith, int nth, voi
             }
 
             std::fill(y_h.begin(), y_h.end(), 0.0f);
-            dragon_simd_fused_step(sstate.data(), Kst.data(), Vst.data(),
+            olala_simd_fused_step(sstate.data(), Kst.data(), Vst.data(),
                                    k_rot.data(), q_rot.data(), v_loc.data(), z_loc.data(),
                                    mo, D_v, y_h.data(),
                                    a_h, beta_h, gamma_h, D_h, R, D_qk, D_v);
@@ -1322,10 +1322,10 @@ static void dragon_m_mega_decode_kernel(ggml_tensor * dst, int ith, int nth, voi
                 const __m512 y3 = _mm512_loadu_ps(y_h.data() + 48);
                 for (int64_t o = 0; o < n_embd; ++o) {
                     const uint16_t * w = wo_h + o * wo_s1;
-                    __m512 acc = _mm512_mul_ps(dragon_bf16_load16(w), y0);
-                    acc = _mm512_fmadd_ps(dragon_bf16_load16(w + 16), y1, acc);
-                    acc = _mm512_fmadd_ps(dragon_bf16_load16(w + 32), y2, acc);
-                    acc = _mm512_fmadd_ps(dragon_bf16_load16(w + 48), y3, acc);
+                    __m512 acc = _mm512_mul_ps(olala_bf16_load16(w), y0);
+                    acc = _mm512_fmadd_ps(olala_bf16_load16(w + 16), y1, acc);
+                    acc = _mm512_fmadd_ps(olala_bf16_load16(w + 32), y2, acc);
+                    acc = _mm512_fmadd_ps(olala_bf16_load16(w + 48), y3, acc);
                     slab[o] = _mm512_reduce_add_ps(acc);
                 }
             } else
@@ -1346,7 +1346,7 @@ static void dragon_m_mega_decode_kernel(ggml_tensor * dst, int ith, int nth, voi
 }
 
 // Sum the per-head output slabs: dst (n_embd, L) = Σ_h src0[:, :, h].
-static void dragon_m_mega_reduce_kernel(ggml_tensor * dst, int ith, int nth, void * /*userdata*/) {
+static void olala_m_mega_reduce_kernel(ggml_tensor * dst, int ith, int nth, void * /*userdata*/) {
     const ggml_tensor * slabs = dst->src[0]; // (n_embd, L, H)
     const int64_t n  = slabs->ne[0] * slabs->ne[1];
     const int64_t H  = slabs->ne[2];
@@ -1364,51 +1364,51 @@ static void dragon_m_mega_reduce_kernel(ggml_tensor * dst, int ith, int nth, voi
     }
 }
 
-// ---- Fused MoE selection / weighting / reduction (dragon-local) ----
+// ---- Fused MoE selection / weighting / reduction (olala-local) ----
 // Mirrors build_moe_ffn with sigmoid gating + DeepSeek-V3 selection bias +
-// norm_w + w_scale for Dragon's config. The ggml chain is 8 selection nodes +
+// norm_w + w_scale for Olala's config. The ggml chain is 8 selection nodes +
 // mul + 5 adds per layer; fused it is 3 custom nodes around the mul_mat_ids.
 
 
-// Fused CPU MoE op (GGML_OP_DRAGON_MOE) for short ubatches (decode): one node
+// Fused CPU MoE op (GGML_OP_OLALA_MOE) for short ubatches (decode): one node
 // instead of ~14. Not usable when a weight sits in a repacked CPU buffer
 // (interleaved layout the op cannot read): run with --no-repack on q4_K files,
-// which is faster on x86 anyway. DRAGON_FUSED_MOE_MAX_T sets the token limit
+// which is faster on x86 anyway. OLALA_FUSED_MOE_MAX_T sets the token limit
 // (default 8, 0 disables).
-static bool dragon_tensor_repacked(const ggml_tensor * w) {
+static bool olala_tensor_repacked(const ggml_tensor * w) {
     return w != nullptr && w->buffer != nullptr &&
         std::strcmp(ggml_backend_buffer_name(w->buffer), "CPU_REPACK") == 0;
 }
 
 // Low-memory mode (--lazy-mode on): RAM budget of the expert cache in MiB:
-// --lazy-cache, else DRAGON_EXPERT_CACHE_MB, else 1 GiB (~70-80% of the experts
+// --lazy-cache, else OLALA_EXPERT_CACHE_MB, else 1 GiB (~70-80% of the experts
 // a token needs are then already resident: 25-45 MB read per token in Q8_0).
-static int dragon_expert_cache_mib(const llama_model & model) {
+static int olala_expert_cache_mib(const llama_model & model) {
     if (model.lazy_cache_mib >= 0) {
         return model.lazy_cache_mib;
     }
     static const int v = [] {
-        const char * e = std::getenv("DRAGON_EXPERT_CACHE_MB");
+        const char * e = std::getenv("OLALA_EXPERT_CACHE_MB");
         return e ? std::max(0, std::atoi(e)) : 1024;
     }();
     return v;
 }
 
-static int64_t dragon_fused_moe_max_tokens() {
+static int64_t olala_fused_moe_max_tokens() {
     static const int64_t v = [] {
-        const char * e = std::getenv("DRAGON_FUSED_MOE_MAX_T");
+        const char * e = std::getenv("OLALA_FUSED_MOE_MAX_T");
         return e ? std::max<int64_t>(0, std::atoll(e)) : (int64_t) 8;
     }();
     return v;
 }
 
-struct dragon_moe_userdata {
+struct olala_moe_userdata {
     float w_scale;
 };
 
 // scores = sigmoid(logits) + bias; writes ids of the k largest (desc, ties →
 // lower index — same as a stable descending argsort).
-static void dragon_moe_select(const float * lt, const float * bd, int64_t n_expert,
+static void olala_moe_select(const float * lt, const float * bd, int64_t n_expert,
                               int64_t k, int32_t * ids) {
     for (int64_t i = 0; i < k; ++i) {
         int64_t best = -1;
@@ -1421,7 +1421,7 @@ static void dragon_moe_select(const float * lt, const float * bd, int64_t n_expe
             if (taken) {
                 continue;
             }
-            const float s = dragon_sigmoidf(lt[e]) + bd[e];
+            const float s = olala_sigmoidf(lt[e]) + bd[e];
             if (s > bv) { bv = s; best = e; }
         }
         if (best < 0) {
@@ -1431,7 +1431,7 @@ static void dragon_moe_select(const float * lt, const float * bd, int64_t n_expe
             // output is garbage either way.
             static std::atomic<int> warned{0};
             if (warned.fetch_add(1) == 0) {
-                fprintf(stderr, "dragon: WARNING: all-NaN MoE router scores for a token (quantization-induced activation overflow?); selecting expert %d\n", (int) i);
+                fprintf(stderr, "olala: WARNING: all-NaN MoE router scores for a token (quantization-induced activation overflow?); selecting expert %d\n", (int) i);
             }
             best = i;
         }
@@ -1440,7 +1440,7 @@ static void dragon_moe_select(const float * lt, const float * bd, int64_t n_expe
 }
 
 // relu(x)^2, one node instead of relu + sqr
-static void dragon_relu_sqr_kernel(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * /*userdata*/) {
+static void olala_relu_sqr_kernel(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * /*userdata*/) {
     GGML_ASSERT(ggml_is_contiguous(a) && ggml_is_contiguous(dst));
     const int64_t n   = ggml_nelements(a);
     const int64_t per = (n + nth - 1) / nth;
@@ -1454,7 +1454,7 @@ static void dragon_relu_sqr_kernel(ggml_tensor * dst, const ggml_tensor * a, int
     }
 }
 
-static void dragon_moe_topk_kernel(ggml_tensor * dst, int ith, int nth, void * /*userdata*/) {
+static void olala_moe_topk_kernel(ggml_tensor * dst, int ith, int nth, void * /*userdata*/) {
     const ggml_tensor * logits = dst->src[0]; // (n_expert, L) f32
     const ggml_tensor * bias   = dst->src[1]; // (n_expert)   f32
     const int64_t n_expert = logits->ne[0];
@@ -1467,16 +1467,16 @@ static void dragon_moe_topk_kernel(ggml_tensor * dst, int ith, int nth, void * /
     const int64_t t0 = std::min<int64_t>((int64_t) ith * per, L);
     const int64_t t1 = std::min<int64_t>(t0 + per, L);
     for (int64_t t = t0; t < t1; ++t) {
-        dragon_moe_select(ld + t * n_expert, bd, n_expert, k, od + t * k);
+        olala_moe_select(ld + t * n_expert, bd, n_expert, k, od + t * k);
     }
 }
 
 // weights = sigmoid(logits)[sel] (un-biased), normalized (sum → clamp → div),
 // then × w_scale — same op order as build_moe_ffn's norm_w path.
-static void dragon_moe_weights_kernel(ggml_tensor * dst, int ith, int nth, void * userdata) {
+static void olala_moe_weights_kernel(ggml_tensor * dst, int ith, int nth, void * userdata) {
     const ggml_tensor * logits = dst->src[0];
     const ggml_tensor * bias   = dst->src[1];
-    const float w_scale = ((const dragon_moe_userdata *) userdata)->w_scale;
+    const float w_scale = ((const olala_moe_userdata *) userdata)->w_scale;
     const int64_t n_expert = logits->ne[0];
     const int64_t L        = logits->ne[1];
     const int64_t k        = dst->ne[0];
@@ -1492,11 +1492,11 @@ static void dragon_moe_weights_kernel(ggml_tensor * dst, int ith, int nth, void 
     GGML_ASSERT(k <= 256);
     for (int64_t t = t0; t < t1; ++t) {
         const float * lt = ld + t * n_expert;
-        dragon_moe_select(lt, bd, n_expert, k, ids);
+        olala_moe_select(lt, bd, n_expert, k, ids);
         float * w = od + t * k;
         float sum = 0.0f;
         for (int64_t i = 0; i < k; ++i) {
-            w[i] = dragon_sigmoidf(lt[ids[i]]);
+            w[i] = olala_sigmoidf(lt[ids[i]]);
             sum += w[i];
         }
         if (sum < 6.103515625e-5f) sum = 6.103515625e-5f; // same clamp as build_moe_ffn
@@ -1508,7 +1508,7 @@ static void dragon_moe_weights_kernel(ggml_tensor * dst, int ith, int nth, void 
 
 // out[d, t] = Σ_i experts[d, i, t] · w[i, t], accumulated in expert order —
 // identical per-element fp order to build_moe_ffn's mul + chained adds.
-static void dragon_moe_reduce_kernel(ggml_tensor * dst, int ith, int nth, void * /*userdata*/) {
+static void olala_moe_reduce_kernel(ggml_tensor * dst, int ith, int nth, void * /*userdata*/) {
     const ggml_tensor * experts = dst->src[0]; // (ne, k, L) f32
     const ggml_tensor * w       = dst->src[1]; // (k, L)     f32
     const int64_t ne = experts->ne[0];
@@ -1544,11 +1544,11 @@ static void dragon_moe_reduce_kernel(ggml_tensor * dst, int ith, int nth, void *
 // X_prev is the previous token (cache for each seq's first in-batch token),
 // and writes each seq's pre-shift last K/V back into the recurrent cache.
 // Replaces ~19 small graph nodes (conts/concats/sigmoid/muls/cpy) per V-layer.
-struct dragon_vshift_userdata {
+struct olala_vshift_userdata {
     int64_t n_seqs;
 };
 
-static void dragon_v_shift_kernel(ggml_tensor * dst, int ith, int nth, void * userdata) {
+static void olala_v_shift_kernel(ggml_tensor * dst, int ith, int nth, void * userdata) {
     const ggml_tensor * K    = dst->src[0]; // (head_dim, n_kv, L) f32, pre-shift
     const ggml_tensor * V    = dst->src[1];
     const ggml_tensor * ak   = dst->src[2]; // (n_kv, L) raw gate logits
@@ -1561,7 +1561,7 @@ static void dragon_v_shift_kernel(ggml_tensor * dst, int ith, int nth, void * us
     const int64_t n_kv  = K->ne[1];
     const int64_t L     = K->ne[2];
     const int64_t n_kp  = hd * n_kv;
-    const int64_t n_seqs   = ((const dragon_vshift_userdata *) userdata)->n_seqs;
+    const int64_t n_seqs   = ((const olala_vshift_userdata *) userdata)->n_seqs;
     const int64_t n_seq_t  = L / n_seqs;
 
     const float   * K_d   = (const float *) K->data;
@@ -1587,8 +1587,8 @@ static void dragon_v_shift_kernel(ggml_tensor * dst, int ith, int nth, void * us
         float pmask = (float) pos_d[t];
         pmask = pmask < 0.0f ? 0.0f : (pmask > 1.0f ? 1.0f : pmask);
         for (int64_t j = 0; j < n_kv; ++j) {
-            const float a_k = dragon_sigmoidf(ak_d[j + t * n_kv]) * pmask;
-            const float a_v = dragon_sigmoidf(av_d[j + t * n_kv]) * pmask;
+            const float a_k = olala_sigmoidf(ak_d[j + t * n_kv]) * pmask;
+            const float a_v = olala_sigmoidf(av_d[j + t * n_kv]) * pmask;
             const float b_k = a_k * -1.0f + 1.0f;  // same scale_bias form
             const float b_v = a_v * -1.0f + 1.0f;
             const float * Kt = K_d + j * hd + t * y_s2;
@@ -1618,7 +1618,7 @@ static void dragon_v_shift_kernel(ggml_tensor * dst, int ith, int nth, void * us
 // Per-thread scratch reused across kernel calls: the M-kernel runs ~29x per
 // token, and fresh zero-filled std::vectors (some past the mmap threshold) cost
 // more than the decode-step math itself.
-struct dragon_span {
+struct olala_span {
     float * p; size_t n;
     float * data()  const { return p; }
     float * begin() const { return p; }
@@ -1626,7 +1626,7 @@ struct dragon_span {
     size_t  size()  const { return n; }
     float & operator[](size_t i) const { return p[i]; }
 };
-static dragon_span dragon_scratch(int slot, size_t n) {
+static olala_span olala_scratch(int slot, size_t n) {
     static thread_local std::vector<float> bufs[16];
     std::vector<float> & b = bufs[slot];
     if (b.size() < n) {
@@ -1635,7 +1635,7 @@ static dragon_span dragon_scratch(int slot, size_t n) {
     return { b.data(), n };
 }
 
-static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void * userdata) {
+static void olala_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void * userdata) {
     // Raw-input kernel (CuteDSL-step style): consumes the two projection GEMM
     // outputs directly and folds B/C RMS-norm (+weight), per-head bias, x/z
     // MIMO scaling and the softplus/exp/sigmoid discretisation into the
@@ -1650,10 +1650,10 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
     ggml_tensor * state_dst = dst->src[3];
 
     // Per-layer constants come pre-packed (once per process) via userdata —
-    // see dragon_get_packed_weights.
-    const auto * ud = (const dragon_m_kernel_userdata *) userdata;
+    // see olala_get_packed_weights.
+    const auto * ud = (const olala_m_kernel_userdata *) userdata;
     GGML_ASSERT(ud != nullptr);
-    const dragon_packed_weights * W = ud->w ? ud->w : dragon_get_packed_weights(*ud->layer, ud->D_qk, ud->D_v, ud->R, ud->H);
+    const olala_packed_weights * W = ud->w ? ud->w : olala_get_packed_weights(*ud->layer, ud->D_qk, ud->D_v, ud->R, ud->H);
     const int64_t n_seqs_kernel = ud->n_seqs;
     const float   rms_eps       = ud->rms_eps;
 
@@ -1663,7 +1663,7 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
     const int64_t D_v  = ud->D_v;
     const int64_t L    = pdyn->ne[1];
 
-    const int64_t num_angles = pdyn->ne[0] - 2 * R * D_qk; // num_rope_angles (= 32 in Dragon 7A1B)
+    const int64_t num_angles = pdyn->ne[0] - 2 * R * D_qk; // num_rope_angles (= 32 in Olala 7A1B)
     const int64_t per_head   = 2 * D_v + 3;
     GGML_ASSERT(pstat->ne[0] == per_head * H);
     GGML_ASSERT(pstat->ne[1] == L);
@@ -1696,21 +1696,21 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
         return pos + logf(expf(-fabsf(x)) + 1.0f);
     };
 
-    // State-cache storage codec (see dragon_state_mode()). Working precision
+    // State-cache storage codec (see olala_state_mode()). Working precision
     // in-kernel remains f32. vLLM runs the state in bf16 as well, so the
     // default also matches the reference serving stack.
     // section_base points at the start of a section in the packed cache row;
     // elt_off is the LOGICAL element offset within that section. `is_ssm`
     // marks the big S-matrix section: kept f32 in BF16 mode (validated
     // config), packed like the rest in the Q8 experiment.
-    const dragon_state_prec st_mode = dragon_state_mode();
+    const olala_state_prec st_mode = olala_state_mode();
     auto load_kv = [&](float * dstp, const float * section_base, int64_t elt_off, int64_t n, bool is_ssm = false) {
-        const dragon_state_prec m = (is_ssm && st_mode == DRAGON_STATE_BF16) ? DRAGON_STATE_F32 : st_mode;
+        const olala_state_prec m = (is_ssm && st_mode == OLALA_STATE_BF16) ? OLALA_STATE_F32 : st_mode;
         switch (m) {
-        case DRAGON_STATE_F32:
+        case OLALA_STATE_F32:
             std::memcpy(dstp, section_base + elt_off, (size_t) n * sizeof(float));
             return;
-        case DRAGON_STATE_BF16: {
+        case OLALA_STATE_BF16: {
             const uint16_t * s16 = (const uint16_t *) section_base + elt_off;
             for (int64_t i = 0; i < n; ++i) {
                 const uint32_t u = (uint32_t) s16[i] << 16;
@@ -1718,7 +1718,7 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
             }
             return;
         }
-        case DRAGON_STATE_Q8: {
+        case OLALA_STATE_Q8: {
             GGML_ASSERT(elt_off % 32 == 0 && n % 32 == 0);
             for (int64_t b = 0; b < n / 32; ++b) {
                 const char  * slot  = (const char *) (section_base + elt_off + b * 32);
@@ -1734,12 +1734,12 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
         }
     };
     auto store_kv = [&](float * section_base, int64_t elt_off, const float * srcp, int64_t n, bool is_ssm = false) {
-        const dragon_state_prec m = (is_ssm && st_mode == DRAGON_STATE_BF16) ? DRAGON_STATE_F32 : st_mode;
+        const olala_state_prec m = (is_ssm && st_mode == OLALA_STATE_BF16) ? OLALA_STATE_F32 : st_mode;
         switch (m) {
-        case DRAGON_STATE_F32:
+        case OLALA_STATE_F32:
             std::memcpy(section_base + elt_off, srcp, (size_t) n * sizeof(float));
             return;
-        case DRAGON_STATE_BF16: {
+        case OLALA_STATE_BF16: {
             uint16_t * d16 = (uint16_t *) section_base + elt_off;
             for (int64_t i = 0; i < n; ++i) {
                 uint32_t u;
@@ -1749,7 +1749,7 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
             }
             return;
         }
-        case DRAGON_STATE_Q8: {
+        case OLALA_STATE_Q8: {
             GGML_ASSERT(elt_off % 32 == 0 && n % 32 == 0);
             for (int64_t b = 0; b < n / 32; ++b) {
                 const float * s = srcp + b * 32;
@@ -1781,11 +1781,11 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
     // slice. (An L-chunked scan à la the tilelang mamba3 kernel was evaluated
     // but its cross-chunk carry recompute costs more than the imbalance it
     // removes at CPU-scale thread counts.)
-    // Opt-in (DRAGON_M_COLSPLIT=1): measured neutral-to-slightly-negative at
+    // Opt-in (OLALA_M_COLSPLIT=1): measured neutral-to-slightly-negative at
     // nth=32 on EPYC 9334 — the duplicated per-(h, t) prep eats the balance
     // gain — but kept for experimentation at other H/nth ratios.
     int64_t S = 1;
-    if (const char * cs_env = std::getenv("DRAGON_M_COLSPLIT"); cs_env && cs_env[0] && cs_env[0] != '0') {
+    if (const char * cs_env = std::getenv("OLALA_M_COLSPLIT"); cs_env && cs_env[0] && cs_env[0] != '0') {
         auto imbalance = [&](int64_t s) {
             const double u = (double) (H * s);
             return std::ceil(u / nth) * nth / u;
@@ -1807,27 +1807,27 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
     }
 
     // Local SSM state for this thread's units: (my_U, Dv_sl, D_qk) fp32.
-    dragon_span ssm_state = dragon_scratch(0, (size_t) my_U * Dv_sl * D_qk);
+    olala_span ssm_state = olala_scratch(0, (size_t) my_U * Dv_sl * D_qk);
     // Per-unit previous-step K and V (for trapezoid β term). K is duplicated
     // across the S slices of a head (identical values); V is row-sliced.
-    dragon_span K_state = dragon_scratch(1, (size_t) my_U * R * D_qk);
-    dragon_span V_state = dragon_scratch(2, (size_t) my_U * R * Dv_sl);
+    olala_span K_state = olala_scratch(1, (size_t) my_U * R * D_qk);
+    olala_span V_state = olala_scratch(2, (size_t) my_U * R * Dv_sl);
     // Cumulative rotary angle per unit (duplicated across slices of a head).
-    dragon_span angle_state = dragon_scratch(3, (size_t) my_U * num_angles);
+    olala_span angle_state = olala_scratch(3, (size_t) my_U * num_angles);
 
     // Offsets into the packed (n_embd_s,) state blob — must match the layout
-    // computed by llama_hparams::n_embd_s() for Dragon.
+    // computed by llama_hparams::n_embd_s() for Olala.
     const int64_t off_K_glob   = H * D_v * D_qk;
     const int64_t off_V_glob   = off_K_glob + H * R * D_qk;
     const int64_t off_ang_glob = off_V_glob + H * R * D_v;
     const int64_t n_state_per_seq = off_ang_glob + H * num_angles;
 
     // Per-step rotated q, k scratch: (D_qk, R) × token-group (TB_MAX = 4).
-    dragon_span q_rot = dragon_scratch(4, (size_t) 4 * D_qk * R);
-    dragon_span k_rot = dragon_scratch(5, (size_t) 4 * D_qk * R);
+    olala_span q_rot = olala_scratch(4, (size_t) 4 * D_qk * R);
+    olala_span k_rot = olala_scratch(5, (size_t) 4 * D_qk * R);
     // Per-(unit, t) materialized v/z rows: (Dv_sl, R) × token-group.
-    dragon_span v_loc = dragon_scratch(6, (size_t) 4 * Dv_sl * R);
-    dragon_span z_loc = dragon_scratch(7, (size_t) 4 * Dv_sl * R);
+    olala_span v_loc = olala_scratch(6, (size_t) 4 * Dv_sl * R);
+    olala_span z_loc = olala_scratch(7, (size_t) 4 * Dv_sl * R);
 
     // L is laid out as n_seqs blocks of n_seq_tokens consecutive tokens.
     const int64_t n_seqs       = std::max<int64_t>(1, n_seqs_kernel);
@@ -1850,15 +1850,15 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
     // sequences, belong to this thread, so taking every snapshot before the
     // first write makes the in-place update race-free.
     const bool inplace = ud->inplace;
-    GGML_ASSERT(!inplace || (st_mode == DRAGON_STATE_F32 && S == 1 && state_out != nullptr));
+    GGML_ASSERT(!inplace || (st_mode == OLALA_STATE_F32 && S == 1 && state_out != nullptr));
     const int32_t * src_ids = inplace ? (const int32_t *) dst->src[4]->data : nullptr;
     auto src_row = [&](int64_t seq) -> const float * {
         return (const float *) ((const char *) state_in->data + (int64_t) src_ids[seq] * state_in->nb[1]);
     };
     const int64_t per_unit = D_v * D_qk + R * D_qk + R * D_v + num_angles;
-    dragon_span snap = { nullptr, 0 };
+    olala_span snap = { nullptr, 0 };
     if (inplace) {
-        snap = dragon_scratch(12, (size_t) (n_seqs * my_U * per_unit));
+        snap = olala_scratch(12, (size_t) (n_seqs * my_U * per_unit));
         for (int64_t seq = 0; seq < n_seqs; ++seq) {
             const float * src = src_row(seq);
             if (src == state_out + seq * n_state_per_seq) {
@@ -1929,12 +1929,12 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
 
     // Per-token scratch reused across heads in this thread's slice. Tokens are
     // processed in groups of up to TB_MAX so the state sweep (the dominant
-    // memory traffic) runs once per group — see dragon_simd_fused_step_tb.
+    // memory traffic) runs once per group — see olala_simd_fused_step_tb.
     constexpr int64_t TB_MAX = 4;
-    dragon_span tanh_ang_pi = dragon_scratch(8, (size_t) TB_MAX * num_angles);
-    dragon_span cs_buf = dragon_scratch(9, (size_t) num_angles);
-    dragon_span ss_buf = dragon_scratch(10, (size_t) num_angles);
-    dragon_span bc_norm = dragon_scratch(11, (size_t) TB_MAX * 2 * R * D_qk); // per-t RMS-normed [B | C]
+    olala_span tanh_ang_pi = olala_scratch(8, (size_t) TB_MAX * num_angles);
+    olala_span cs_buf = olala_scratch(9, (size_t) num_angles);
+    olala_span ss_buf = olala_scratch(10, (size_t) num_angles);
+    olala_span bc_norm = olala_scratch(11, (size_t) TB_MAX * 2 * R * D_qk); // per-t RMS-normed [B | C]
     const int64_t seq_t0  = seq * n_seq_tokens;
     const int64_t seq_t1  = (seq + 1) * n_seq_tokens;
     for (int64_t tg = seq_t0; tg < seq_t1; tg += TB_MAX) {
@@ -1992,7 +1992,7 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
                 if (a_neg > -1e-4f) a_neg = -1e-4f;       // clamp(max = -A_floor)
                 alpha_g[tt]         = expf(a_neg * dt_sp);
                 const float dt_h    = dt_sp;
-                const float trap_h  = dragon_sigmoidf(ph[2*D_v + 2]);
+                const float trap_h  = olala_sigmoidf(ph[2*D_v + 2]);
                 beta_g[tt]          = (1.0f - trap_h) * dt_h * alpha_g[tt];
                 gamma_g[tt]         = trap_h * dt_h;
 
@@ -2034,7 +2034,7 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
                         for (int64_t p = 0; p < Dv_sl; ++p) {
                             vr[p] = xs[p] * mxr[p];
                         }
-                        dragon_silu_mul_n(zs, mz_h + r * D_v, mimo_d + h * m_s2 + p0 + r * m_s1,
+                        olala_silu_mul_n(zs, mz_h + r * D_v, mimo_d + h * m_s2 + p0 + r * m_s1,
                                           zlt + r * Dv_sl, Dv_sl);
                     }
                     // D skip: y = sum_r w * D * v, seeded before the state sweep adds S.q
@@ -2049,7 +2049,7 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
                 }
                 if (do_rotary) {
                     // cos / sin per angle once for this (h, t); reused across R.
-                    dragon_sincos_n(ang_st, ss_buf.data(), cs_buf.data(), num_angles);
+                    olala_sincos_n(ang_st, ss_buf.data(), cs_buf.data(), num_angles);
                     const int64_t i2_off = 2 * quarter;
                     for (int64_t r = 0; r < R; ++r) {
                         float * qr = qrt + r * D_qk;
@@ -2095,7 +2095,7 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
             float * K_st = inplace ? row_seq + off_K_glob + h * R * D_qk : K_state.data() + ul * R * D_qk;
             float * V_st = inplace ? row_seq + off_V_glob + h * R * D_v  : V_state.data() + ul * R * Dv_sl;
             float * st   = inplace ? row_seq + h * D_v * D_qk            : ssm_state.data() + ul * Dv_sl * D_qk;
-            dragon_step_v2_dispatch(st, K_st, V_st, kpv, qpv, vpv, zpv,
+            olala_step_v2_dispatch(st, K_st, V_st, kpv, qpv, vpv, zpv,
                                     ypv, alpha_g, beta_g, gamma_g,
                                     R, TB, D_qk, Dv_sl);
 
@@ -2136,17 +2136,17 @@ static void dragon_mamba3_mimo_kernel(ggml_tensor * dst, int ith, int nth, void 
     }  // end per-seq loop
 }
 
-// DRAGON_GGML_OP=1 routes the recurrence core of the primitive path through
+// OLALA_GGML_OP=1 routes the recurrence core of the primitive path through
 // the first-class GGML_OP_MAMBA3_MIMO op instead of the closed-form
 // cumsum/tri/mul_mat construction.
-static bool dragon_use_ggml_op() {
-    static const bool forced = dragon_env_on("DRAGON_GGML_OP");
-    return forced || !dragon_layer_cpu;
+static bool olala_use_ggml_op() {
+    static const bool forced = olala_env_on("OLALA_GGML_OP");
+    return forced || !olala_layer_cpu;
 }
 
 // Primitive re-expression of the Mamba3-MIMO recurrence. Uses only standard
 // ggml ops (mul, add, cumsum, exp, tri, mul_mat), so it runs on any backend
-// — gated on the DRAGON_M_PRIM env var; default uses the CPU custom op which
+// — gated on the OLALA_M_PRIM env var; default uses the CPU custom op which
 // is faster on CPU but only runs on CPU.
 //
 // Algorithm follows mamba3_MIMO_chunk_ref from the production tilelang tests
@@ -2155,10 +2155,10 @@ static bool dragon_use_ggml_op() {
 // kv tensor. Memory at L=128 / H=48 / D_qk=128 / D_v=64 is ~200 MB for kv;
 // fine for short prefill, needs chunking for long contexts.
 //
-// Output: y (D_v, H, L) fp32, math equivalent to dragon_mamba3_mimo_kernel.
+// Output: y (D_v, H, L) fp32, math equivalent to olala_mamba3_mimo_kernel.
 // Validated: 125/127 argmax match vs CPU custom op on a 127-token prompt, cos
 // ≈ 0.9997 (limit set by fp32 op-order rounding).
-static ggml_tensor * build_dragon_m_recurrence_prim(
+static ggml_tensor * build_olala_m_recurrence_prim(
         ggml_context * ctx,
         ggml_tensor * q_biased,    // (D_qk, R, H, L)
         ggml_tensor * k_biased,    // (D_qk, R, H, L)
@@ -2182,7 +2182,7 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
         ggml_tensor ** state_out_packed = nullptr,
         // L = n_seqs * T with tokens laid out seq-major (all T tokens of seq 0,
         // then seq 1, ...) — the layout produced by equal-split ubatches.
-        // n_seqs > 1 is only supported on the DRAGON_GGML_OP path; the
+        // n_seqs > 1 is only supported on the OLALA_GGML_OP path; the
         // closed-form decay-matrix branch is single-sequence.
         int64_t n_seqs = 1) {
     (void) il;  // currently unused (reserved for future per-layer dump hooks)
@@ -2193,7 +2193,7 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
     GGML_ASSERT(T * n_seqs == L && "L must be divisible by n_seqs (equal-split ubatch)");
     GGML_ASSERT(n_seqs == 1 && "the closed-form primitive is single-sequence");
 
-    // Packed-state offsets (must match llama_hparams::n_embd_s() for Dragon).
+    // Packed-state offsets (must match llama_hparams::n_embd_s() for Olala).
     const int64_t off_K_glob   = H * D_v * D_qk;
     const int64_t off_V_glob   = off_K_glob + H * R * D_qk;
     const int64_t off_ang_glob = off_V_glob + H * R * D_v;
@@ -2457,7 +2457,7 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
 }
 
 
-// Chunked variant of build_dragon_m_recurrence_prim. Splits L into chunks of
+// Chunked variant of build_olala_m_recurrence_prim. Splits L into chunks of
 // size CS; computes within-chunk decay matrix + state with the closed form,
 // then carries a (D_qk, D_v, H) state across chunks via the exact
 // linear-recurrence update. Peak compute-buffer is O(CS·D_qk·D_v·H) instead
@@ -2472,7 +2472,7 @@ static ggml_tensor * build_dragon_m_recurrence_prim(
 //                                 + state_within_chunk[:,:,CS-1,:]
 // The diagonal correction (subtract γ_shifted · kv·q at u=t) is purely local
 // to the chunk, so it's applied unchanged.
-static ggml_tensor * build_dragon_m_recurrence_prim_chunked(
+static ggml_tensor * build_olala_m_recurrence_prim_chunked(
         ggml_context * ctx,
         ggml_tensor * q_biased,    // (D_qk, R, H, L)
         ggml_tensor * k_biased,    // (D_qk, R, H, L)
@@ -2495,7 +2495,7 @@ static ggml_tensor * build_dragon_m_recurrence_prim_chunked(
     GGML_ASSERT(num_angles == quarter && "halved rotary expects num_angles = D_qk/4");
     GGML_ASSERT(CS > 0 && CS <= L);
 
-    // Packed-state offsets (must match llama_hparams::n_embd_s() for Dragon).
+    // Packed-state offsets (must match llama_hparams::n_embd_s() for Olala).
     const int64_t off_K_glob   = H * D_v * D_qk;
     const int64_t off_V_glob   = off_K_glob + H * R * D_qk;
     const int64_t off_ang_glob = off_V_glob + H * R * D_v;
@@ -2773,8 +2773,8 @@ static ggml_tensor * build_dragon_m_recurrence_prim_chunked(
 //   [H*D_v*D_qk]                (D_qk, R,   H)  K_state    (last step's k_rot)
 //   [H*D_v*D_qk + H*R*D_qk]     (D_v,  R,   H)  V_state    (last step's v)
 //   [... + H*R*D_v]             (na,        H)  angle_state
-// — matches llama_hparams::n_embd_s() for Dragon.
-static ggml_tensor * build_dragon_m_decode_step(
+// — matches llama_hparams::n_embd_s() for Olala.
+static ggml_tensor * build_olala_m_decode_step(
         ggml_context * ctx,
         ggml_tensor * q_biased,    // (D_qk, R, H, 1)
         ggml_tensor * k_biased,    // (D_qk, R, H, 1)
@@ -2916,9 +2916,9 @@ static ggml_tensor * build_dragon_m_decode_step(
 
 // Graph builder for the M-layer (Mamba3-MIMO) mixer. Wires the static and
 // dynamic projections, normalises B/C, computes α/dt/trap, and dispatches the
-// recurrence — either to dragon_mamba3_mimo_kernel via ggml_custom_4d (default)
-// or to build_dragon_m_recurrence_prim when DRAGON_M_PRIM is set in the env.
-static ggml_tensor * build_dragon_m_mixer_real(
+// recurrence — either to olala_mamba3_mimo_kernel via ggml_custom_4d (default)
+// or to build_olala_m_recurrence_prim when OLALA_M_PRIM is set in the env.
+static ggml_tensor * build_olala_m_mixer_real(
         llm_graph_context & gctx,
         const llama_model & model,
         llm_graph_input_rs * inp_rs,
@@ -2933,9 +2933,9 @@ static ggml_tensor * build_dragon_m_mixer_real(
     const int64_t H_ssm   = (int64_t) hparams.ssm_d_inner / (int64_t) hparams.ssm_dt_rank; // 48
     const int64_t D_v     = (int64_t) hparams.ssm_dt_rank;                                 // 64 (headdim)
     const int64_t D_qk    = (int64_t) hparams.ssm_d_state;                                 // 128 (d_state)
-    const int64_t R       = (int64_t) hparams.dragon_mamba_mimo_dim;                       // 4
+    const int64_t R       = (int64_t) hparams.olala_mamba_mimo_dim;                       // 4
     const int64_t G       = (int64_t) hparams.ssm_n_group;                                 // 1
-    const int64_t angles_d = (int64_t) hparams.dragon_num_rope_angles;                     // 32
+    const int64_t angles_d = (int64_t) hparams.olala_num_rope_angles;                     // 32
     const auto  & layer   = model.layers[il];
 
     // Bind the recurrent state buffer so the cache is wired in even though we
@@ -2945,15 +2945,15 @@ static ggml_tensor * build_dragon_m_mixer_real(
     // The default CPU kernel updates the f32 state in place in the cache: the
     // state gather (a get_rows of ~1.7 MB/layer per sequence) is replaced by
     // the source-row ids, read by the kernel itself.
-    static const bool inplace_env_ok = !dragon_env_on("DRAGON_M_PRIM") && !std::getenv("DRAGON_M_DECODE_PRIM") &&
-                                       !std::getenv("DRAGON_M_CHUNK_SIZE") && !dragon_env_on("DRAGON_MEGA_DECODE") &&
-                                       !dragon_env_on("DRAGON_M_COLSPLIT") && !dragon_env_on("DRAGON_NO_INPLACE_STATE");
-    const bool state_inplace = inplace_env_ok && !dragon_use_ggml_op() && dragon_state_mode() == DRAGON_STATE_F32;
+    static const bool inplace_env_ok = !olala_env_on("OLALA_M_PRIM") && !std::getenv("OLALA_M_DECODE_PRIM") &&
+                                       !std::getenv("OLALA_M_CHUNK_SIZE") && !olala_env_on("OLALA_MEGA_DECODE") &&
+                                       !olala_env_on("OLALA_M_COLSPLIT") && !olala_env_on("OLALA_NO_INPLACE_STATE");
+    const bool state_inplace = inplace_env_ok && !olala_use_ggml_op() && olala_state_mode() == OLALA_STATE_F32;
     // GPU decode (one token per sequence) when every sequence reads its own cache row: the ggml op reads the state
     // straight from the cache rows it then overwrites (the Metal serial kernel loads the whole state of a (head,
     // sequence) before writing it), no gather copy.
-    const bool state_view = !state_inplace && inplace_env_ok && dragon_use_ggml_op() && dragon_layer_metal &&
-                            dragon_state_mode() == DRAGON_STATE_F32 && n_tokens == (int64_t) gctx.ubatch.n_seqs &&
+    const bool state_view = !state_inplace && inplace_env_ok && olala_use_ggml_op() && olala_layer_metal &&
+                            olala_state_mode() == OLALA_STATE_F32 && n_tokens == (int64_t) gctx.ubatch.n_seqs &&
                             inp_rs->s_copy_ident;
     ggml_tensor * rs_states = nullptr, * rs_ids = nullptr;
     ggml_tensor * rs_view = state_inplace
@@ -2973,12 +2973,12 @@ static ggml_tensor * build_dragon_m_mixer_real(
         : gctx.build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), gctx.ubatch.n_seqs);
 
     // Per-stage dump scaffolding — only dumps for the first M layer, gated on
-    // the DRAGON_DUMP_DIR env var; no-op otherwise.
+    // the OLALA_DUMP_DIR env var; no-op otherwise.
     auto dump_m_stage = [&](ggml_tensor * t, const char * tag) -> ggml_tensor * {
         if (il != 0) return t;
         char namebuf[256];
         std::snprintf(namebuf, sizeof(namebuf), "m_%%02d_%s.bin", tag);
-        return dragon_maybe_dump(ctx, t, namebuf, il);
+        return olala_maybe_dump(ctx, t, namebuf, il);
     };
     cur = dump_m_stage(cur, "00_in");
 
@@ -2992,23 +2992,23 @@ static ggml_tensor * build_dragon_m_mixer_real(
     // projection is built as a graph GEMM at all — the decode mega-kernel
     // computes it internally while streaming the weights).
     bool expanded_path = false;
-    if (n_tokens == 1 && std::getenv("DRAGON_M_DECODE_PRIM")) {
+    if (n_tokens == 1 && std::getenv("OLALA_M_DECODE_PRIM")) {
         expanded_path = true;
     }
-    if (const char * ec = std::getenv("DRAGON_M_CHUNK_SIZE"); ec && ec[0] && atoll(ec) > 0) {
+    if (const char * ec = std::getenv("OLALA_M_CHUNK_SIZE"); ec && ec[0] && atoll(ec) > 0) {
         expanded_path = true;
     }
-    if (const char * ep = std::getenv("DRAGON_M_PRIM"); ep && ep[0] && ep[0] != '0') {
+    if (const char * ep = std::getenv("OLALA_M_PRIM"); ep && ep[0] && ep[0] != '0') {
         expanded_path = true;
     }
-    const bool fused_op = dragon_use_ggml_op() && !expanded_path;
-    // Opt-in (DRAGON_MEGA_DECODE=1): measured 2-4% SLOWER than the default
+    const bool fused_op = olala_use_ggml_op() && !expanded_path;
+    // Opt-in (OLALA_MEGA_DECODE=1): measured 2-4% SLOWER than the default
     // path — ggml's batched GEMM already amortizes projection weights across
     // concurrent sequences, and its native AVX512-BF16 dots outrun the
     // hand-rolled bf16 loads here. Kept for experimentation (the overlap idea
     // pays on GPU, not on this CPU).
     static const bool want_mega = []() {
-        const char * e = std::getenv("DRAGON_MEGA_DECODE");
+        const char * e = std::getenv("OLALA_MEGA_DECODE");
         return e && e[0] && e[0] != '0';
     }();
     const bool mega_decode = !expanded_path && !fused_op && want_mega && R == 4 &&
@@ -3115,14 +3115,14 @@ static ggml_tensor * build_dragon_m_mixer_real(
         k_f = to_f32(k_biased);
         v_f = to_f32(v_proj);
         z_f = to_f32(z_proj);
-        // Optional input dumps for kernel-vs-primitive validation (DRAGON_DUMP_DIR gated).
+        // Optional input dumps for kernel-vs-primitive validation (OLALA_DUMP_DIR gated).
         q_f = dump_m_stage(q_f, "01_qf");
         k_f = dump_m_stage(k_f, "02_kf");
         v_f = dump_m_stage(v_f, "03_vf");
         z_f = dump_m_stage(z_f, "04_zf");
     }
     // (default path: per-layer constants come from the process-wide packed
-    // weight cache — no graph nodes at all; see dragon_get_packed_weights)
+    // weight cache — no graph nodes at all; see olala_get_packed_weights)
 
     // 4) Discretisation: α = exp(-softplus(A_raw) · softplus(dt_raw + dt_bias)).
     //    Only built as graph ops on the expanded paths (the primitives consume
@@ -3141,7 +3141,7 @@ static ggml_tensor * build_dragon_m_mixer_real(
             return ggml_add(ctx, pos, ggml_log(ctx, inner));
         };
         ggml_tensor * dt_sp = softplus(dt_pos);
-        // -A clamped above by -A_floor (= -1e-4 in Dragon's config.time_step_floor).
+        // -A clamped above by -A_floor (= -1e-4 in Olala's config.time_step_floor).
         ggml_tensor * a_neg = ggml_clamp(ctx, ggml_scale(ctx, softplus(A_raw), -1.0f),
                                          /*min=*/ -FLT_MAX, /*max=*/ -1e-4f);
         ggml_tensor * ADT     = ggml_mul(ctx, a_neg, dt_sp);
@@ -3172,15 +3172,15 @@ static ggml_tensor * build_dragon_m_mixer_real(
     //                                    written its final state; the prefill paths
     //                                    don't do that yet, so the first decode step
     //                                    after a prefill starts from a zero state.
-    //                                    See `examples/dragon-generate` for a fully
+    //                                    See `examples/olala-generate` for a fully
     //                                    correct repeated-prefill workaround.
-    //   * DRAGON_M_CHUNK_SIZE=<N>      — chunked primitive (peak buffer O(CS),
+    //   * OLALA_M_CHUNK_SIZE=<N>      — chunked primitive (peak buffer O(CS),
     //                                    needed for long contexts on tight GPUs).
     //                                    Recommended N ∈ [64, 256].
-    //   * DRAGON_M_PRIM=1              — non-chunked primitive (any backend, but
+    //   * OLALA_M_PRIM=1              — non-chunked primitive (any backend, but
     //                                    allocates (D_qk, D_v, H, L) kv and
     //                                    (L, L, H) decay tensors; fine to L≈1000).
-    //   * DRAGON_GGML_OP=1             — same as DRAGON_M_PRIM but the recurrence
+    //   * OLALA_GGML_OP=1             — same as OLALA_M_PRIM but the recurrence
     //                                    core runs as GGML_OP_MAMBA3_MIMO.
     //   * Default                      — CPU-only custom op (fastest on CPU).
     ggml_tensor * y = nullptr;
@@ -3202,7 +3202,7 @@ static ggml_tensor * build_dragon_m_mixer_real(
         };
         *c_bias = f32c(bias); *c_mxz = f32c(mxz); *c_norms = f32c(norms); *c_misc = f32c(misc);
     };
-    static const bool cpu_custom_m = dragon_env_on("DRAGON_CPU_CUSTOM_M");
+    static const bool cpu_custom_m = olala_env_on("OLALA_CPU_CUSTOM_M");
     if (state_inplace && !cpu_custom_m && !mega_decode) {
         // CPU default: GGML_OP_MAMBA3_MIMO in-place mode - reads each sequence's
         // source row of the cache and updates its destination row in place
@@ -3245,11 +3245,11 @@ static ggml_tensor * build_dragon_m_mixer_real(
                     kv_head * row_size)));
         goto post_recurrence;
     }
-    if (n_tokens == 1 && std::getenv("DRAGON_M_DECODE_PRIM")) {
+    if (n_tokens == 1 && std::getenv("OLALA_M_DECODE_PRIM")) {
         // (Debug) route decode through the pure-ggml-ops decode-step primitive.
         ggml_tensor * trap_post = ggml_cont(ctx, ggml_sigmoid(ctx, trap_raw));
         ggml_tensor * state_packed_out = nullptr;
-        y = build_dragon_m_decode_step(ctx,
+        y = build_olala_m_decode_step(ctx,
                 q_f, k_f, v_f, z_f,
                 a_f_, d_f_, trap_post, ang_f,
                 D_f, M_f,
@@ -3269,15 +3269,15 @@ static ggml_tensor * build_dragon_m_mixer_real(
     }
     {
     int64_t chunk_size = 0;
-    if (const char * ec = std::getenv("DRAGON_M_CHUNK_SIZE"); ec && ec[0]) {
+    if (const char * ec = std::getenv("OLALA_M_CHUNK_SIZE"); ec && ec[0]) {
         chunk_size = atoll(ec);
     }
     if (chunk_size > 0) {
         GGML_ASSERT(ubatch.n_seqs == 1 &&
-                    "DRAGON_M_CHUNK_SIZE path is single-sequence; use DRAGON_GGML_OP=1 for n_seqs > 1");
+                    "OLALA_M_CHUNK_SIZE path is single-sequence; use OLALA_GGML_OP=1 for n_seqs > 1");
         ggml_tensor * trap_post = ggml_cont(ctx, ggml_sigmoid(ctx, trap_raw));
         ggml_tensor * state_out = nullptr;
-        y = build_dragon_m_recurrence_prim_chunked(ctx,
+        y = build_olala_m_recurrence_prim_chunked(ctx,
                 q_f, k_f, v_f, z_f,
                 a_f_, d_f_, trap_post, ang_f,
                 D_f, M_f,
@@ -3295,13 +3295,13 @@ static ggml_tensor * build_dragon_m_mixer_real(
                     hparams.n_embd_s(), ubatch.n_seqs,
                     ssm_states_all->nb[1],
                     kv_head * row_size)));
-    } else if (const char * e = std::getenv("DRAGON_M_PRIM"); e && e[0] && e[0] != '0') {
+    } else if (const char * e = std::getenv("OLALA_M_PRIM"); e && e[0] && e[0] != '0') {
         ggml_tensor * trap_post = ggml_cont(ctx, ggml_sigmoid(ctx, trap_raw));
         ggml_tensor * state_out = nullptr;
         // Equal-split ubatches guarantee the same token count per seq, laid
         // out seq-major (all tokens of seq 0, then seq 1, ...).
         GGML_ASSERT((int64_t) ubatch.n_seqs * (int64_t) ubatch.n_seq_tokens == n_tokens);
-        y = build_dragon_m_recurrence_prim(ctx,
+        y = build_olala_m_recurrence_prim(ctx,
                 q_f, k_f, v_f, z_f,
                 a_f_, d_f_, trap_post, ang_f,
                 D_f, M_f,
@@ -3328,23 +3328,23 @@ static ggml_tensor * build_dragon_m_mixer_real(
                 hparams.n_embd_s(), gctx.ubatch.n_seqs,
                 ssm_states_all->nb[1], kv_head * row_size);
         ggml_tensor * args[4] = { cur, proj_dyn, rs_view, state_dst };
-        auto * ud = (dragon_m_kernel_userdata *) std::malloc(sizeof(dragon_m_kernel_userdata));
+        auto * ud = (olala_m_kernel_userdata *) std::malloc(sizeof(olala_m_kernel_userdata));
         ud->inplace = false;
         ud->n_seqs  = ubatch.n_seqs;
         ud->rms_eps = hparams.f_norm_rms_eps;
         ud->D_qk = D_qk; ud->D_v = D_v; ud->R = R; ud->H = H_ssm;
         ud->layer = &layer;
-        ud->w    = layer.ssm_b_bias->data ? dragon_get_packed_weights(layer, D_qk, D_v, R, H_ssm) : nullptr;
+        ud->w    = layer.ssm_b_bias->data ? olala_get_packed_weights(layer, D_qk, D_v, R, H_ssm) : nullptr;
         ud->w_in = layer.ssm_in;
         ud->w_wo = layer.wo;
         const int64_t n_embd_m = cur->ne[0];
         ggml_tensor * slabs = ggml_custom_4d(ctx, GGML_TYPE_F32,
                 n_embd_m, n_tokens, H_ssm, 1,
-                args, 4, dragon_m_mega_decode_kernel, GGML_N_TASKS_MAX, ud);
+                args, 4, olala_m_mega_decode_kernel, GGML_N_TASKS_MAX, ud);
         ggml_set_name(slabs, "m_mega");
         ggml_tensor * rargs[1] = { slabs };
         out_pre = ggml_custom_4d(ctx, GGML_TYPE_F32, n_embd_m, n_tokens, 1, 1,
-                rargs, 1, dragon_m_mega_reduce_kernel, GGML_N_TASKS_MAX, nullptr);
+                rargs, 1, olala_m_mega_reduce_kernel, GGML_N_TASKS_MAX, nullptr);
         ggml_set_name(out_pre, "m_mega_out");
     } else {
         // State-aware custom op: rs_view (src[8]) is the gathered state input;
@@ -3361,7 +3361,7 @@ static ggml_tensor * build_dragon_m_mixer_real(
         // Heap-allocated so the userdata pointer outlives graph build. ggml runs
         // the kernel during graph execution, by which time the local stack would
         // be gone.
-        auto * ud = (dragon_m_kernel_userdata *) std::malloc(sizeof(dragon_m_kernel_userdata));
+        auto * ud = (olala_m_kernel_userdata *) std::malloc(sizeof(olala_m_kernel_userdata));
         ud->inplace = state_inplace;
         ud->n_seqs  = ubatch.n_seqs;
         ud->rms_eps = hparams.f_norm_rms_eps;
@@ -3369,12 +3369,12 @@ static ggml_tensor * build_dragon_m_mixer_real(
         // packing reads the weights: skipped for graphs built on an unallocated
         // model (e.g. the -fit dry run), done lazily if such a graph ever runs
         ud->layer = &layer;
-        ud->w = layer.ssm_b_bias->data ? dragon_get_packed_weights(layer, D_qk, D_v, R, H_ssm) : nullptr;
+        ud->w = layer.ssm_b_bias->data ? olala_get_packed_weights(layer, D_qk, D_v, R, H_ssm) : nullptr;
         ud->w_in = nullptr; ud->w_wo = nullptr;
         y = ggml_custom_4d(ctx, GGML_TYPE_F32,
                            D_v, H_ssm, n_tokens, 1,
                            args, state_inplace ? 5 : 4,
-                           dragon_mamba3_mimo_kernel,
+                           olala_mamba3_mimo_kernel,
                            /*n_tasks=*/ GGML_N_TASKS_MAX,
                            /*userdata=*/ ud);
         ggml_set_name(y, "m_kernel");
@@ -3415,7 +3415,7 @@ post_recurrence:
 //   the differential combine:
 //        output[B,L,n_noise,snr,D] = signal − sigmoid(λ_proj(x)) · noise
 //   flattened to (B,L,n_signal,D), and a block-level SiLU gate.
-static ggml_tensor * build_dragon_v_mixer(
+static ggml_tensor * build_olala_v_mixer(
         llm_graph_context & gctx,
         const llama_model & model,
         llm_graph_input_attn_kv * inp_attn,
@@ -3428,17 +3428,17 @@ static ggml_tensor * build_dragon_v_mixer(
     auto * ctx = gctx.ctx0;
 
     const int64_t head_dim = (int64_t) hparams.n_embd_head_k_full;
-    const int64_t n_head   = (int64_t) hparams.dragon_n_signal_heads + (int64_t) hparams.dragon_n_noise_heads;
-    const int64_t n_kv     = (int64_t) hparams.dragon_n_noise_heads;
-    const int64_t n_signal = (int64_t) hparams.dragon_n_signal_heads;
+    const int64_t n_head   = (int64_t) hparams.olala_n_signal_heads + (int64_t) hparams.olala_n_noise_heads;
+    const int64_t n_kv     = (int64_t) hparams.olala_n_noise_heads;
+    const int64_t n_signal = (int64_t) hparams.olala_n_signal_heads;
     const int64_t n_noise  = n_kv;
     const int64_t snr      = n_signal / n_noise;
-    const int64_t rank     = (int64_t) hparams.dragon_tpa_rank;
-    const float   gate_b   = hparams.dragon_gate_bias;
+    const int64_t rank     = (int64_t) hparams.olala_tpa_rank;
+    const float   gate_b   = hparams.olala_gate_bias;
     const auto  & layer    = model.layers[il];
 
     // factored TPA cache (cparams.tpa_factored, any backend): the KV cache rows are the TPA factors of each token
-    // (ggml_dragon_tpa_prep_factored) and the attention reads them back (ggml_dragon_tpa_attn); about 2.6x less KV memory
+    // (ggml_olala_tpa_prep_factored) and the attention reads them back (ggml_olala_tpa_attn); about 2.6x less KV memory
     if (gctx.cparams.tpa_factored) {
         GGML_ASSERT(layer.attn_shift_k != nullptr);
         const int64_t n_seqs = gctx.ubatch.n_seqs;
@@ -3448,13 +3448,13 @@ static ggml_tensor * build_dragon_v_mixer(
                                    layer.attn_shift_k, layer.attn_shift_v, layer.attn_lambda, layer.attn_gate };
         bool repacked = false;
         for (ggml_tensor * w : wlist) {
-            repacked = repacked || dragon_tensor_repacked(w);
+            repacked = repacked || olala_tensor_repacked(w);
         }
         ggml_tensor * pr = nullptr;
-        if (n_tokens <= DRAGON_METAL_MAX_TOKENS && (dragon_layer_metal || !repacked)) {
-            pr = ggml_dragon_mmv(ctx, cur, wlist, 9);
+        if (n_tokens <= OLALA_METAL_MAX_TOKENS && (olala_layer_metal || !repacked)) {
+            pr = ggml_olala_mmv(ctx, cur, wlist, 9);
         } else {
-            // long batches (matrix-matrix kernels) or CPU repacked weights (not read by DRAGON_MMV): the 9 projections
+            // long batches (matrix-matrix kernels) or CPU repacked weights (not read by OLALA_MMV): the 9 projections
             // one by one, concatenated
             for (ggml_tensor * w : wlist) {
                 ggml_tensor * y = ggml_mul_mat(ctx, w, cur);
@@ -3466,16 +3466,16 @@ static ggml_tensor * build_dragon_v_mixer(
         ggml_tensor * states_all = mctx_recr->get_r_l(il);
         ggml_tensor * shift_view = gctx.build_rs(inp_rs, states_all, hparams.n_embd_r(), n_seqs);       // (n_embd_r, n_seqs)
 
-        const float slw_wsize_f = (float) std::max<uint32_t>(hparams.dragon_slw_wsize, 1u);
-        ggml_tensor * prep = ggml_dragon_tpa_prep_factored(ctx, pr, shift_view, gctx.build_inp_pos(),
+        const float slw_wsize_f = (float) std::max<uint32_t>(hparams.olala_slw_wsize, 1u);
+        ggml_tensor * prep = ggml_olala_tpa_prep_factored(ctx, pr, shift_view, gctx.build_inp_pos(),
                 layer.attn_q_norm, layer.attn_k_norm, layer.attn_softmax_scaler,
                 (int) n_head, (int) n_kv, (int) rank, (int) head_dim, (int) n_signal, (int) n_seqs,
                 hparams.f_norm_rms_eps, slw_wsize_f, gate_b);
         ggml_set_name(prep, "v_tpa_prep");
 
         const size_t  f      = sizeof(float);
-        const int64_t KR     = ggml_dragon_tpa_row_k((int) n_kv, (int) rank, (int) head_dim);
-        const int64_t VR     = ggml_dragon_tpa_row_v((int) n_kv, (int) rank, (int) head_dim);
+        const int64_t KR     = ggml_olala_tpa_row_k((int) n_kv, (int) rank, (int) head_dim);
+        const int64_t VR     = ggml_olala_tpa_row_v((int) n_kv, (int) rank, (int) head_dim);
         const int64_t o_k    = n_tokens*n_head*head_dim;
         const int64_t o_v    = o_k + n_tokens*KR;
         const int64_t o_lam  = o_v + n_tokens*VR;
@@ -3516,21 +3516,21 @@ static ggml_tensor * build_dragon_v_mixer(
         const float kq_scale = 1.0f / (float) head_dim;
         const float softcap  = hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f;
         ggml_tensor * attn_out = nullptr;
-        if (n_tokens/ns > DRAGON_TPA_FACTORED_MAX_T) {
+        if (n_tokens/ns > OLALA_TPA_FACTORED_MAX_T) {
             // long batches: K / V expanded once (one layer at a time) and the usual attention
-            ggml_tensor * ke = ggml_dragon_tpa_expand(ctx, kc, inp_attn->self_prev_cell, (int) n_kv, (int) rank, (int) head_dim, false);
-            ggml_tensor * ve = ggml_dragon_tpa_expand(ctx, vc, inp_attn->self_prev_cell, (int) n_kv, (int) rank, (int) head_dim, true);
+            ggml_tensor * ke = ggml_olala_tpa_expand(ctx, kc, inp_attn->self_prev_cell, (int) n_kv, (int) rank, (int) head_dim, false);
+            ggml_tensor * ve = ggml_olala_tpa_expand(ctx, vc, inp_attn->self_prev_cell, (int) n_kv, (int) rank, (int) head_dim, true);
             ggml_set_name(ke, "v_tpa_k");
             ggml_set_name(ve, "v_tpa_v");
             attn_out = gctx.build_attn_mha(Qf, ke, ve, nullptr, mask, nullptr, nullptr, 0, kq_scale, il);
         } else {
             ggml_tensor * q4 = ggml_reshape_4d(ctx, Qf, head_dim, n_head, n_tokens/ns, ns);
-            attn_out = ggml_dragon_tpa_attn(ctx, q4, kc, vc, mask, inp_attn->self_prev_cell, (int) n_kv, (int) rank, kq_scale, softcap);
+            attn_out = ggml_olala_tpa_attn(ctx, q4, kc, vc, mask, inp_attn->self_prev_cell, (int) n_kv, (int) rank, kq_scale, softcap);
             ggml_set_name(attn_out, "v_tpa_attn");
         }
         attn_out = ggml_reshape_3d(ctx, attn_out, head_dim, n_head, n_tokens);
 
-        ggml_tensor * y_attn = ggml_dragon_diff_gate(ctx, attn_out, lam, gs);
+        ggml_tensor * y_attn = ggml_olala_diff_gate(ctx, attn_out, lam, gs);
         ggml_tensor * v_out  = ggml_mul_mat(ctx, layer.wo, y_attn);
         ggml_set_name(v_out, "v_out_proj");
         return v_out;
@@ -3538,13 +3538,13 @@ static ggml_tensor * build_dragon_v_mixer(
 
     // Metal: the whole preparation in 3 ops (9 projections in one GEMV, TPA expand + token shift + norms + scalable softmax
     // + lambda + gate in one kernel, differential combine x gate in one kernel); the attention itself stays in build_attn.
-    if (dragon_layer_metal && layer.attn_shift_k != nullptr && n_tokens <= DRAGON_METAL_MAX_TOKENS) {
+    if (olala_layer_metal && layer.attn_shift_k != nullptr && n_tokens <= OLALA_METAL_MAX_TOKENS) {
         const int64_t n_seqs = gctx.ubatch.n_seqs;
         GGML_ASSERT(n_tokens % n_seqs == 0);
 
         ggml_tensor * wlist[9] = { layer.wq, layer.attn_wa_k, layer.attn_wa_v, layer.attn_wb_k, layer.attn_wb_v,
                                    layer.attn_shift_k, layer.attn_shift_v, layer.attn_lambda, layer.attn_gate };
-        ggml_tensor * pr = ggml_dragon_mmv(ctx, cur, wlist, 9);
+        ggml_tensor * pr = ggml_olala_mmv(ctx, cur, wlist, 9);
         ggml_set_name(pr, "v_proj_fused");
 
         ggml_tensor * states_all = mctx_recr->get_r_l(il);
@@ -3559,8 +3559,8 @@ static ggml_tensor * build_dragon_v_mixer(
                   })
             : gctx.build_rs(inp_rs, states_all, hparams.n_embd_r(), n_seqs);                       // (n_embd_r, n_seqs)
 
-        const float slw_wsize_f = (float) std::max<uint32_t>(hparams.dragon_slw_wsize, 1u);
-        ggml_tensor * prep = ggml_dragon_tpa_prep(ctx, pr, shift_view, gctx.build_inp_pos(),
+        const float slw_wsize_f = (float) std::max<uint32_t>(hparams.olala_slw_wsize, 1u);
+        ggml_tensor * prep = ggml_olala_tpa_prep(ctx, pr, shift_view, gctx.build_inp_pos(),
                 layer.attn_q_norm, layer.attn_k_norm, layer.attn_softmax_scaler,
                 (int) n_head, (int) n_kv, (int) rank, (int) head_dim, (int) n_signal, (int) n_seqs,
                 hparams.f_norm_rms_eps, slw_wsize_f, gate_b);
@@ -3590,7 +3590,7 @@ static ggml_tensor * build_dragon_v_mixer(
         ggml_tensor * attn_out = gctx.build_attn(inp_attn, nullptr, nullptr, nullptr, Qf, Kf, Vf, nullptr, nullptr, nullptr, kq_scale, il);
         attn_out = ggml_reshape_3d(ctx, attn_out, head_dim, n_head, n_tokens);
 
-        ggml_tensor * y_attn = ggml_dragon_diff_gate(ctx, attn_out, lam, gs);
+        ggml_tensor * y_attn = ggml_olala_diff_gate(ctx, attn_out, lam, gs);
         ggml_tensor * v_out  = ggml_mul_mat(ctx, layer.wo, y_attn);
         ggml_set_name(v_out, "v_out_proj");
         return v_out;
@@ -3634,8 +3634,8 @@ static ggml_tensor * build_dragon_v_mixer(
                                                                                  // (n_embd_r, n_seqs)
         const int64_t n_kp     = head_dim * n_kv;                                // K-side floats
 
-        static const bool force_no_fused_shift = std::getenv("DRAGON_NO_FUSED_SHIFT") != nullptr;
-        if (!force_no_fused_shift && dragon_layer_cpu) {
+        static const bool force_no_fused_shift = std::getenv("OLALA_NO_FUSED_SHIFT") != nullptr;
+        if (!force_no_fused_shift && olala_layer_cpu) {
             // Fused token shift: one custom op computes K̃/Ṽ for both tensors
             // and writes the pre-shift last K/V of each seq into the cache.
             ggml_tensor * ak = ggml_mul_mat(ctx, layer.attn_shift_k, cur);       // (n_kv, L)
@@ -3647,11 +3647,11 @@ static ggml_tensor * build_dragon_v_mixer(
             ggml_tensor * cache_view = ggml_view_2d(ctx, states_all,
                     hparams.n_embd_r(), n_seqs, states_all->nb[1], kv_head * row_size);
             ggml_tensor * args[7] = { Kcur, Vcur, ak, av, gctx.build_inp_pos(), shift_view, cache_view };
-            auto * sud = (dragon_vshift_userdata *) std::malloc(sizeof(dragon_vshift_userdata));
+            auto * sud = (olala_vshift_userdata *) std::malloc(sizeof(olala_vshift_userdata));
             sud->n_seqs = n_seqs;
             ggml_tensor * kv_new = ggml_custom_4d(ctx, GGML_TYPE_F32,
                     head_dim, n_kv, n_tokens, 2,
-                    args, 7, dragon_v_shift_kernel, GGML_N_TASKS_MAX, sud);
+                    args, 7, olala_v_shift_kernel, GGML_N_TASKS_MAX, sud);
             ggml_set_name(kv_new, "v_shift_fused");
             Kcur = ggml_view_3d(ctx, kv_new, head_dim, n_kv, n_tokens,
                                 kv_new->nb[1], kv_new->nb[2], 0);
@@ -3749,7 +3749,7 @@ post_shift:;
     // Scalable softmax: Q *= softmax_scaler[h] · log(min(pos+1, slw_wsize)).
     // https://arxiv.org/abs/2501.19399
     {
-        const float slw_wsize_f = (float) std::max<uint32_t>(hparams.dragon_slw_wsize, 1u);
+        const float slw_wsize_f = (float) std::max<uint32_t>(hparams.olala_slw_wsize, 1u);
         ggml_tensor * pos_f32      = ggml_cast(ctx, gctx.build_inp_pos(), GGML_TYPE_F32);
         ggml_tensor * pos_plus_one = ggml_scale_bias(ctx, pos_f32, 1.0f, 1.0f);
         ggml_tensor * pos_clamped  = ggml_clamp(ctx, pos_plus_one, 1.0f, slw_wsize_f);
@@ -3759,7 +3759,7 @@ post_shift:;
         Qcur = ggml_mul(ctx, Qcur, scaler);
     }
 
-    // Sliding-window attention with softcap. Dragon uses softmax_scale = 1/head_dim
+    // Sliding-window attention with softcap. Olala uses softmax_scale = 1/head_dim
     // (not 1/√head_dim) when use_completed_p = true; combined with the scalable
     // softmax pre-multiply this gives effective scale softmax_scaler[h] ·
     // log(min(pos+1, slw_wsize)) / head_dim on Q·Kᵀ.
@@ -3797,7 +3797,7 @@ post_shift:;
 }
 
 
-llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_params & params)
+llama_model_olala::graph::graph(const llama_model & model, const llm_graph_params & params)
     : llm_graph_context(params) {
 
     ggml_tensor * cur;
@@ -3820,32 +3820,32 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
     for (int il = 0; il < n_layer; ++il) {
         {
             ggml_backend_dev_t dev = model.dev_layer(il);
-            static const bool force_portable = dragon_env_on("DRAGON_PORTABLE");
-            dragon_layer_cpu = !force_portable &&
+            static const bool force_portable = olala_env_on("OLALA_PORTABLE");
+            olala_layer_cpu = !force_portable &&
                 (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
-            dragon_layer_metal = !force_portable && dev != nullptr &&
+            olala_layer_metal = !force_portable && dev != nullptr &&
                 ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
                 strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "MTL") == 0;
         }
 
-        // Optional per-block dump for HF↔llama.cpp comparison, gated on DRAGON_DUMP_DIR.
-        inpL = dragon_maybe_dump(ctx0, inpL, "block_%02d_in.bin", il);
+        // Optional per-block dump for HF↔llama.cpp comparison, gated on OLALA_DUMP_DIR.
+        inpL = olala_maybe_dump(ctx0, inpL, "block_%02d_in.bin", il);
 
         ggml_tensor * residual = inpL;
 
         ggml_tensor * y_mixer;
         if (hparams.is_recr(il)) {
-            y_mixer = build_dragon_m_mixer_real(*this, model, inp_rs, mctx_recr,
+            y_mixer = build_olala_m_mixer_real(*this, model, inp_rs, mctx_recr,
                                                 residual, hparams, n_tokens_g,
                                                 ubatch_ref, il);
         } else {
-            y_mixer = build_dragon_v_mixer(*this, model, inp_attn, inp_rs, mctx_recr,
+            y_mixer = build_olala_v_mixer(*this, model, inp_attn, inp_rs, mctx_recr,
                                            residual, hparams, n_tokens_g, il);
         }
         cb(y_mixer, "mixer_out", il);
 
         // ----- Geodesic-residual #1 -----
-        cur = build_dragon_geodesic(ctx0, residual, y_mixer,
+        cur = build_olala_geodesic(ctx0, residual, y_mixer,
                                     model.layers[il].geo_mixer_scale,
                                     model.layers[il].geo_mixer_bias, il);
         cb(cur, "post_mixer", il);
@@ -3853,27 +3853,27 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
         // ----- MoE + shared expert -----
         residual = cur;
 
-        static const bool force_no_fused_moe = std::getenv("DRAGON_NO_FUSED_MOE") != nullptr;
+        static const bool force_no_fused_moe = std::getenv("OLALA_NO_FUSED_MOE") != nullptr;
         ggml_tensor * y_mlp = nullptr;
         // low-memory mode: the experts are a lazily read file mapping; the fused op
         // is the only path that prefetches and releases them, so use it for every
         // ubatch size (it processes pairs grouped by expert, fine for prefill too)
         const bool lazy_experts = model.can_prefetch.count(model.layers[il].ffn_up_exps) > 0 &&
                                   model.can_prefetch.count(model.layers[il].ffn_down_exps) > 0;
-        const bool metal_moe = dragon_layer_metal && !lazy_experts && cur->ne[1] <= DRAGON_METAL_MAX_TOKENS;
+        const bool metal_moe = olala_layer_metal && !lazy_experts && cur->ne[1] <= OLALA_METAL_MAX_TOKENS;
         // (lazy experts on a GPU layer: the CPU fused op too - the only path that pages the experts in and out)
-        const bool use_moe_op = (dragon_layer_cpu || metal_moe || lazy_experts) && !force_no_fused_moe && !dragon_dump_dir() &&
-            (cur->ne[1] <= dragon_fused_moe_max_tokens() || lazy_experts || metal_moe) &&
-            !dragon_tensor_repacked(model.layers[il].ffn_latent_down) &&
-            !dragon_tensor_repacked(model.layers[il].ffn_up_exps) &&
-            !dragon_tensor_repacked(model.layers[il].ffn_down_exps) &&
-            !dragon_tensor_repacked(model.layers[il].ffn_latent_up) &&
-            !dragon_tensor_repacked(model.layers[il].ffn_up_shexp) &&
-            !dragon_tensor_repacked(model.layers[il].ffn_down_shexp);
+        const bool use_moe_op = (olala_layer_cpu || metal_moe || lazy_experts) && !force_no_fused_moe && !olala_dump_dir() &&
+            (cur->ne[1] <= olala_fused_moe_max_tokens() || lazy_experts || metal_moe) &&
+            !olala_tensor_repacked(model.layers[il].ffn_latent_down) &&
+            !olala_tensor_repacked(model.layers[il].ffn_up_exps) &&
+            !olala_tensor_repacked(model.layers[il].ffn_down_exps) &&
+            !olala_tensor_repacked(model.layers[il].ffn_latent_up) &&
+            !olala_tensor_repacked(model.layers[il].ffn_up_shexp) &&
+            !olala_tensor_repacked(model.layers[il].ffn_down_shexp);
         if (use_moe_op) {
             // Whole MoE block (latent down, router, top-k, experts, latent up,
             // shared expert, sum) as one CPU op: 3 barriers instead of ~14 nodes.
-            y_mlp = ggml_dragon_moe(ctx0, cur,
+            y_mlp = ggml_olala_moe(ctx0, cur,
                     model.layers[il].ffn_latent_down,
                     model.layers[il].ffn_gate_inp,
                     model.layers[il].ffn_exp_probs_b,
@@ -3883,7 +3883,7 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
                     model.layers[il].ffn_up_shexp,
                     model.layers[il].ffn_down_shexp,
                     (int) n_expert_used, hparams.expert_weights_scale,
-                    lazy_experts ? dragon_expert_cache_mib(model) : -1);
+                    lazy_experts ? olala_expert_cache_mib(model) : -1);
             cb(y_mlp, "mlp_out", il);
         } else {
             // n_embd → moe_latent_size bottleneck before the routed experts.
@@ -3899,18 +3899,18 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
             ggml_tensor * router_logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur_f32);
             cb(router_logits, "moe_router_logits", il);
             // Optional dump of the top-k selection for HF↔llama.cpp router comparison.
-            if (dragon_dump_dir()) {
+            if (olala_dump_dir()) {
                 ggml_tensor * probs    = ggml_sigmoid(ctx0, router_logits);
                 ggml_tensor * probs_b  = ggml_add(ctx0, probs, model.layers[il].ffn_exp_probs_b);
                 ggml_tensor * topk_idx = ggml_argsort_top_k(ctx0, probs_b, n_expert_used);
                 ggml_tensor * topk_f32 = ggml_cast(ctx0, topk_idx, GGML_TYPE_F32);
-                topk_f32 = dragon_maybe_dump(ctx0, topk_f32, "moe_topk_blk%02d.bin", il);
+                topk_f32 = olala_maybe_dump(ctx0, topk_f32, "moe_topk_blk%02d.bin", il);
                 // Anchor in graph so the dump op isn't optimised away.
                 cur = ggml_add(ctx0, cur, ggml_scale(ctx0, ggml_sum_rows(ctx0, topk_f32), 0.0f));
             }
 
                 ggml_tensor * routed = nullptr;
-            if (force_no_fused_moe || !dragon_layer_cpu) {
+            if (force_no_fused_moe || !olala_layer_cpu) {
                 routed = build_moe_ffn(
                         inp_latent,
                         model.layers[il].ffn_gate_inp,
@@ -3930,25 +3930,25 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
                 ggml_tensor * targs[2] = { router_logits, model.layers[il].ffn_exp_probs_b };
                 ggml_tensor * sel = ggml_custom_4d(ctx0, GGML_TYPE_I32,
                         n_expert_used, L_moe, 1, 1, targs, 2,
-                        dragon_moe_topk_kernel, GGML_N_TASKS_MAX, nullptr);
+                        olala_moe_topk_kernel, GGML_N_TASKS_MAX, nullptr);
                 ggml_set_name(sel, "moe_topk_fused");
-                auto * mud = (dragon_moe_userdata *) std::malloc(sizeof(dragon_moe_userdata));
+                auto * mud = (olala_moe_userdata *) std::malloc(sizeof(olala_moe_userdata));
                 mud->w_scale = hparams.expert_weights_scale;
                 ggml_tensor * w_sel = ggml_custom_4d(ctx0, GGML_TYPE_F32,
                         n_expert_used, L_moe, 1, 1, targs, 2,
-                        dragon_moe_weights_kernel, GGML_N_TASKS_MAX, mud);
+                        olala_moe_weights_kernel, GGML_N_TASKS_MAX, mud);
                 ggml_set_name(w_sel, "moe_weights_fused");
 
                 ggml_tensor * lat3 = ggml_reshape_3d(ctx0, inp_latent, n_lat, 1, L_moe);
                 ggml_tensor * up = ggml_mul_mat_id(ctx0, model.layers[il].ffn_up_exps, lat3, sel);
                 ggml_set_name(up, "ffn_moe_up");
-                up = ggml_map_custom1(ctx0, up, dragon_relu_sqr_kernel, GGML_N_TASKS_MAX, nullptr);
+                up = ggml_map_custom1(ctx0, up, olala_relu_sqr_kernel, GGML_N_TASKS_MAX, nullptr);
                 ggml_tensor * down = ggml_mul_mat_id(ctx0, model.layers[il].ffn_down_exps, up, sel);
                 ggml_set_name(down, "ffn_moe_down");
                 ggml_tensor * rargs[2] = { down, w_sel };
                 routed = ggml_custom_4d(ctx0, GGML_TYPE_F32,
                         n_lat, L_moe, 1, 1, rargs, 2,
-                        dragon_moe_reduce_kernel, GGML_N_TASKS_MAX, nullptr);
+                        olala_moe_reduce_kernel, GGML_N_TASKS_MAX, nullptr);
                 ggml_set_name(routed, "moe_reduce_fused");
             }
             cb(routed, "moe_routed_pre_up", il);
@@ -3959,9 +3959,9 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
 
             // Dense shared expert: n_embd → ff_shexp → ReLU² → n_embd, no gate.
             ggml_tensor * shared = nullptr;
-            if (dragon_layer_cpu && !force_no_fused_moe) {
+            if (olala_layer_cpu && !force_no_fused_moe) {
                 shared = ggml_mul_mat(ctx0, model.layers[il].ffn_up_shexp, cur);
-                shared = ggml_map_custom1(ctx0, shared, dragon_relu_sqr_kernel, GGML_N_TASKS_MAX, nullptr);
+                shared = ggml_map_custom1(ctx0, shared, olala_relu_sqr_kernel, GGML_N_TASKS_MAX, nullptr);
                 shared = ggml_mul_mat(ctx0, model.layers[il].ffn_down_shexp, shared);
             } else {
                 shared = build_ffn(cur,
@@ -3978,7 +3978,7 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
         }
 
         // ----- Geodesic-residual #2 -----
-        cur = build_dragon_geodesic(ctx0, residual, y_mlp,
+        cur = build_olala_geodesic(ctx0, residual, y_mlp,
                                     model.layers[il].geo_mlp_scale,
                                     model.layers[il].geo_mlp_bias, il);
 
@@ -3994,9 +3994,9 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
     cur = inpL;
 
     // Dump the final hidden state (input to lm_head) if requested.
-    cur = dragon_maybe_dump(ctx0, cur, "final_hidden.bin", 0);
+    cur = olala_maybe_dump(ctx0, cur, "final_hidden.bin", 0);
 
-    cb(cur, "result_norm", -1); // no final norm in Dragon
+    cb(cur, "result_norm", -1); // no final norm in Olala
     res->t_embd = cur;
 
     cur = build_lora_mm(model.output, cur, model.output_s);
@@ -4005,7 +4005,7 @@ llama_model_dragon::graph::graph(const llama_model & model, const llm_graph_para
 
     ggml_build_forward_expand(gf, cur);
 
-    // the activations of Dragon reach ~1e8 (Mamba outputs) and the relu^2 expert hidden states also leave the half
+    // the activations of Olala reach ~1e8 (Mamba outputs) and the relu^2 expert hidden states also leave the half
     // range: the products with quantized weights must not convert their activations below bf16 [TAG_GGML_PREC]
     // (Metal: bfloat instead of half operands in the matrix-matrix kernels)
     for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {

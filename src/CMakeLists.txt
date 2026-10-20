@@ -70,11 +70,11 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
-# Enable native CPU features (AVX2/AVX-512/FMA) for the Dragon M-kernel SIMD
-# helpers in models/dragon.cpp. ggml-cpu has its own ISA handling; this only
+# Enable native CPU features (AVX2/AVX-512/FMA) for the Olala M-kernel SIMD
+# helpers in models/olala.cpp. ggml-cpu has its own ISA handling; this only
 # affects the llama target's TUs so we can use AVX-512 intrinsics directly.
 if (GGML_NATIVE AND NOT CMAKE_OSX_ARCHITECTURES AND NOT MSVC)
-    set_source_files_properties(models/dragon.cpp PROPERTIES
+    set_source_files_properties(models/olala.cpp PROPERTIES
         COMPILE_OPTIONS "-march=native")
 endif()
 

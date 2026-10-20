@@ -587,12 +587,12 @@ extern "C" {
         GGML_OP_DSV4_HC_POST,
         GGML_OP_MAMBA3_MIMO,
         GGML_OP_GEODESIC,
-        GGML_OP_DRAGON_MOE,
-        GGML_OP_DRAGON_MMV,
-        GGML_OP_DRAGON_TPA_PREP,
-        GGML_OP_DRAGON_DIFF_GATE,
-        GGML_OP_DRAGON_TPA_ATTN,
-        GGML_OP_DRAGON_TPA_EXPAND,
+        GGML_OP_OLALA_MOE,
+        GGML_OP_OLALA_MMV,
+        GGML_OP_OLALA_TPA_PREP,
+        GGML_OP_OLALA_DIFF_GATE,
+        GGML_OP_OLALA_TPA_ATTN,
+        GGML_OP_OLALA_TPA_EXPAND,
 
         GGML_OP_UNARY,
 
@@ -2734,7 +2734,7 @@ extern "C" {
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
 
-    // Dragon (Olala) Mamba3-MIMO mixer core, raw-projection form. Per head h and
+    // Olala Mamba3-MIMO mixer core, raw-projection form. Per head h and
     // token t (sequence-major tokens, equal count per sequence):
     //   k_r = rot(rmsnorm(B_r)*w_b + b_bias_r),  q_r = rot(rmsnorm(C_r)*w_c + c_bias_r)
     //   v_r = x * mimo_x_r,                       z_r = z * mimo_z_r
@@ -2788,7 +2788,7 @@ extern "C" {
             float                 eps,
             float                 a_floor);
 
-    // Dragon (Olala) geodesic residual, per row of x and g (n_embd, n_rows):
+    // Olala geodesic residual, per row of x and g (n_embd, n_rows):
     //   g_perp = g - (x.g / |x|^2) x
     //   theta  = min((min(|g_perp|/|x|, pi/4) * scale + bias) * inv_depth, pi/4)
     //   out    = x cos(theta) + (g_perp/|g_perp|) |x| sin(theta)
@@ -2802,13 +2802,13 @@ extern "C" {
             float                 inv_depth);
 
 
-    // Dragon (Olala) latent MoE block, fused (CPU backend). x: (n_embd, T) f32.
+    // Olala latent MoE block, fused (CPU backend). x: (n_embd, T) f32.
     //   lat    = w_lat_down^T x                                        (n_lat, T)
     //   logits = w_router^T x (f32); sel = top-k of sigmoid(logits) + router_bias
     //   w_k    = sigmoid(logits[sel_k]) / max(sum_k sigmoid(logits[sel_k]), 2^-14) * w_scale
     //   routed = w_lat_up^T sum_k w_k * (w_down_exps[sel_k]^T relu(w_up_exps[sel_k]^T lat)^2)
     //   out    = routed + w_down_sh^T relu(w_up_sh^T x)^2                 (n_embd, T)
-    GGML_API struct ggml_tensor * ggml_dragon_moe(
+    GGML_API struct ggml_tensor * ggml_olala_moe(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
             struct ggml_tensor  * w_lat_down,   // (n_embd, n_lat)
@@ -2828,20 +2828,20 @@ extern "C" {
                                                      // after use, keeping at most this many MiB
                                                      // of recently used experts resident
 
-    // Dragon V-layer helpers (decode kernels; Metal + CPU reference)
+    // Olala V-layer helpers (decode kernels; Metal + CPU reference)
     //   y = concat_i(W_i^T x) for up to 9 weight matrices sharing the input x (n_embd, T) f32 -> (sum_i rows_i, T) f32
-    GGML_API struct ggml_tensor * ggml_dragon_mmv(
+    GGML_API struct ggml_tensor * ggml_olala_mmv(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
             struct ggml_tensor ** ws,
             int                   n_ws);
 
-    //   attention preparation of the Dragon V-layer (semantic reference: ggml_compute_forward_dragon_tpa_prep_f32):
+    //   attention preparation of the Olala V-layer (semantic reference: ggml_compute_forward_olala_tpa_prep_f32):
     //   pr (ROW, T) f32 = [q (H*Dh) | A_k (Hn*R) | A_v (Hn*R) | B_k (R*Dh) | B_v (R*Dh) | sh_k (Hn) | sh_v (Hn) | lam (Hn) | g (Hs*Dh)]
     //   prev (2*Hn*Dh, n_seqs) f32 = [K_prev | V_prev] per sequence, pos (T) i32, q_norm / k_norm (Dh), scaler (H)
     //   out: flat f32 [q (Dh,H,T) normed+scaled | k (Dh,Hn,T) shifted+normed | v (Dh,Hn,T) shifted | lam (Hn,T) sigmoid |
     //        gs (Hs*Dh,T) silu(g + gate_b) | kvlast (2*Hn*Dh, n_seqs) pre-shift K/V of each sequence's last token]
-    GGML_API struct ggml_tensor * ggml_dragon_tpa_prep(
+    GGML_API struct ggml_tensor * ggml_olala_tpa_prep(
             struct ggml_context * ctx,
             struct ggml_tensor  * pr,
             struct ggml_tensor  * prev,
@@ -2856,8 +2856,8 @@ extern "C" {
     //   [q~ (Dh,H,T) normed+scaled, times k_norm | krow (KR,T) | vrow (VR,T) | lam | gs | kvlast] with
     //   krow = [B_k (R*Dh) | A_k (Hn*R) | ck (Hn) | ak (Hn) | 0 pad], vrow = [B_v (R*Dh) | A_v (Hn*R) | av (Hn) | 0 pad],
     //   ck = 1/(R*rms(shifted raw K)), ak / av the token-shift weights (0 at position 0), KR / VR multiples of Hn
-    //   (ggml_dragon_tpa_row_k / ggml_dragon_tpa_row_v); see ggml_dragon_tpa_attn for how the rows are read back
-    GGML_API struct ggml_tensor * ggml_dragon_tpa_prep_factored(
+    //   (ggml_olala_tpa_row_k / ggml_olala_tpa_row_v); see ggml_olala_tpa_attn for how the rows are read back
+    GGML_API struct ggml_tensor * ggml_olala_tpa_prep_factored(
             struct ggml_context * ctx,
             struct ggml_tensor  * pr,
             struct ggml_tensor  * prev,
@@ -2868,18 +2868,18 @@ extern "C" {
             int H, int Hn, int R, int Dh, int Hs, int n_seqs,
             float eps, float wsize, float gate_b);
 
-    GGML_API int64_t ggml_dragon_tpa_row_k(int Hn, int R, int Dh);
-    GGML_API int64_t ggml_dragon_tpa_row_v(int Hn, int R, int Dh);
+    GGML_API int64_t ggml_olala_tpa_row_k(int Hn, int R, int Dh);
+    GGML_API int64_t ggml_olala_tpa_row_v(int Hn, int R, int Dh);
 
-    //   attention over a factored Dragon TPA cache (semantic reference: ggml_compute_forward_dragon_tpa_attn_f32):
-    //   q (Dh, H, T, n_stream) f32 (q~ of ggml_dragon_tpa_prep_factored), k (KR, n_kv, n_stream) / v (VR, n_kv, n_stream)
+    //   attention over a factored Olala TPA cache (semantic reference: ggml_compute_forward_olala_tpa_attn_f32):
+    //   q (Dh, H, T, n_stream) f32 (q~ of ggml_olala_tpa_prep_factored), k (KR, n_kv, n_stream) / v (VR, n_kv, n_stream)
     //   rows of the cache, mask (n_kv, T_pad >= T, 1, n_stream) f16/f32, prev (n_kv, n_stream) i32 = cell of the previous
     //   token of the same sequence (-1: none). For kv head g = h/(H/Hn), cell c, p = prev[c]:
     //     K[c] = ck[c,g]*((1-ak[c,g])*sum_r A_k[c,g,r]*B_k[c,r] + ak[c,g]*sum_r A_k[p,g,r]*B_k[p,r])   (k_norm is in q~)
     //     V[c] = ((1-av[c,g])*sum_r A_v[c,g,r]*B_v[c,r] + av[c,g]*sum_r A_v[p,g,r]*B_v[p,r])/R
     //     out[h,t] = softmax_c(softcap*tanh(scale*q[h,t].K[c]/softcap) + mask[c,t]) . V      (softcap 0: no tanh)
     //   -> (Dh, H, T, n_stream) f32
-    GGML_API struct ggml_tensor * ggml_dragon_tpa_attn(
+    GGML_API struct ggml_tensor * ggml_olala_tpa_attn(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
             struct ggml_tensor  * k,
@@ -2889,10 +2889,10 @@ extern "C" {
             int Hn, int R,
             float scale, float softcap);
 
-    //   expanded K (is_v = false) or V of a factored Dragon TPA cache, for the attention of long batches:
+    //   expanded K (is_v = false) or V of a factored Olala TPA cache, for the attention of long batches:
     //   rows (KR or VR, n_kv, n_stream), prev (n_kv, n_stream) -> (Dh, Hn, n_kv, n_stream) f16, K[c] / V[c] as in
-    //   ggml_dragon_tpa_attn (K without the k_norm weight, which is in q~)
-    GGML_API struct ggml_tensor * ggml_dragon_tpa_expand(
+    //   ggml_olala_tpa_attn (K without the k_norm weight, which is in q~)
+    GGML_API struct ggml_tensor * ggml_olala_tpa_expand(
             struct ggml_context * ctx,
             struct ggml_tensor  * rows,
             struct ggml_tensor  * prev,
@@ -2901,7 +2901,7 @@ extern "C" {
 
     //   differential combine + gate: attn (Dh, H, T), lam (Hn, T), gs (Hs*Dh, T) -> (Hs*Dh, T)
     //   out[(hn*snr+i)*Dh+d] = (attn[(hn*(snr+1)+i)*Dh+d] - lam[hn]*attn[(hn*(snr+1)+snr)*Dh+d]) * gs[(hn*snr+i)*Dh+d]
-    GGML_API struct ggml_tensor * ggml_dragon_diff_gate(
+    GGML_API struct ggml_tensor * ggml_olala_diff_gate(
             struct ggml_context * ctx,
             struct ggml_tensor  * attn,
             struct ggml_tensor  * lam,

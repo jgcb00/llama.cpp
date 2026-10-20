@@ -1,6 +1,6 @@
 #include "common.h"
 
-// Dragon (Olala) fused ops: GGML_OP_MAMBA3_MIMO (Mamba3-MIMO mixer core, raw
+// Olala fused ops: GGML_OP_MAMBA3_MIMO (Mamba3-MIMO mixer core, raw
 // projections in) and GGML_OP_GEODESIC (geodesic residual).
 //
 // semantic reference: ggml_compute_forward_mamba3_mimo_f32 / _geodesic_f32 in
@@ -15,9 +15,9 @@
 // the columns d = l, l + 32, ..., so the state update and the q.S contraction
 // are per thread (one simd_sum per (row, rank)) and need no extra barriers.
 //
-// The per-head state (D_v*D_qk floats, 32 KB for Dragon) does not fit next to
+// The per-head state (D_v*D_qk floats, 32 KB for Olala) does not fit next to
 // the staging buffers in the 32 KB of threadgroup memory, so:
-//   - fast path (template dims, Dragon: D_qk = 128, D_v = 64, R = 4): the state
+//   - fast path (template dims, Olala: D_qk = 128, D_v = 64, R = 4): the state
 //     lives in registers (D_v/8 x D_qk/32 = 32 floats per thread)
 //   - generic path (DQK == 0, runtime dims): the state lives in device memory
 //     (output state slot / chunk workspace), each element owned by one thread
@@ -668,8 +668,8 @@ kernel void kernel_geodesic_f32(
 
 
 // ---------------------------------------------------------------------------------------------
-// GGML_OP_DRAGON_MOE: the Dragon latent MoE block in 4 dispatches (semantic reference:
-// ggml_compute_forward_dragon_moe_f32 in ggml-cpu/ops.cpp). Activations f32, weights T4 =
+// GGML_OP_OLALA_MOE: the Olala latent MoE block in 4 dispatches (semantic reference:
+// ggml_compute_forward_olala_moe_f32 in ggml-cpu/ops.cpp). Activations f32, weights T4 =
 // float4 / half4 / bfloat4, 256 threads (8 simdgroups) per threadgroup, lanes over 4-wide
 // columns (rows must be 16-byte aligned: n % 8 == 0 for f16/bf16). Every dot product first
 // issues all of its row loads (up to DMOE_MAXCH float4 per lane, unrolled) so that the memory
@@ -689,13 +689,13 @@ kernel void kernel_geodesic_f32(
 
 // row lengths in 4-wide chunks per lane (n/128) of the input / latent / expert FF / shared FF, fixed when the
 // pipeline is built: the per-lane row arrays then take only the registers they need
-constant int FC_dmoe_nch_e [[function_constant(FC_DRAGON_MOE + 0)]];
-constant int FC_dmoe_nch_l [[function_constant(FC_DRAGON_MOE + 1)]];
-constant int FC_dmoe_nch_f [[function_constant(FC_DRAGON_MOE + 2)]];
-constant int FC_dmoe_nch_s [[function_constant(FC_DRAGON_MOE + 3)]];
-constant int FC_dmoe_nf    [[function_constant(FC_DRAGON_MOE + 4)]]; // kernel m: float4 per W_down row slice
+constant int FC_dmoe_nch_e [[function_constant(FC_OLALA_MOE + 0)]];
+constant int FC_dmoe_nch_l [[function_constant(FC_OLALA_MOE + 1)]];
+constant int FC_dmoe_nch_f [[function_constant(FC_OLALA_MOE + 2)]];
+constant int FC_dmoe_nch_s [[function_constant(FC_OLALA_MOE + 3)]];
+constant int FC_dmoe_nf    [[function_constant(FC_OLALA_MOE + 4)]]; // kernel m: float4 per W_down row slice
 
-// weight access of the Dragon kernels, by weight type T4: float4 / half4 / bfloat4 (4 elements of the row type), or
+// weight access of the Olala kernels, by weight type T4: float4 / half4 / bfloat4 (4 elements of the row type), or
 // dmoe_q8 for Q8_0 rows (blocks of 32: f16 scale + 32 int8). dmoe_rb: bytes of n elements (n a multiple of 32 for
 // Q8_0: whole rows and block-aligned slices), dmoe_ld: elements e .. e+3 of a row (e a multiple of 4)
 struct dmoe_q8 { char4 v; };
@@ -963,7 +963,7 @@ static inline void dmoe_geodesic_row_tg(
 // takes the second half of the row (K split, the halves summed through threadgroup memory)
 template<typename T4, typename WSP, int KS = 1>
 static inline void dmoe_stage_a(
-        constant ggml_metal_kargs_dragon_moe & args,
+        constant ggml_metal_kargs_olala_moe & args,
         device const float * x,
         device const char  * w_ld,
         device const float * w_r,
@@ -1090,8 +1090,8 @@ static inline void dmoe_stage_a(
 }
 
 template<typename T4>
-kernel void kernel_dragon_moe_a(
-        constant ggml_metal_kargs_dragon_moe & args,
+kernel void kernel_olala_moe_a(
+        constant ggml_metal_kargs_olala_moe & args,
         device const float * x,
         device const char  * w_ld,
         device const float * w_r,
@@ -1191,7 +1191,7 @@ static inline void dmoe_route(
 // stage b1 of (token t, expert slot kk = p/nsplit, FF slice p%nsplit)
 template<typename T4, typename WSP>
 static inline void dmoe_stage_b1(
-        constant ggml_metal_kargs_dragon_moe & args,
+        constant ggml_metal_kargs_olala_moe & args,
         WSP                  ws,
         device const float * bias,
         device const char  * w_up,
@@ -1262,8 +1262,8 @@ static inline void dmoe_stage_b1(
 }
 
 template<typename T4>
-kernel void kernel_dragon_moe_b1(
-        constant ggml_metal_kargs_dragon_moe & args,
+kernel void kernel_olala_moe_b1(
+        constant ggml_metal_kargs_olala_moe & args,
         device const float * ws_in,
         device const float * bias,
         device const char  * w_up,
@@ -1291,7 +1291,7 @@ kernel void kernel_dragon_moe_b1(
 // stage b2 of (token t, expert slot kk = p/nsplit, n_lat row slice p%nsplit)
 template<typename T4, typename WSP>
 static inline void dmoe_stage_b2(
-        constant ggml_metal_kargs_dragon_moe & args,
+        constant ggml_metal_kargs_olala_moe & args,
         WSP                  ws,
         device const char  * w_down,
         threadgroup  float * shm,
@@ -1345,7 +1345,7 @@ static inline void dmoe_stage_b2(
 // shared-expert down of (output row block tgx, token pair tgy) -> ws[off_dsh] (sh_split)
 template<typename T4, typename WSP>
 static inline void dmoe_stage_ds(
-        constant ggml_metal_kargs_dragon_moe & args,
+        constant ggml_metal_kargs_olala_moe & args,
         WSP                  ws,
         device const char  * w_ds,
         threadgroup  float * shm,
@@ -1386,8 +1386,8 @@ static inline void dmoe_stage_ds(
 }
 
 template<typename T4>
-kernel void kernel_dragon_moe_b2(
-        constant ggml_metal_kargs_dragon_moe & args,
+kernel void kernel_olala_moe_b2(
+        constant ggml_metal_kargs_olala_moe & args,
         device const float * ws_in,
         device const char  * w_down,
         device       float * ws_out,
@@ -1497,7 +1497,7 @@ static inline int dmoe_route_sg(
 // The extra threadgroups do the same for the shared expert (sh_rows FF rows each, all the tokens) into dsh.
 template<typename T4, typename WSP = device float *>
 static inline void dmoe_stage_m_routed(
-        constant ggml_metal_kargs_dragon_moe & args,
+        constant ggml_metal_kargs_olala_moe & args,
         WSP                  ws,
         device const float * bias,
         device const char  * w_up,
@@ -1597,7 +1597,7 @@ static inline void dmoe_stage_m_routed(
 
 template<typename T4>
 static inline void dmoe_stage_m_shared(
-        constant ggml_metal_kargs_dragon_moe & args,
+        constant ggml_metal_kargs_olala_moe & args,
         device       float * ws,
         device const float * x,
         device const char  * w_us,
@@ -1655,8 +1655,8 @@ static inline void dmoe_stage_m_shared(
 }
 
 template<typename T4>
-kernel void kernel_dragon_moe_m(
-        constant ggml_metal_kargs_dragon_moe & args,
+kernel void kernel_olala_moe_m(
+        constant ggml_metal_kargs_olala_moe & args,
         device       float * ws,
         device const float * bias,
         device const char  * w_up,
@@ -1682,7 +1682,7 @@ kernel void kernel_dragon_moe_m(
 // stage c of (output row block tgx, token pair tgy)
 template<typename T4, typename WSP, typename DP>
 static inline void dmoe_stage_c(
-        constant ggml_metal_kargs_dragon_moe & args,
+        constant ggml_metal_kargs_olala_moe & args,
         WSP                  ws,
         device const char  * w_lu,
         device const char  * w_ds,
@@ -1773,8 +1773,8 @@ static inline void dmoe_stage_c(
 }
 
 template<typename T4>
-kernel void kernel_dragon_moe_c(
-        constant ggml_metal_kargs_dragon_moe & args,
+kernel void kernel_olala_moe_c(
+        constant ggml_metal_kargs_olala_moe & args,
         device       float * ws,
         device const char  * w_lu,
         device const char  * w_ds,
@@ -1824,7 +1824,7 @@ kernel void kernel_dragon_moe_c(
 }
 
 // ---------------------------------------------------------------------------------------------
-// fused Dragon MoE (decode, one token): the whole block in one persistent dispatch of P threadgroups (all resident).
+// fused Olala MoE (decode, one token): the whole block in one persistent dispatch of P threadgroups (all resident).
 // Global barriers: arrival counter + separate release flag (the last arrival releases; the waiters poll the flag, not
 // the counter). State in a zero-initialized device scratch (sync), reset by the last threadgroup to exit.
 //   phase 0: W_lu rows of the threadgroup loaded (held in registers until phase 2); y = GEODESIC(x, pg) (or x) in
@@ -1884,8 +1884,8 @@ static inline void dmoe_f_wait(device uint * sync, int r, ushort tiitg, bool all
 }
 
 template<typename T4>
-kernel void kernel_dragon_moe_f(
-        constant ggml_metal_kargs_dragon_moe & args,
+kernel void kernel_olala_moe_f(
+        constant ggml_metal_kargs_olala_moe & args,
         device const float * x,
         device const char  * w_ld,
         device const float * w_r,
@@ -2104,50 +2104,50 @@ kernel void kernel_dragon_moe_f(
     }
 }
 
-typedef decltype(kernel_dragon_moe_a<float4>)  kernel_dragon_moe_a_t;
-typedef decltype(kernel_dragon_moe_b1<float4>) kernel_dragon_moe_b1_t;
-typedef decltype(kernel_dragon_moe_b2<float4>) kernel_dragon_moe_b2_t;
-typedef decltype(kernel_dragon_moe_c<float4>)  kernel_dragon_moe_c_t;
-typedef decltype(kernel_dragon_moe_m<float4>)  kernel_dragon_moe_m_t;
-typedef decltype(kernel_dragon_moe_f<float4>)  kernel_dragon_moe_f_t;
+typedef decltype(kernel_olala_moe_a<float4>)  kernel_olala_moe_a_t;
+typedef decltype(kernel_olala_moe_b1<float4>) kernel_olala_moe_b1_t;
+typedef decltype(kernel_olala_moe_b2<float4>) kernel_olala_moe_b2_t;
+typedef decltype(kernel_olala_moe_c<float4>)  kernel_olala_moe_c_t;
+typedef decltype(kernel_olala_moe_m<float4>)  kernel_olala_moe_m_t;
+typedef decltype(kernel_olala_moe_f<float4>)  kernel_olala_moe_f_t;
 
-template [[host_name("kernel_dragon_moe_a_f32")]]   kernel kernel_dragon_moe_a_t  kernel_dragon_moe_a<float4>;
-template [[host_name("kernel_dragon_moe_b1_f32")]]  kernel kernel_dragon_moe_b1_t kernel_dragon_moe_b1<float4>;
-template [[host_name("kernel_dragon_moe_b2_f32")]]  kernel kernel_dragon_moe_b2_t kernel_dragon_moe_b2<float4>;
-template [[host_name("kernel_dragon_moe_c_f32")]]   kernel kernel_dragon_moe_c_t  kernel_dragon_moe_c<float4>;
-template [[host_name("kernel_dragon_moe_m_f32")]]   kernel kernel_dragon_moe_m_t  kernel_dragon_moe_m<float4>;
-template [[host_name("kernel_dragon_moe_f_f32")]]   kernel kernel_dragon_moe_f_t  kernel_dragon_moe_f<float4>;
-template [[host_name("kernel_dragon_moe_a_f16")]]   kernel kernel_dragon_moe_a_t  kernel_dragon_moe_a<half4>;
-template [[host_name("kernel_dragon_moe_b1_f16")]]  kernel kernel_dragon_moe_b1_t kernel_dragon_moe_b1<half4>;
-template [[host_name("kernel_dragon_moe_b2_f16")]]  kernel kernel_dragon_moe_b2_t kernel_dragon_moe_b2<half4>;
-template [[host_name("kernel_dragon_moe_c_f16")]]   kernel kernel_dragon_moe_c_t  kernel_dragon_moe_c<half4>;
-template [[host_name("kernel_dragon_moe_m_f16")]]   kernel kernel_dragon_moe_m_t  kernel_dragon_moe_m<half4>;
-template [[host_name("kernel_dragon_moe_f_f16")]]   kernel kernel_dragon_moe_f_t  kernel_dragon_moe_f<half4>;
+template [[host_name("kernel_olala_moe_a_f32")]]   kernel kernel_olala_moe_a_t  kernel_olala_moe_a<float4>;
+template [[host_name("kernel_olala_moe_b1_f32")]]  kernel kernel_olala_moe_b1_t kernel_olala_moe_b1<float4>;
+template [[host_name("kernel_olala_moe_b2_f32")]]  kernel kernel_olala_moe_b2_t kernel_olala_moe_b2<float4>;
+template [[host_name("kernel_olala_moe_c_f32")]]   kernel kernel_olala_moe_c_t  kernel_olala_moe_c<float4>;
+template [[host_name("kernel_olala_moe_m_f32")]]   kernel kernel_olala_moe_m_t  kernel_olala_moe_m<float4>;
+template [[host_name("kernel_olala_moe_f_f32")]]   kernel kernel_olala_moe_f_t  kernel_olala_moe_f<float4>;
+template [[host_name("kernel_olala_moe_a_f16")]]   kernel kernel_olala_moe_a_t  kernel_olala_moe_a<half4>;
+template [[host_name("kernel_olala_moe_b1_f16")]]  kernel kernel_olala_moe_b1_t kernel_olala_moe_b1<half4>;
+template [[host_name("kernel_olala_moe_b2_f16")]]  kernel kernel_olala_moe_b2_t kernel_olala_moe_b2<half4>;
+template [[host_name("kernel_olala_moe_c_f16")]]   kernel kernel_olala_moe_c_t  kernel_olala_moe_c<half4>;
+template [[host_name("kernel_olala_moe_m_f16")]]   kernel kernel_olala_moe_m_t  kernel_olala_moe_m<half4>;
+template [[host_name("kernel_olala_moe_f_f16")]]   kernel kernel_olala_moe_f_t  kernel_olala_moe_f<half4>;
 #if defined(GGML_METAL_HAS_BF16)
-template [[host_name("kernel_dragon_moe_a_bf16")]]  kernel kernel_dragon_moe_a_t  kernel_dragon_moe_a<bfloat4>;
-template [[host_name("kernel_dragon_moe_b1_bf16")]] kernel kernel_dragon_moe_b1_t kernel_dragon_moe_b1<bfloat4>;
-template [[host_name("kernel_dragon_moe_b2_bf16")]] kernel kernel_dragon_moe_b2_t kernel_dragon_moe_b2<bfloat4>;
-template [[host_name("kernel_dragon_moe_c_bf16")]]  kernel kernel_dragon_moe_c_t  kernel_dragon_moe_c<bfloat4>;
-template [[host_name("kernel_dragon_moe_m_bf16")]]   kernel kernel_dragon_moe_m_t  kernel_dragon_moe_m<bfloat4>;
-template [[host_name("kernel_dragon_moe_f_bf16")]]   kernel kernel_dragon_moe_f_t  kernel_dragon_moe_f<bfloat4>;
+template [[host_name("kernel_olala_moe_a_bf16")]]  kernel kernel_olala_moe_a_t  kernel_olala_moe_a<bfloat4>;
+template [[host_name("kernel_olala_moe_b1_bf16")]] kernel kernel_olala_moe_b1_t kernel_olala_moe_b1<bfloat4>;
+template [[host_name("kernel_olala_moe_b2_bf16")]] kernel kernel_olala_moe_b2_t kernel_olala_moe_b2<bfloat4>;
+template [[host_name("kernel_olala_moe_c_bf16")]]  kernel kernel_olala_moe_c_t  kernel_olala_moe_c<bfloat4>;
+template [[host_name("kernel_olala_moe_m_bf16")]]   kernel kernel_olala_moe_m_t  kernel_olala_moe_m<bfloat4>;
+template [[host_name("kernel_olala_moe_f_bf16")]]   kernel kernel_olala_moe_f_t  kernel_olala_moe_f<bfloat4>;
 #endif
-template [[host_name("kernel_dragon_moe_a_q8_0")]]  kernel kernel_dragon_moe_a_t  kernel_dragon_moe_a<dmoe_q8>;
-template [[host_name("kernel_dragon_moe_b1_q8_0")]] kernel kernel_dragon_moe_b1_t kernel_dragon_moe_b1<dmoe_q8>;
-template [[host_name("kernel_dragon_moe_b2_q8_0")]] kernel kernel_dragon_moe_b2_t kernel_dragon_moe_b2<dmoe_q8>;
-template [[host_name("kernel_dragon_moe_c_q8_0")]]  kernel kernel_dragon_moe_c_t  kernel_dragon_moe_c<dmoe_q8>;
-template [[host_name("kernel_dragon_moe_m_q8_0")]]   kernel kernel_dragon_moe_m_t  kernel_dragon_moe_m<dmoe_q8>;
-template [[host_name("kernel_dragon_moe_f_q8_0")]]   kernel kernel_dragon_moe_f_t  kernel_dragon_moe_f<dmoe_q8>;
+template [[host_name("kernel_olala_moe_a_q8_0")]]  kernel kernel_olala_moe_a_t  kernel_olala_moe_a<dmoe_q8>;
+template [[host_name("kernel_olala_moe_b1_q8_0")]] kernel kernel_olala_moe_b1_t kernel_olala_moe_b1<dmoe_q8>;
+template [[host_name("kernel_olala_moe_b2_q8_0")]] kernel kernel_olala_moe_b2_t kernel_olala_moe_b2<dmoe_q8>;
+template [[host_name("kernel_olala_moe_c_q8_0")]]  kernel kernel_olala_moe_c_t  kernel_olala_moe_c<dmoe_q8>;
+template [[host_name("kernel_olala_moe_m_q8_0")]]   kernel kernel_olala_moe_m_t  kernel_olala_moe_m<dmoe_q8>;
+template [[host_name("kernel_olala_moe_f_q8_0")]]   kernel kernel_olala_moe_f_t  kernel_olala_moe_f<dmoe_q8>;
 
 
 // ---------------------------------------------------------------------------------------------
-// Dragon V-layer helpers (semantic reference: ggml_compute_forward_dragon_{mmv,tpa_prep,diff_gate} in ggml-cpu/ops.cpp)
+// Olala V-layer helpers (semantic reference: ggml_compute_forward_olala_{mmv,tpa_prep,diff_gate} in ggml-cpu/ops.cpp)
 
 // y = concat_i(W_i^T x): NR rows per simdgroup, the row streamed in groups of U 4-wide chunks per lane (all the loads
 // of a group issued before its dots, few registers -> high occupancy), x read from the cache (no staging, no barrier);
 // args.nsg simdgroups per threadgroup
 template<typename T4, int NR, int U>
-kernel void kernel_dragon_mmv(
-        constant ggml_metal_kargs_dragon_mmv & args,
+kernel void kernel_olala_mmv(
+        constant ggml_metal_kargs_olala_mmv & args,
         device const float * x,
         device const char  * w0,
         device const char  * w1,
@@ -2221,19 +2221,19 @@ kernel void kernel_dragon_mmv(
 }
 
 // one row per simdgroup, chunks loaded 2 at a time (measured best on M3 Ultra for 1-4 tokens)
-typedef decltype(kernel_dragon_mmv<float4, 1, 2>) kernel_dragon_mmv_t;
-template [[host_name("kernel_dragon_mmv_f32")]]  kernel kernel_dragon_mmv_t kernel_dragon_mmv<float4,  1, 2>;
-template [[host_name("kernel_dragon_mmv_f16")]]  kernel kernel_dragon_mmv_t kernel_dragon_mmv<half4,   1, 2>;
+typedef decltype(kernel_olala_mmv<float4, 1, 2>) kernel_olala_mmv_t;
+template [[host_name("kernel_olala_mmv_f32")]]  kernel kernel_olala_mmv_t kernel_olala_mmv<float4,  1, 2>;
+template [[host_name("kernel_olala_mmv_f16")]]  kernel kernel_olala_mmv_t kernel_olala_mmv<half4,   1, 2>;
 #if defined(GGML_METAL_HAS_BF16)
-template [[host_name("kernel_dragon_mmv_bf16")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<bfloat4, 1, 2>;
+template [[host_name("kernel_olala_mmv_bf16")]] kernel kernel_olala_mmv_t kernel_olala_mmv<bfloat4, 1, 2>;
 #endif
-template [[host_name("kernel_dragon_mmv_q8_0")]] kernel kernel_dragon_mmv_t kernel_dragon_mmv<dmoe_q8, 1, 2>;
+template [[host_name("kernel_olala_mmv_q8_0")]] kernel kernel_olala_mmv_t kernel_olala_mmv<dmoe_q8, 1, 2>;
 
 
-// staged variant for larger batches (T > 4): y = concat_i(W_i^T x): one output row per simdgroup, x staged for tb tokens (same scheme as kernel_dragon_moe_a)
+// staged variant for larger batches (T > 4): y = concat_i(W_i^T x): one output row per simdgroup, x staged for tb tokens (same scheme as kernel_olala_moe_a)
 template<typename T4>
-kernel void kernel_dragon_mmv_st(
-        constant ggml_metal_kargs_dragon_mmv & args,
+kernel void kernel_olala_mmv_st(
+        constant ggml_metal_kargs_olala_mmv & args,
         device const float * x,
         device const char  * w0,
         device const char  * w1,
@@ -2296,18 +2296,18 @@ kernel void kernel_dragon_mmv_st(
     }
 }
 
-typedef decltype(kernel_dragon_mmv_st<float4>) kernel_dragon_mmv_st_t;
-template [[host_name("kernel_dragon_mmv_st_f32")]]  kernel kernel_dragon_mmv_st_t kernel_dragon_mmv_st<float4>;
-template [[host_name("kernel_dragon_mmv_st_f16")]]  kernel kernel_dragon_mmv_st_t kernel_dragon_mmv_st<half4>;
+typedef decltype(kernel_olala_mmv_st<float4>) kernel_olala_mmv_st_t;
+template [[host_name("kernel_olala_mmv_st_f32")]]  kernel kernel_olala_mmv_st_t kernel_olala_mmv_st<float4>;
+template [[host_name("kernel_olala_mmv_st_f16")]]  kernel kernel_olala_mmv_st_t kernel_olala_mmv_st<half4>;
 #if defined(GGML_METAL_HAS_BF16)
-template [[host_name("kernel_dragon_mmv_st_bf16")]] kernel kernel_dragon_mmv_st_t kernel_dragon_mmv_st<bfloat4>;
+template [[host_name("kernel_olala_mmv_st_bf16")]] kernel kernel_olala_mmv_st_t kernel_olala_mmv_st<bfloat4>;
 #endif
-template [[host_name("kernel_dragon_mmv_st_q8_0")]] kernel kernel_dragon_mmv_st_t kernel_dragon_mmv_st<dmoe_q8>;
+template [[host_name("kernel_olala_mmv_st_q8_0")]] kernel kernel_olala_mmv_st_t kernel_olala_mmv_st<dmoe_q8>;
 
 // one threadgroup per (q head h, token t); the kv head hn = h / (H/Hn) is prepared by the G threadgroups
 // sharing it (only the first writes it). threadgroup memory: [ kk (Dh) | vv (Dh) | red (8) ]
-kernel void kernel_dragon_tpa_prep_f32(
-        constant ggml_metal_kargs_dragon_tpa_prep & args,
+kernel void kernel_olala_tpa_prep_f32(
+        constant ggml_metal_kargs_olala_tpa_prep & args,
         device const float   * pr,
         device const float   * prev,
         device const int32_t * pos,
@@ -2497,8 +2497,8 @@ kernel void kernel_dragon_tpa_prep_f32(
     }
 }
 
-kernel void kernel_dragon_diff_gate_f32(
-        constant ggml_metal_kargs_dragon_diff_gate & args,
+kernel void kernel_olala_diff_gate_f32(
+        constant ggml_metal_kargs_olala_diff_gate & args,
         device const float * attn,
         device const float * lam,
         device const float * gs,
@@ -2523,21 +2523,21 @@ kernel void kernel_dragon_diff_gate_f32(
 }
 
 // ---------------------------------------------------------------------------------------------
-// attention over the factored TPA cache (semantic reference: ggml_compute_forward_dragon_tpa_attn in ggml-cpu/ops.cpp)
+// attention over the factored TPA cache (semantic reference: ggml_compute_forward_olala_tpa_attn in ggml-cpu/ops.cpp)
 // one threadgroup per (chunk of cells, token, stream), one simdgroup per kv head g (its G = H/Hn q heads are the rows
 // of 8x8 tiles). The cells are processed in blocks of 8: the block K (then V) of every kv head is expanded from the
 // factors into threadgroup memory as half, then S = Q K^T and O = diag(f) O + W V with simdgroup matrices
 // NE: Dh/32; kv heads and rank are function constants
-constant int FC_tpa_hn [[function_constant(FC_DRAGON_TPA + 0)]];
-constant int FC_tpa_r  [[function_constant(FC_DRAGON_TPA + 1)]];
+constant int FC_tpa_hn [[function_constant(FC_OLALA_TPA + 0)]];
+constant int FC_tpa_r  [[function_constant(FC_OLALA_TPA + 1)]];
 
 #define DTPA_NC   8   // cells per block: the columns of the S tile
 
 #define DTPA_MAXR 8   // TPA rank
 
 template<typename KT, typename KT4, int NE>
-kernel void kernel_dragon_tpa_attn(
-        constant ggml_metal_kargs_dragon_tpa_attn & args,
+kernel void kernel_olala_tpa_attn(
+        constant ggml_metal_kargs_olala_tpa_attn & args,
         device const char * q,
         device const char * kc,
         device const char * vc,
@@ -2769,17 +2769,17 @@ kernel void kernel_dragon_tpa_attn(
     }
 }
 
-typedef decltype(kernel_dragon_tpa_attn<half, half4, 4>) kernel_dragon_tpa_attn_t;
-template [[host_name("kernel_dragon_tpa_attn_f16_ne2")]] kernel kernel_dragon_tpa_attn_t kernel_dragon_tpa_attn<half,  half4,  2>;
-template [[host_name("kernel_dragon_tpa_attn_f16_ne4")]] kernel kernel_dragon_tpa_attn_t kernel_dragon_tpa_attn<half,  half4,  4>;
-template [[host_name("kernel_dragon_tpa_attn_f32_ne2")]] kernel kernel_dragon_tpa_attn_t kernel_dragon_tpa_attn<float, float4, 2>;
-template [[host_name("kernel_dragon_tpa_attn_f32_ne4")]] kernel kernel_dragon_tpa_attn_t kernel_dragon_tpa_attn<float, float4, 4>;
+typedef decltype(kernel_olala_tpa_attn<half, half4, 4>) kernel_olala_tpa_attn_t;
+template [[host_name("kernel_olala_tpa_attn_f16_ne2")]] kernel kernel_olala_tpa_attn_t kernel_olala_tpa_attn<half,  half4,  2>;
+template [[host_name("kernel_olala_tpa_attn_f16_ne4")]] kernel kernel_olala_tpa_attn_t kernel_olala_tpa_attn<half,  half4,  4>;
+template [[host_name("kernel_olala_tpa_attn_f32_ne2")]] kernel kernel_olala_tpa_attn_t kernel_olala_tpa_attn<float, float4, 2>;
+template [[host_name("kernel_olala_tpa_attn_f32_ne4")]] kernel kernel_olala_tpa_attn_t kernel_olala_tpa_attn<float, float4, 4>;
 
-// expanded K or V of a factored TPA cache (semantic reference: ggml_compute_forward_dragon_tpa_expand): one
+// expanded K or V of a factored TPA cache (semantic reference: ggml_compute_forward_olala_tpa_expand): one
 // threadgroup per (cell, stream), thread item (kv head, 4 elements)
 template<typename KT, typename KT4>
-kernel void kernel_dragon_tpa_expand(
-        constant ggml_metal_kargs_dragon_tpa_attn & args,
+kernel void kernel_olala_tpa_expand(
+        constant ggml_metal_kargs_olala_tpa_attn & args,
         device const char * rows,
         device const char * prev,
         device       half * dst,
@@ -2824,14 +2824,14 @@ kernel void kernel_dragon_tpa_expand(
     ((device half4 *) (dst + (((size_t) s*args.n_kv + c)*Hn + g)*Dh))[d4] = (half4) (w1*x + w2*xp);
 }
 
-typedef decltype(kernel_dragon_tpa_expand<half, half4>) kernel_dragon_tpa_expand_t;
-template [[host_name("kernel_dragon_tpa_expand_f16")]] kernel kernel_dragon_tpa_expand_t kernel_dragon_tpa_expand<half,  half4>;
-template [[host_name("kernel_dragon_tpa_expand_f32")]] kernel kernel_dragon_tpa_expand_t kernel_dragon_tpa_expand<float, float4>;
+typedef decltype(kernel_olala_tpa_expand<half, half4>) kernel_olala_tpa_expand_t;
+template [[host_name("kernel_olala_tpa_expand_f16")]] kernel kernel_olala_tpa_expand_t kernel_olala_tpa_expand<half,  half4>;
+template [[host_name("kernel_olala_tpa_expand_f32")]] kernel kernel_olala_tpa_expand_t kernel_olala_tpa_expand<float, float4>;
 
-// combine the chunks of kernel_dragon_tpa_attn: one threadgroup per (head, token, stream), one thread per element
+// combine the chunks of kernel_olala_tpa_attn: one threadgroup per (head, token, stream), one thread per element
 // (the chunk weights exp(m - max) and the sum are computed once, in threadgroup memory)
-kernel void kernel_dragon_tpa_attn_reduce(
-        constant ggml_metal_kargs_dragon_tpa_attn & args,
+kernel void kernel_olala_tpa_attn_reduce(
+        constant ggml_metal_kargs_olala_tpa_attn & args,
         device const float * tmp,
         device       float * dst,
         threadgroup  float * shm [[threadgroup(0)]],
