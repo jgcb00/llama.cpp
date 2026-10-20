@@ -2544,8 +2544,9 @@ static int ggml_metal_op_dragon_moe_impl(ggml_metal_op_t ctx, int idx, ggml_tens
     // threadgroups of b1, its down projection in extra threadgroups of b2)
     const bool sh = args.sh_split != 0;
 
-    // kernel a: rows split across 2 simdgroups
-    if ((d.n_embd/128) % 2 == 0) {
+    // kernel a: rows split across 2 simdgroups (each half whole blocks of the W_ld / W_us types)
+    if ((d.n_embd/128) % 2 == 0 && (d.n_embd/2) % ggml_blck_size(op->src[1]->type) == 0 &&
+        (d.n_embd/2) % ggml_blck_size(op->src[7]->type) == 0) {
         args.a_ks = 2;
     }
     const int64_t a_rpt = 8/args.a_ks; // rows per threadgroup of kernel a

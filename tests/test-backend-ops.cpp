@@ -5046,11 +5046,13 @@ struct test_dragon_moe : public test_case {
     const float   w_scale;
     const int     geo; // bits: 1: followed by GGML_OP_GEODESIC(x2, moe), 2: input = GGML_OP_GEODESIC(x0, g),
                        // 4: followed by GGML_OP_GEODESIC(input, moe) as in the model (the Metal backend fuses them for small batches)
-    const bool    safe2; // q8_0-safe2 layout: Q6_K W_down, BF16 W_lu and W_ds, type_w for the others
+    const int     mix; // weight types as in quantized files: 1: q8_0-safe2 (Q6_K W_down, BF16 W_lu / W_ds, type_w for the
+                       // others), 2: q5_k_m with the safe overrides (Q5_K W_ld / W_down / W_us / W_ds, Q8_0 W_up, BF16 W_lu),
+                       // 3: as 2 with Q6_K W_down / W_ds (the q5_k_m layers that keep 6 bits)
 
     std::string vars() override {
         return VARS_TO_STR9(type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale) + (geo ? ",geo=" + std::to_string(geo) : "") +
-               (safe2 ? ",safe2=1" : "");
+               (mix ? ",mix=" + std::to_string(mix) : "");
     }
 
     double max_nmse_err() override {
@@ -5058,9 +5060,9 @@ struct test_dragon_moe : public test_case {
     }
 
     test_dragon_moe(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 1536, int64_t n_tok = 1, int64_t n_lat = 384,
-            int64_t n_expert = 256, int64_t n_ff = 768, int64_t n_ff_sh = 1536, int k = 6, float w_scale = 2.45f, int geo = 0, bool safe2 = false)
+            int64_t n_expert = 256, int64_t n_ff = 768, int64_t n_ff_sh = 1536, int k = 6, float w_scale = 2.45f, int geo = 0, int mix = 0)
         : type_w(type_w), n_embd(n_embd), n_tok(n_tok), n_lat(n_lat), n_expert(n_expert), n_ff(n_ff), n_ff_sh(n_ff_sh), k(k), w_scale(w_scale), geo(geo),
-          safe2(safe2) {}
+          mix(mix) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tok);
@@ -5070,16 +5072,19 @@ struct test_dragon_moe : public test_case {
             ggml_tensor * gbias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
             x = ggml_geodesic(ctx, x, g, scale, gbias, 0.25f);
         }
-        ggml_tensor * w_ld   = ggml_new_tensor_2d(ctx, type_w,        n_embd, n_lat);
+        const ggml_type type_q5 = mix >= 2 ? GGML_TYPE_Q5_K : type_w;
+        ggml_tensor * w_ld   = ggml_new_tensor_2d(ctx, type_q5,       n_embd, n_lat);
         ggml_tensor * w_r    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_expert);
         ggml_tensor * bias   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
-        ggml_tensor * w_up   = ggml_new_tensor_3d(ctx, type_w,        n_lat, n_ff, n_expert);
-        const ggml_type type_dn = safe2 ? GGML_TYPE_Q6_K : type_w;
-        const ggml_type type_bf = safe2 ? GGML_TYPE_BF16 : type_w;
+        const ggml_type type_up = mix >= 2 ? GGML_TYPE_Q8_0 : type_w;
+        const ggml_type type_dn = mix == 1 || mix == 3 ? GGML_TYPE_Q6_K : type_q5;
+        const ggml_type type_lu = mix ? GGML_TYPE_BF16 : type_w;
+        const ggml_type type_ds = mix == 1 ? GGML_TYPE_BF16 : mix == 3 ? GGML_TYPE_Q6_K : type_q5;
+        ggml_tensor * w_up   = ggml_new_tensor_3d(ctx, type_up,       n_lat, n_ff, n_expert);
         ggml_tensor * w_down = ggml_new_tensor_3d(ctx, type_dn,       n_ff, n_lat, n_expert);
-        ggml_tensor * w_lu   = ggml_new_tensor_2d(ctx, type_bf,       n_lat, n_embd);
-        ggml_tensor * w_us   = ggml_new_tensor_2d(ctx, type_w,        n_embd, n_ff_sh);
-        ggml_tensor * w_ds   = ggml_new_tensor_2d(ctx, type_bf,       n_ff_sh, n_embd);
+        ggml_tensor * w_lu   = ggml_new_tensor_2d(ctx, type_lu,       n_lat, n_embd);
+        ggml_tensor * w_us   = ggml_new_tensor_2d(ctx, type_q5,       n_embd, n_ff_sh);
+        ggml_tensor * w_ds   = ggml_new_tensor_2d(ctx, type_ds,       n_ff_sh, n_embd);
         ggml_tensor * out    = ggml_dragon_moe(ctx, x, w_ld, w_r, bias, w_up, w_down, w_lu, w_us, w_ds, k, w_scale, -1);
         if (geo & 4) {
             // as in the model: l_out = GEODESIC(moe input, moe output)
@@ -11728,6 +11733,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_F32,   256, 3, { 64, 8, 200 }));
     test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_Q8_0, 1536, 1));
     test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_Q8_0, 1536, 5));
+    for (ggml_type t : { GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) { // q5_k_m files
+        test_cases.emplace_back(new test_dragon_mmv(t, 1536, 1));
+        test_cases.emplace_back(new test_dragon_mmv(t, 1536, 5));
+    }
     test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 1, 1));   // decode
     test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 4, 4));   // batched decode
     test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 6, 2));   // 3 tokens per sequence (in-batch shift)
@@ -11753,11 +11762,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  4, 384,  32, 768, 1536, 6, 2.45f));    // Q8_0, b1/b2 path
     test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536, 19, 384,  32, 768, 1536, 6, 2.45f));    // Q8_0, odd batch
     // q8_0-safe2 files (Q6_K W_down, BF16 W_lu / W_ds): mixed-type kernels
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 6, true)); // decode as in the model
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  2, 384,  32, 768, 1536, 6, 2.45f, 2, true)); // 2 tokens (sh_split)
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  4, 384,  32, 768, 1536, 6, 2.45f, 0, true)); // b1/b2 path
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  8, 384,  32, 768, 1536, 6, 2.45f, 4, true)); // 8 tokens (-ub 8)
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 0, true)); // Q6_K W_down with BF16 W_ds
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 6, 1)); // decode as in the model
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  2, 384,  32, 768, 1536, 6, 2.45f, 2, 1)); // 2 tokens (sh_split)
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  4, 384,  32, 768, 1536, 6, 2.45f, 0, 1)); // b1/b2 path
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  8, 384,  32, 768, 1536, 6, 2.45f, 4, 1)); // 8 tokens (-ub 8)
+    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 0, 1)); // Q6_K W_down with BF16 W_ds
+    // q5_k_m files with the safe overrides (Q5_K or Q6_K W_down / W_ds depending on the layer)
+    for (int mix : { 2, 3 }) {
+        test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536, 1, 384, 32, 768, 1536, 6, 2.45f, 6, mix)); // decode as in the model
+        test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536, 2, 384, 32, 768, 1536, 6, 2.45f, 2, mix)); // 2 tokens
+        test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536, 8, 384, 32, 768, 1536, 6, 2.45f, 4, mix)); // 8 tokens
+    }
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

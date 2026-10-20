@@ -1967,7 +1967,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
                 }
                 const enum ggml_type wt = op->src[1]->type;
-                if (wt != GGML_TYPE_F32 && wt != GGML_TYPE_F16 && wt != GGML_TYPE_Q8_0 && !(wt == GGML_TYPE_BF16 && dev->props.has_bfloat)) {
+                if (wt != GGML_TYPE_F32 && wt != GGML_TYPE_F16 && wt != GGML_TYPE_Q8_0 && wt != GGML_TYPE_Q5_K && wt != GGML_TYPE_Q6_K &&
+                    !(wt == GGML_TYPE_BF16 && dev->props.has_bfloat)) {
                     return false;
                 }
                 for (int i = 1; i < GGML_MAX_SRC && op->src[i] != NULL; ++i) {

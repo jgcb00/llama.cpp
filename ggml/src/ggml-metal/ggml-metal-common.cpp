@@ -135,15 +135,20 @@ int ggml_metal_op_dragon_moe_sh_rows(const struct ggml_tensor * op) {
 
 // kernel m replaces b1 and b2 for up to 2 tokens
 bool ggml_metal_op_dragon_moe_merged(const struct ggml_tensor * op) {
-    // kernel m reads W_up, W_down, W_us and W_ds with one weight type, or Q8_0 W_up / W_us with a Q8_0 / Q6_K W_down
-    // and a Q8_0 / BF16 W_ds (the instantiations in mamba3.metal)
-    const ggml_type t  = op->src[4]->type;
-    const ggml_type td = op->src[5]->type;
-    const ggml_type tds = op->src[8]->type;
-    const bool uniform = td == t && op->src[7]->type == t && tds == t;
-    const bool q8_mix  = t == GGML_TYPE_Q8_0 && op->src[7]->type == GGML_TYPE_Q8_0 &&
-                         (td == GGML_TYPE_Q8_0 || td == GGML_TYPE_Q6_K) && (tds == GGML_TYPE_Q8_0 || tds == GGML_TYPE_BF16);
-    const bool same_type = uniform || q8_mix;
+    // kernel m reads W_up, W_down, W_us and W_ds with one weight type or one of the combinations instantiated in
+    // mamba3.metal (kernel_dragon_moe_m_<W_up>_<W_down>_<W_us>_<W_ds>)
+    static const ggml_type mixed[][4] = {
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_BF16 },
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_BF16 },
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 },
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K },
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K },
+    };
+    const ggml_type t[4] = { op->src[4]->type, op->src[5]->type, op->src[7]->type, op->src[8]->type };
+    bool same_type = t[1] == t[0] && t[2] == t[0] && t[3] == t[0];
+    for (const auto & m : mixed) {
+        same_type = same_type || (t[0] == m[0] && t[1] == m[1] && t[2] == m[2] && t[3] == m[3]);
+    }
     return same_type && op->src[0]->ne[1] <= 2 && ggml_metal_op_dragon_moe_msplit(op) > 0 && ggml_metal_op_dragon_moe_sh_rows(op) > 0;
 }
 
@@ -194,9 +199,24 @@ int ggml_metal_op_dragon_moe_sh_src(int which) {
     }
 }
 
-// weight types of kernels a, b1, b2 and c (routed-path weight, shared-expert weight), as instantiated in mamba3.metal:
-// one type among F32 / F16 / BF16 / Q8_0, or Q8_0 with BF16 (either way), or Q6_K W_down with a Q8_0 / BF16 W_ds
+// weight types of kernels a, b1, b2 and c (routed-path weight, shared-expert weight) and of kernel m (W_up, W_down, W_us,
+// W_ds), as instantiated in mamba3.metal: one type among F32 / F16 / BF16 / Q8_0 for all, or the combinations of the
+// q8_0-safe2 and q5_k_m (safe overrides) files below
+static bool dmoe_uniform_type(ggml_type t) {
+    return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 || t == GGML_TYPE_Q8_0;
+}
+
 bool ggml_metal_op_dragon_moe_types_ok(const struct ggml_tensor * op, bool has_bfloat) {
+    struct pair { int which; ggml_type w, s; };
+    static const pair mixed[] = {
+        { 0, GGML_TYPE_Q8_0, GGML_TYPE_BF16 }, { 0, GGML_TYPE_BF16, GGML_TYPE_Q8_0 }, { 0, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K },
+        { 1, GGML_TYPE_Q8_0, GGML_TYPE_BF16 }, { 1, GGML_TYPE_BF16, GGML_TYPE_Q8_0 }, { 1, GGML_TYPE_Q8_0, GGML_TYPE_Q5_K },
+        { 2, GGML_TYPE_Q8_0, GGML_TYPE_BF16 }, { 2, GGML_TYPE_BF16, GGML_TYPE_Q8_0 },
+        { 2, GGML_TYPE_Q6_K, GGML_TYPE_BF16 }, { 2, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 },
+        { 2, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K }, { 2, GGML_TYPE_Q6_K, GGML_TYPE_Q6_K },
+        { 3, GGML_TYPE_Q8_0, GGML_TYPE_BF16 }, { 3, GGML_TYPE_BF16, GGML_TYPE_Q8_0 },
+        { 3, GGML_TYPE_BF16, GGML_TYPE_Q5_K }, { 3, GGML_TYPE_BF16, GGML_TYPE_Q6_K },
+    };
     static const int routed[4] = { 1, 4, 5, 6 };
     for (int which = 0; which < 4; ++which) {
         const ggml_type tw = op->src[routed[which]]->type;
@@ -204,15 +224,11 @@ bool ggml_metal_op_dragon_moe_types_ok(const struct ggml_tensor * op, bool has_b
         if ((tw == GGML_TYPE_BF16 || ts == GGML_TYPE_BF16) && !has_bfloat) {
             return false;
         }
-        if (tw == ts) {
-            if (tw != GGML_TYPE_F32 && tw != GGML_TYPE_F16 && tw != GGML_TYPE_BF16 && tw != GGML_TYPE_Q8_0) {
-                return false;
-            }
-            continue;
+        bool ok = tw == ts && dmoe_uniform_type(tw);
+        for (const pair & p : mixed) {
+            ok = ok || (p.which == which && p.w == tw && p.s == ts);
         }
-        const bool q8_bf16 = (tw == GGML_TYPE_Q8_0 && ts == GGML_TYPE_BF16) || (tw == GGML_TYPE_BF16 && ts == GGML_TYPE_Q8_0);
-        const bool q6_down = which == 2 && tw == GGML_TYPE_Q6_K && (ts == GGML_TYPE_Q8_0 || ts == GGML_TYPE_BF16);
-        if (!q8_bf16 && !q6_down) {
+        if (!ok) {
             return false;
         }
     }
