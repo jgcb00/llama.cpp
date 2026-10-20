@@ -376,7 +376,6 @@ struct cmd_params {
     bool                             no_warmup;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
-    llama_tpa_cache_type tpa_cache = LLAMA_TPA_CACHE_TYPE_AUTO;
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -477,7 +476,6 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
-    printf("  --tpa-cache <full|factored|auto>                  (default: auto)\n");
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
     printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
@@ -864,13 +862,6 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
-            } else if (arg == "--tpa-cache") {
-                if (++i >= argc) {
-                    invalid_param = true;
-                    break;
-                }
-                const std::string v = argv[i];
-                params.tpa_cache = v == "full" ? LLAMA_TPA_CACHE_TYPE_FULL : v == "factored" ? LLAMA_TPA_CACHE_TYPE_FACTORED : LLAMA_TPA_CACHE_TYPE_AUTO;
             } else if (arg == "-fa" || arg == "--flash-attn") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1321,14 +1312,12 @@ struct cmd_params_instance {
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
         cparams.flash_attn_type = flash_attn;
-        cparams.tpa_cache_type  = tpa_cache;
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
 
         return cparams;
     }
-    llama_tpa_cache_type tpa_cache = LLAMA_TPA_CACHE_TYPE_AUTO;
 };
 
 static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_params & params) {
@@ -1398,7 +1387,6 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
-            instance.tpa_cache = params.tpa_cache;
             instances.push_back(instance);
         }
 
@@ -1437,7 +1425,6 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
-            instance.tpa_cache = params.tpa_cache;
             instances.push_back(instance);
         }
 
@@ -1476,7 +1463,6 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
-            instance.tpa_cache = params.tpa_cache;
             instances.push_back(instance);
         }
     }

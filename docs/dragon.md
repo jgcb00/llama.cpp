@@ -127,6 +127,10 @@ Long context / multi-user (q5_k_m, 16 threads): pp8192 405 t/s; decode 86 t/s at
   after routing, release after use). ≈ 1.2 GiB RSS for q5_k_m; 27 t/s decode under a
   2 GiB cap from NVMe. Details and measurements: [olala-setup.md](olala-setup.md)
   (low-RAM mode).
+- Attention KV cache: the layout (expanded K/V or TPA factors, 2.6x less KV memory) is chosen per
+  GPU, no option: full on Apple M1-M4 (faster there, at the cost of more memory), factored on
+  M5 / A19, full on the other backends. Measurements and trade-off: [olala-setup.md](olala-setup.md)
+  (Mac section).
 - GPU: `-ngl 99`, **bf16 weights** (see §3). H100 PCIe bf16: pp8192 5313 t/s,
   tg128 163 t/s.
 

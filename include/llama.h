@@ -197,7 +197,8 @@ extern "C" {
     LLAMA_API const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type);
 
     // KV cache layout of the TPA attention layers (Dragon): the expanded K/V (full) or the TPA factors (factored: ~2.6x
-    // less memory per token, more compute in the attention)
+    // less memory per token, more compute in the attention). auto: factored on devices with matrix units (Metal: M5 / A19),
+    // full otherwise
     enum llama_tpa_cache_type {
         LLAMA_TPA_CACHE_TYPE_AUTO     = -1,
         LLAMA_TPA_CACHE_TYPE_FULL     = 0,

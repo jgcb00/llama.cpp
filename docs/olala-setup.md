@@ -192,6 +192,29 @@ Then:
 ./build/bin/llama-server -m olala-bf16.gguf -ngl 99 -fa 1 -c 32768 -np 4 --port 8080
 ```
 
+**Attention KV cache layout (chosen automatically, no option).** The 7 attention layers can keep
+either the expanded K/V (*full*) or only the TPA factors of each token (*factored*, 2.6x less KV
+memory, more attention compute). The choice is made per GPU:
+
+- **M1 to M4: full.** On these chips the factored cache is slower, so full is worth its extra
+  memory. Measured on M3 Ultra, Q8_0, one sequence:
+
+  | | full | factored |
+  |---|---|---|
+  | decode, empty / 8k / 32k context | 194 / 168 / 126 t/s | 178 / 145 / 100 t/s |
+  | prefill pp512, empty / 8k / 32k context | 3393 / 2539 / 1358 t/s | 3524 / 2575 / 1270 t/s |
+  | KV cache at 32k context, per sequence | 1344 MiB | 509 MiB |
+
+  The factored cache also needs ~180 MiB more compute buffer, shared by all the sequences.
+  So full costs ~650 MiB more for one sequence at 32k, ~835 MiB more for each additional one,
+  and twice that at 64k.
+- **M5 / A19 (GPUs with the Metal tensor API): factored.** Not measured yet.
+- **Other backends: full** (the factored kernels exist only for Metal and CPU).
+
+Applications that link libllama can force the layout with `llama_context_params.tpa_cache_type`
+(`LLAMA_TPA_CACHE_TYPE_FULL` / `_FACTORED`); perplexity is the same either way (wikitext-2, 8
+chunks: 12.90 full, 12.88-12.89 factored).
+
 If Metal fails or the machine has < 16 GB: run on the Mac CPU instead with a quantized file
 — same build, add `-ngl 0` (or `--device none`) and use `olala-q5_k_m.gguf`
 (or the 4.0 GiB small variant), `-t` = number of performance cores.
