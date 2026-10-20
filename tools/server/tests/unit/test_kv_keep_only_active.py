@@ -36,7 +36,7 @@ LONG_PROMPT = (
     "Once upon a time in a land far away, there lived a brave knight "
     "who traveled across mountains and rivers to find the legendary "
     "golden sword hidden deep within the enchanted forest of whispers. "
-    "He met many creatures along the way including dragons and fairies "
+    "He met many creatures along the way including olalas and fairies "
     "and wizards who helped him on his noble quest to save the kingdom."
 )
 

@@ -2,14 +2,14 @@
 // a binary file. Used for numerical comparison against a reference (e.g. HF).
 //
 // Usage:
-//   dragon-logits -m model.gguf -o out.bin [-t threads] "prompt text"
+//   olala-logits -m model.gguf -o out.bin [-t threads] "prompt text"
 //
 // Output file format (little-endian):
 //   int32  n_tokens
 //   int32  n_vocab
 //   float  logits[n_tokens * n_vocab]
 //
-// If DRAGON_DUMP_DIR=<dir> is set in the environment, the Dragon graph also
+// If OLALA_DUMP_DIR=<dir> is set in the environment, the Olala graph also
 // writes per-block hidden states to <dir>/block_XX_in.bin for debugging.
 
 #include "llama.h"

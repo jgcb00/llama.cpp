@@ -688,7 +688,7 @@ static bool arch_supported(const llm_arch arch) {
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {
         return false;
     }
-    if (arch == LLM_ARCH_DRAGON) {
+    if (arch == LLM_ARCH_OLALA) {
         return false; // TODO hparams and tensor shapes (Mamba3 / TPA layers, latent MoE)
     }
     // FIXME: these hit scheduler/view-backed-output issues with WebGPU on CI.

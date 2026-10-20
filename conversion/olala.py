@@ -1,4 +1,4 @@
-"""Dragon 7A1B converter.
+"""Olala 7A1B converter.
 
 Hybrid Mamba3-MIMO (M layers) + Differential-TPA-V2 attention (V layers) + MoE,
 with a geodesic-rotation residual on every block.
@@ -16,8 +16,8 @@ from . import ModelBase, TextModel, logger
 
 
 @ModelBase.register("DragonForCausalLM", "OlalaForCausalLM")
-class DragonModel(TextModel):
-    model_arch = gguf.MODEL_ARCH.DRAGON
+class OlalaModel(TextModel):
+    model_arch = gguf.MODEL_ARCH.OLALA
 
     # Block-letter convention: 'M' = Mamba3-MIMO mixer, 'V' = Differential-TPA-V2 mixer.
     SSM_LAYER_TYPES = {"M"}
@@ -26,7 +26,7 @@ class DragonModel(TextModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # The Dragon config exposes `layers_config` as a per-block letter string.
+        # The Olala config exposes `layers_config` as a per-block letter string.
         layers_cfg: str = self.hparams.get("layers_config", "")
         if not layers_cfg or len(layers_cfg) != self.block_count:
             raise ValueError(
@@ -37,7 +37,7 @@ class DragonModel(TextModel):
         self._attn_layers = [i for i, c in enumerate(layers_cfg) if c in self.ATTN_LAYER_TYPES]
         unknown = sorted({c for c in layers_cfg} - self.SSM_LAYER_TYPES - self.ATTN_LAYER_TYPES)
         if unknown:
-            raise ValueError(f"Dragon converter only handles M and V layers; got unknown: {unknown}")
+            raise ValueError(f"Olala converter only handles M and V layers; got unknown: {unknown}")
 
         # Cache a few derived quantities for set_gguf_parameters / modify_tensors.
         self._head_dim       = int(self.hparams["head_dim"])
@@ -51,7 +51,7 @@ class DragonModel(TextModel):
         self._mamba_ngroups  = int(self.hparams["mamba_ngroups"])
         self._d_inner        = 2 * int(self.hparams["hidden_size"])     # expand_factor=2
         self._nheads_ssm     = self._d_inner // self._mamba_headdim     # 3072 / 64 = 48
-        # rope_fraction = 0.5 in the Mamba3MimoFast __init__ (line 1863 of modeling_dragon.py)
+        # rope_fraction = 0.5 in the Mamba3MimoFast __init__ (line 1863 of modeling_olala.py)
         split = int(self._mamba_d_state * 0.5)
         if split % 2 != 0:
             split -= 1
@@ -60,7 +60,7 @@ class DragonModel(TextModel):
         self._zero_centered = bool(self.hparams.get("zero_centered_gamma", False))
         self._geodesic      = bool(self.hparams.get("geodesic_update", False))
         if not self._geodesic:
-            raise NotImplementedError("Dragon converter currently only handles geodesic_update=true configs")
+            raise NotImplementedError("Olala converter currently only handles geodesic_update=true configs")
 
     # ------------------------------------------------------------------
     # GGUF parameters
@@ -68,7 +68,7 @@ class DragonModel(TextModel):
 
     def set_vocab(self):
         # tokenizer_class == "Qwen2Tokenizer" → GPT-2-style BPE.
-        # transformers≥5 expects `extra_special_tokens` to be a dict; the Dragon
+        # transformers≥5 expects `extra_special_tokens` to be a dict; the Olala
         # checkpoint stores it as a list. Patch a tokenizer copy in a temp dir
         # rather than mutating the source checkpoint.
         import json, shutil, tempfile
@@ -77,7 +77,7 @@ class DragonModel(TextModel):
         cfg_path = self.dir_model / "tokenizer_config.json"
         cfg = json.loads(cfg_path.read_text())
         if isinstance(cfg.get("extra_special_tokens"), list):
-            tmp = Path(tempfile.mkdtemp(prefix="dragon_vocab_"))
+            tmp = Path(tempfile.mkdtemp(prefix="olala_vocab_"))
             # Only copy the small files AutoTokenizer needs.
             for name in ("tokenizer.json", "vocab.json", "merges.txt", "added_tokens.json", "special_tokens_map.json",
                          "chat_template.jinja", "chat_template.json"):
@@ -102,7 +102,7 @@ class DragonModel(TextModel):
         self.gguf_writer.add_block_count(self.block_count)
         self.gguf_writer.add_context_length(int(self.hparams["max_position_embeddings"]))
         self.gguf_writer.add_embedding_length(int(self.hparams["hidden_size"]))
-        # `intermediate_size` in the Dragon config is unused at inference (the MoE has its own sizes).
+        # `intermediate_size` in the Olala config is unused at inference (the MoE has its own sizes).
         # Some llama.cpp consumers still want a value; set it to 0 to make it clear there's no dense FFN.
         self.gguf_writer.add_feed_forward_length(0)
         self.gguf_writer.add_head_count(self._n_head)
@@ -138,10 +138,10 @@ class DragonModel(TextModel):
         self.gguf_writer.add_ssm_group_count(self._mamba_ngroups)
         self.gguf_writer.add_ssm_time_step_rank(self._mamba_headdim)  # repurposed: per-head value dim for M layer
 
-        # --- Dragon-specific (carry the strictly-novel knobs as arch.* keys) ---
+        # --- Olala-specific (carry the strictly-novel knobs as arch.* keys) ---
         # NOTE: we use raw add_uint32/add_string for fields that don't have a typed setter.
         kvw = self.gguf_writer
-        arch = "dragon"
+        arch = "olala"
         kvw.add_uint32(f"{arch}.mamba_mimo_dim",       self._mimo_dim)
         kvw.add_uint32(f"{arch}.mamba_headdim",        self._mamba_headdim)
         kvw.add_uint32(f"{arch}.num_signal_heads",     self._n_sig)
@@ -167,7 +167,7 @@ class DragonModel(TextModel):
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         # 1. Drop tensors that don't carry weights we need.
-        #    `prosres_scalar` is a registered-buffer in DragonGeodesicNorm that
+        #    `prosres_scalar` is a registered-buffer in OlalaGeodesicNorm that
         #    isn't actually used in the forward pass.
         if name.endswith(".prosres_scalar"):
             return

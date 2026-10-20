@@ -4859,7 +4859,7 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .run();
     }
 
-    // Olala (Dragon 7A1B) tests - custom parser
+    // Olala 7A1B tests - custom parser
     // Unique feature: <|channel_start|>NAME<|content|>...<|channel_end|> channels, XML-wrapped
     // JSON tool calls in a dedicated tools channel, and a generation prompt that leaves the
     // analysis channel open. Cases mirror jgcb00/olala parsers/test_olala_parsers.py.

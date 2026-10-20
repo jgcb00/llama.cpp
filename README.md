@@ -1,8 +1,8 @@
-# llama.cpp — Olala / Dragon 7A1B fork (`olala-master`)
+# llama.cpp — Olala 7A1B fork (`olala-master`)
 
-> This branch adds the Olala / Dragon 7A1B hybrid model (Mamba3-MIMO + differential
+> This branch adds the Olala 7A1B hybrid model (Mamba3-MIMO + differential
 > attention + MoE) on CPU, Metal and CUDA. **Setup procedure: [docs/olala-setup.md](docs/olala-setup.md)**,
-> details: [docs/dragon.md](docs/dragon.md).
+> details: [docs/olala.md](docs/olala.md).
 
 # llama.cpp
 

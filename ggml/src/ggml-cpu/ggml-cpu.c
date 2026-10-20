@@ -2113,29 +2113,29 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_geodesic(params, tensor);
             } break;
-        case GGML_OP_DRAGON_MOE:
+        case GGML_OP_OLALA_MOE:
             {
-                ggml_compute_forward_dragon_moe(params, tensor);
+                ggml_compute_forward_olala_moe(params, tensor);
             } break;
-        case GGML_OP_DRAGON_MMV:
+        case GGML_OP_OLALA_MMV:
             {
-                ggml_compute_forward_dragon_mmv(params, tensor);
+                ggml_compute_forward_olala_mmv(params, tensor);
             } break;
-        case GGML_OP_DRAGON_TPA_PREP:
+        case GGML_OP_OLALA_TPA_PREP:
             {
-                ggml_compute_forward_dragon_tpa_prep(params, tensor);
+                ggml_compute_forward_olala_tpa_prep(params, tensor);
             } break;
-        case GGML_OP_DRAGON_DIFF_GATE:
+        case GGML_OP_OLALA_DIFF_GATE:
             {
-                ggml_compute_forward_dragon_diff_gate(params, tensor);
+                ggml_compute_forward_olala_diff_gate(params, tensor);
             } break;
-        case GGML_OP_DRAGON_TPA_ATTN:
+        case GGML_OP_OLALA_TPA_ATTN:
             {
-                ggml_compute_forward_dragon_tpa_attn(params, tensor);
+                ggml_compute_forward_olala_tpa_attn(params, tensor);
             } break;
-        case GGML_OP_DRAGON_TPA_EXPAND:
+        case GGML_OP_OLALA_TPA_EXPAND:
             {
-                ggml_compute_forward_dragon_tpa_expand(params, tensor);
+                ggml_compute_forward_olala_tpa_expand(params, tensor);
             } break;
         case GGML_OP_MAP_CUSTOM1:
             {
@@ -2322,12 +2322,12 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_POST:
         case GGML_OP_MAMBA3_MIMO:
         case GGML_OP_GEODESIC:
-        case GGML_OP_DRAGON_MOE:
-        case GGML_OP_DRAGON_MMV:
-        case GGML_OP_DRAGON_TPA_PREP:
-        case GGML_OP_DRAGON_DIFF_GATE:
-        case GGML_OP_DRAGON_TPA_ATTN:
-        case GGML_OP_DRAGON_TPA_EXPAND:
+        case GGML_OP_OLALA_MOE:
+        case GGML_OP_OLALA_MMV:
+        case GGML_OP_OLALA_TPA_PREP:
+        case GGML_OP_OLALA_DIFF_GATE:
+        case GGML_OP_OLALA_TPA_ATTN:
+        case GGML_OP_OLALA_TPA_EXPAND:
             {
                 n_tasks = n_threads;
             } break;
@@ -3067,22 +3067,22 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         cur = ggml_mamba3_mimo_work_size(node, n_tasks);
                     } break;
-                case GGML_OP_DRAGON_MOE:
+                case GGML_OP_OLALA_MOE:
                     {
-                        cur = ggml_dragon_moe_work_size(node, n_tasks);
+                        cur = ggml_olala_moe_work_size(node, n_tasks);
                     } break;
-                case GGML_OP_DRAGON_MMV:
+                case GGML_OP_OLALA_MMV:
                     {
                         // one dequantized weight row per thread
                         cur = sizeof(float)*(node->src[0]->ne[0] + CACHE_LINE_SIZE_F32)*n_tasks;
                     } break;
-                case GGML_OP_DRAGON_TPA_PREP:
+                case GGML_OP_OLALA_TPA_PREP:
                     {
                         // 5 rows of Dh floats per thread
                         const int64_t Dh = ggml_get_op_params_i32(node, 3);
                         cur = sizeof(float)*(5*Dh + CACHE_LINE_SIZE_F32)*n_tasks;
                     } break;
-                case GGML_OP_DRAGON_TPA_ATTN:
+                case GGML_OP_OLALA_TPA_ATTN:
                     {
                         // per thread: R dot products per cell, the scores, the output row
                         const int64_t R    = ggml_get_op_params_i32(node, 1);

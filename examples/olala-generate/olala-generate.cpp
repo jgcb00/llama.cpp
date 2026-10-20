@@ -1,12 +1,12 @@
-// Multi-token greedy generation for Dragon, implemented as repeated prefill.
+// Multi-token greedy generation for Olala, implemented as repeated prefill.
 //
-// Decode-mode recurrent-state plumbing isn't wired through Dragon's M-layer
+// Decode-mode recurrent-state plumbing isn't wired through Olala's M-layer
 // kernel yet (state in/out are zeroed every call), so we work around it by
 // re-prefilling the whole sequence on every generation step. O(L²) total work
 // but numerically correct.
 //
 // Usage:
-//   dragon-generate -m model.gguf [-n N] [-ngl K] [-t T] -p "prompt"
+//   olala-generate -m model.gguf [-n N] [-ngl K] [-t T] -p "prompt"
 //
 // Output: the generated text on stdout. Stderr carries timings.
 //
@@ -85,7 +85,7 @@ int main(int argc, char ** argv) {
     cp.n_ctx     = n_ctx_max;
     cp.n_batch   = n_ctx_max;
     cp.no_perf   = true;
-    if (std::getenv("DRAGON_FA")) {
+    if (std::getenv("OLALA_FA")) {
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }
     if (n_threads > 0) {

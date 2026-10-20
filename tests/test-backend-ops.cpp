@@ -4879,7 +4879,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
-// GGML_OP_MAMBA3_MIMO (fused Dragon mixer core, raw projections in)
+// GGML_OP_MAMBA3_MIMO (fused Olala mixer core, raw projections in)
 struct test_mamba3_mimo : public test_case {
     const int64_t d_qk;
     const int64_t r; // MIMO rank
@@ -4928,7 +4928,7 @@ struct test_mamba3_mimo : public test_case {
 };
 
 // GGML_OP_MAMBA3_MIMO + the cpy of the new state into the recurrent cache, as built by the
-// Dragon graph (exercises the Metal MAMBA3_MIMO + CPY fusion)
+// Olala graph (exercises the Metal MAMBA3_MIMO + CPY fusion)
 struct test_mamba3_mimo_cache_fusion : public test_case {
     const int64_t d_qk;
     const int64_t r;
@@ -5033,8 +5033,8 @@ struct test_geodesic : public test_case {
     }
 };
 
-// GGML_OP_DRAGON_MOE (the Dragon latent MoE block; CPU reference vs the Metal 3-dispatch implementation)
-struct test_dragon_moe : public test_case {
+// GGML_OP_OLALA_MOE (the Olala latent MoE block; CPU reference vs the Metal 3-dispatch implementation)
+struct test_olala_moe : public test_case {
     const ggml_type type_w;
     const int64_t n_embd;
     const int64_t n_tok;
@@ -5055,7 +5055,7 @@ struct test_dragon_moe : public test_case {
         return 5e-4; // the CPU reference rounds the activations to the weight type before its dot products
     }
 
-    test_dragon_moe(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 1536, int64_t n_tok = 1, int64_t n_lat = 384,
+    test_olala_moe(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 1536, int64_t n_tok = 1, int64_t n_lat = 384,
             int64_t n_expert = 256, int64_t n_ff = 768, int64_t n_ff_sh = 1536, int k = 6, float w_scale = 2.45f, int geo = 0)
         : type_w(type_w), n_embd(n_embd), n_tok(n_tok), n_lat(n_lat), n_expert(n_expert), n_ff(n_ff), n_ff_sh(n_ff_sh), k(k), w_scale(w_scale), geo(geo) {}
 
@@ -5075,7 +5075,7 @@ struct test_dragon_moe : public test_case {
         ggml_tensor * w_lu   = ggml_new_tensor_2d(ctx, type_w,        n_lat, n_embd);
         ggml_tensor * w_us   = ggml_new_tensor_2d(ctx, type_w,        n_embd, n_ff_sh);
         ggml_tensor * w_ds   = ggml_new_tensor_2d(ctx, type_w,        n_ff_sh, n_embd);
-        ggml_tensor * out    = ggml_dragon_moe(ctx, x, w_ld, w_r, bias, w_up, w_down, w_lu, w_us, w_ds, k, w_scale, -1);
+        ggml_tensor * out    = ggml_olala_moe(ctx, x, w_ld, w_r, bias, w_up, w_down, w_lu, w_us, w_ds, k, w_scale, -1);
         if (geo & 4) {
             // as in the model: l_out = GEODESIC(moe input, moe output)
             ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
@@ -5100,7 +5100,7 @@ struct test_dragon_moe : public test_case {
         // weights use the logits)
         ggml_tensor * bias = nullptr;
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (t->op == GGML_OP_DRAGON_MOE) {
+            if (t->op == GGML_OP_OLALA_MOE) {
                 bias = t->src[3];
             }
         }
@@ -5115,8 +5115,8 @@ struct test_dragon_moe : public test_case {
     }
 };
 
-// GGML_OP_DRAGON_MMV
-struct test_dragon_mmv : public test_case {
+// GGML_OP_OLALA_MMV
+struct test_olala_mmv : public test_case {
     const ggml_type type_w;
     const int64_t n_embd;
     const int64_t n_tok;
@@ -5130,7 +5130,7 @@ struct test_dragon_mmv : public test_case {
         return 5e-4;
     }
 
-    test_dragon_mmv(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 1536, int64_t n_tok = 1,
+    test_olala_mmv(ggml_type type_w = GGML_TYPE_BF16, int64_t n_embd = 1536, int64_t n_tok = 1,
             std::vector<int64_t> rows = { 6144, 48, 48, 512, 512, 12, 12, 12, 4608 })
         : type_w(type_w), n_embd(n_embd), n_tok(n_tok), rows(rows) {}
 
@@ -5141,12 +5141,12 @@ struct test_dragon_mmv : public test_case {
         for (size_t i = 0; i < rows.size(); ++i) {
             ws[i] = ggml_new_tensor_2d(ctx, type_w, n_embd, rows[i]);
         }
-        return ggml_dragon_mmv(ctx, x, ws, (int) rows.size());
+        return ggml_olala_mmv(ctx, x, ws, (int) rows.size());
     }
 };
 
-// GGML_OP_DRAGON_TPA_PREP
-struct test_dragon_tpa_prep : public test_case {
+// GGML_OP_OLALA_TPA_PREP
+struct test_olala_tpa_prep : public test_case {
     const int H, Hn, R, Dh, n_tok, n_seqs;
     const bool factored;
 
@@ -5158,7 +5158,7 @@ struct test_dragon_tpa_prep : public test_case {
         return 1e-6;
     }
 
-    test_dragon_tpa_prep(int H = 48, int Hn = 12, int R = 4, int Dh = 128, int n_tok = 1, int n_seqs = 1, bool factored = false)
+    test_olala_tpa_prep(int H = 48, int Hn = 12, int R = 4, int Dh = 128, int n_tok = 1, int n_seqs = 1, bool factored = false)
         : H(H), Hn(Hn), R(R), Dh(Dh), n_tok(n_tok), n_seqs(n_seqs), factored(factored) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -5172,9 +5172,9 @@ struct test_dragon_tpa_prep : public test_case {
         ggml_tensor * k_norm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, Dh);
         ggml_tensor * scaler = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H);
         if (factored) {
-            return ggml_dragon_tpa_prep_factored(ctx, pr, prev, pos, q_norm, k_norm, scaler, H, Hn, R, Dh, Hs, n_seqs, 1e-6f, 4096.0f, 0.5f);
+            return ggml_olala_tpa_prep_factored(ctx, pr, prev, pos, q_norm, k_norm, scaler, H, Hn, R, Dh, Hs, n_seqs, 1e-6f, 4096.0f, 0.5f);
         }
-        return ggml_dragon_tpa_prep(ctx, pr, prev, pos, q_norm, k_norm, scaler, H, Hn, R, Dh, Hs, n_seqs, 1e-6f, 4096.0f, 0.5f);
+        return ggml_olala_tpa_prep(ctx, pr, prev, pos, q_norm, k_norm, scaler, H, Hn, R, Dh, Hs, n_seqs, 1e-6f, 4096.0f, 0.5f);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -5194,8 +5194,8 @@ struct test_dragon_tpa_prep : public test_case {
     }
 };
 
-// GGML_OP_DRAGON_TPA_ATTN
-struct test_dragon_tpa_attn : public test_case {
+// GGML_OP_OLALA_TPA_ATTN
+struct test_olala_tpa_attn : public test_case {
     const int H, Hn, R, Dh, n_kv, T, ns;
     const ggml_type type_kv;
 
@@ -5207,20 +5207,20 @@ struct test_dragon_tpa_attn : public test_case {
         return 5e-4;
     }
 
-    test_dragon_tpa_attn(int H = 48, int Hn = 12, int R = 4, int Dh = 128, int n_kv = 256, int T = 1, int ns = 1, ggml_type type_kv = GGML_TYPE_F16)
+    test_olala_tpa_attn(int H = 48, int Hn = 12, int R = 4, int Dh = 128, int n_kv = 256, int T = 1, int ns = 1, ggml_type type_kv = GGML_TYPE_F16)
         : H(H), Hn(Hn), R(R), Dh(Dh), n_kv(n_kv), T(T), ns(ns), type_kv(type_kv) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, Dh, H, T, ns);
-        ggml_tensor * k    = ggml_new_tensor_3d(ctx, type_kv, ggml_dragon_tpa_row_k(Hn, R, Dh), n_kv, ns);
-        ggml_tensor * v    = ggml_new_tensor_3d(ctx, type_kv, ggml_dragon_tpa_row_v(Hn, R, Dh), n_kv, ns);
+        ggml_tensor * k    = ggml_new_tensor_3d(ctx, type_kv, ggml_olala_tpa_row_k(Hn, R, Dh), n_kv, ns);
+        ggml_tensor * v    = ggml_new_tensor_3d(ctx, type_kv, ggml_olala_tpa_row_v(Hn, R, Dh), n_kv, ns);
         ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, GGML_PAD(T, 8), 1, ns);
         ggml_tensor * prev = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, ns);
         ggml_set_name(mask, "mask");
         ggml_set_name(prev, "prev");
         ggml_set_name(k, "k");
         ggml_set_name(v, "v");
-        return ggml_dragon_tpa_attn(ctx, q, k, v, mask, prev, Hn, R, 1.0f/Dh, 150.0f);
+        return ggml_olala_tpa_attn(ctx, q, k, v, mask, prev, Hn, R, 1.0f/Dh, 150.0f);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -5251,8 +5251,8 @@ struct test_dragon_tpa_attn : public test_case {
     }
 };
 
-// GGML_OP_DRAGON_TPA_EXPAND
-struct test_dragon_tpa_expand : public test_case {
+// GGML_OP_OLALA_TPA_EXPAND
+struct test_olala_tpa_expand : public test_case {
     const int Hn, R, Dh, n_kv, ns;
     const bool is_v;
     const ggml_type type_kv;
@@ -5261,15 +5261,15 @@ struct test_dragon_tpa_expand : public test_case {
         return VARS_TO_STR7(Hn, R, Dh, n_kv, ns, is_v, type_kv);
     }
 
-    test_dragon_tpa_expand(int Hn = 12, int R = 4, int Dh = 128, int n_kv = 64, int ns = 1, bool is_v = false, ggml_type type_kv = GGML_TYPE_F16)
+    test_olala_tpa_expand(int Hn = 12, int R = 4, int Dh = 128, int n_kv = 64, int ns = 1, bool is_v = false, ggml_type type_kv = GGML_TYPE_F16)
         : Hn(Hn), R(R), Dh(Dh), n_kv(n_kv), ns(ns), is_v(is_v), type_kv(type_kv) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int64_t n = is_v ? ggml_dragon_tpa_row_v(Hn, R, Dh) : ggml_dragon_tpa_row_k(Hn, R, Dh);
+        const int64_t n = is_v ? ggml_olala_tpa_row_v(Hn, R, Dh) : ggml_olala_tpa_row_k(Hn, R, Dh);
         ggml_tensor * rows = ggml_new_tensor_3d(ctx, type_kv, n, n_kv, ns);
         ggml_tensor * prev = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, ns);
         ggml_set_name(prev, "prev");
-        return ggml_dragon_tpa_expand(ctx, rows, prev, Hn, R, Dh, is_v);
+        return ggml_olala_tpa_expand(ctx, rows, prev, Hn, R, Dh, is_v);
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -5289,22 +5289,22 @@ struct test_dragon_tpa_expand : public test_case {
     }
 };
 
-// GGML_OP_DRAGON_DIFF_GATE
-struct test_dragon_diff_gate : public test_case {
+// GGML_OP_OLALA_DIFF_GATE
+struct test_olala_diff_gate : public test_case {
     const int64_t Dh, H, Hn, n_tok;
 
     std::string vars() override {
         return VARS_TO_STR4(Dh, H, Hn, n_tok);
     }
 
-    test_dragon_diff_gate(int64_t Dh = 128, int64_t H = 48, int64_t Hn = 12, int64_t n_tok = 3)
+    test_olala_diff_gate(int64_t Dh = 128, int64_t H = 48, int64_t Hn = 12, int64_t n_tok = 3)
         : Dh(Dh), H(H), Hn(Hn), n_tok(n_tok) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * attn = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, Dh, H, n_tok);
         ggml_tensor * lam  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, Hn, n_tok);
         ggml_tensor * gs   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (H - Hn)*Dh, n_tok);
-        return ggml_dragon_diff_gate(ctx, attn, lam, gs);
+        return ggml_olala_diff_gate(ctx, attn, lam, gs);
     }
 };
 
@@ -11796,8 +11796,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
 
-    // (type, d_qk, r, d_v, head_count, n_seq_tokens, n_seqs); Dragon 7A1B dims: D_qk=64, R=4, D_v=64, H=48
-    // (d_qk, r, d_v, head_count, n_seq_tokens, n_seqs); Dragon 7A1B: 128, 4, 64, 48
+    // (type, d_qk, r, d_v, head_count, n_seq_tokens, n_seqs); Olala 7A1B dims: D_qk=64, R=4, D_v=64, H=48
+    // (d_qk, r, d_v, head_count, n_seq_tokens, n_seqs); Olala 7A1B: 128, 4, 64, 48
     test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,   1, 1)); // decode
     test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,   1, 4)); // batched decode
     test_cases.emplace_back(new test_mamba3_mimo(128, 4, 64, 48,   7, 1)); // short prefill / spec-decode verify
@@ -11816,51 +11816,51 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_geodesic(1536, 7, 0.25f));
     test_cases.emplace_back(new test_geodesic(1536, 512, 1.0f/36));
     test_cases.emplace_back(new test_geodesic(100, 3, 0.5f));
-    // (type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale); Dragon 7A1B: bf16, 1536, 384, 256, 768, 1536, 6, 2.45
-    test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_BF16, 1536, 1));
-    test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_BF16, 1536, 5));
-    test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_F32,   256, 3, { 64, 8, 200 }));
-    test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_Q8_0, 1536, 1));
-    test_cases.emplace_back(new test_dragon_mmv(GGML_TYPE_Q8_0, 1536, 5));
-    test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 1, 1));   // decode
-    test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 4, 4));   // batched decode
-    test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 6, 2));   // 3 tokens per sequence (in-batch shift)
-    test_cases.emplace_back(new test_dragon_tpa_prep(8, 2, 3, 64, 5, 1));      // small dims, gate not divisible by H
-    test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 1, 1, true)); // factored
-    test_cases.emplace_back(new test_dragon_tpa_prep(48, 12, 4, 128, 6, 2, true));
-    test_cases.emplace_back(new test_dragon_tpa_prep(8, 2, 3, 64, 5, 1, true));
+    // (type_w, n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k, w_scale); Olala 7A1B: bf16, 1536, 384, 256, 768, 1536, 6, 2.45
+    test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_BF16, 1536, 1));
+    test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_BF16, 1536, 5));
+    test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_F32,   256, 3, { 64, 8, 200 }));
+    test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_Q8_0, 1536, 1));
+    test_cases.emplace_back(new test_olala_mmv(GGML_TYPE_Q8_0, 1536, 5));
+    test_cases.emplace_back(new test_olala_tpa_prep(48, 12, 4, 128, 1, 1));   // decode
+    test_cases.emplace_back(new test_olala_tpa_prep(48, 12, 4, 128, 4, 4));   // batched decode
+    test_cases.emplace_back(new test_olala_tpa_prep(48, 12, 4, 128, 6, 2));   // 3 tokens per sequence (in-batch shift)
+    test_cases.emplace_back(new test_olala_tpa_prep(8, 2, 3, 64, 5, 1));      // small dims, gate not divisible by H
+    test_cases.emplace_back(new test_olala_tpa_prep(48, 12, 4, 128, 1, 1, true)); // factored
+    test_cases.emplace_back(new test_olala_tpa_prep(48, 12, 4, 128, 6, 2, true));
+    test_cases.emplace_back(new test_olala_tpa_prep(8, 2, 3, 64, 5, 1, true));
     for (ggml_type type_kv : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
         for (bool is_v : { false, true }) {
-            test_cases.emplace_back(new test_dragon_tpa_expand(12, 4, 128, 100, 2, is_v, type_kv));
-            test_cases.emplace_back(new test_dragon_tpa_expand(4,  3, 64,  37,  1, is_v, type_kv));
+            test_cases.emplace_back(new test_olala_tpa_expand(12, 4, 128, 100, 2, is_v, type_kv));
+            test_cases.emplace_back(new test_olala_tpa_expand(4,  3, 64,  37,  1, is_v, type_kv));
         }
     }
     for (ggml_type type_kv : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
-        test_cases.emplace_back(new test_dragon_tpa_attn(48, 12, 4, 128, 256,  1, 1, type_kv));  // decode
-        test_cases.emplace_back(new test_dragon_tpa_attn(48, 12, 4, 128, 1000, 1, 2, type_kv));  // 2 streams, partial chunk
-        test_cases.emplace_back(new test_dragon_tpa_attn(48, 12, 4, 128, 96,   7, 1, type_kv));  // several tokens
-        test_cases.emplace_back(new test_dragon_tpa_attn(16, 4,  3, 64,  37,   3, 1, type_kv));  // small dims
+        test_cases.emplace_back(new test_olala_tpa_attn(48, 12, 4, 128, 256,  1, 1, type_kv));  // decode
+        test_cases.emplace_back(new test_olala_tpa_attn(48, 12, 4, 128, 1000, 1, 2, type_kv));  // 2 streams, partial chunk
+        test_cases.emplace_back(new test_olala_tpa_attn(48, 12, 4, 128, 96,   7, 1, type_kv));  // several tokens
+        test_cases.emplace_back(new test_olala_tpa_attn(16, 4,  3, 64,  37,   3, 1, type_kv));  // small dims
     }
-    test_cases.emplace_back(new test_dragon_diff_gate(128, 48, 12, 3));
-    test_cases.emplace_back(new test_dragon_diff_gate(64, 8, 2, 1));
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f)); // decode (the model has 256 experts: perf mode)
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 1)); // decode + fused geodesic
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  4, 384,  32, 768, 1536, 6, 2.45f, 1)); // batched + geodesic
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 3)); // decode, geodesic in and out
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  2, 384,  32, 768, 1536, 6, 2.45f, 2)); // 2 tokens, input geodesic
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F32,   128,  2, 128,  16, 128,  128, 2, 1.5f, 3)); // small dims, both geodesics
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  4, 384,  32, 768, 1536, 6, 2.45f)); // batched decode
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536, 19, 384,  32, 768, 1536, 6, 2.45f)); // odd batch (> 8 tokens per pass)
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F16,   256,  3, 128,  32, 128,  256, 4, 1.0f));  // small dims, f16
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F32,   128,  2, 128,  16, 128,  128, 2, 1.5f));  // f32, n_ff_sh < n_embd (CPU reference dsh fix)
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_F32,   256,  5, 128,  16, 256,  128, 3, 1.5f));  // f32, 5 tokens (2 passes of kernel a)
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 3)); // Q8_0 decode, geodesic in and out
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 4)); // decode, output geodesic on the input (model)
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 6)); // decode, both geodesics as in the model
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 6)); // Q8_0, both geodesics as in the model
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  2, 384,  32, 768, 1536, 6, 2.45f, 2)); // Q8_0, 2 tokens
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536,  4, 384,  32, 768, 1536, 6, 2.45f));    // Q8_0, b1/b2 path
-    test_cases.emplace_back(new test_dragon_moe(GGML_TYPE_Q8_0, 1536, 19, 384,  32, 768, 1536, 6, 2.45f));    // Q8_0, odd batch
+    test_cases.emplace_back(new test_olala_diff_gate(128, 48, 12, 3));
+    test_cases.emplace_back(new test_olala_diff_gate(64, 8, 2, 1));
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f)); // decode (the model has 256 experts: perf mode)
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 1)); // decode + fused geodesic
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  4, 384,  32, 768, 1536, 6, 2.45f, 1)); // batched + geodesic
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 3)); // decode, geodesic in and out
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  2, 384,  32, 768, 1536, 6, 2.45f, 2)); // 2 tokens, input geodesic
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_F32,   128,  2, 128,  16, 128,  128, 2, 1.5f, 3)); // small dims, both geodesics
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  4, 384,  32, 768, 1536, 6, 2.45f)); // batched decode
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536, 19, 384,  32, 768, 1536, 6, 2.45f)); // odd batch (> 8 tokens per pass)
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_F16,   256,  3, 128,  32, 128,  256, 4, 1.0f));  // small dims, f16
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_F32,   128,  2, 128,  16, 128,  128, 2, 1.5f));  // f32, n_ff_sh < n_embd (CPU reference dsh fix)
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_F32,   256,  5, 128,  16, 256,  128, 3, 1.5f));  // f32, 5 tokens (2 passes of kernel a)
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 3)); // Q8_0 decode, geodesic in and out
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 4)); // decode, output geodesic on the input (model)
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_BF16, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 6)); // decode, both geodesics as in the model
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  1, 384,  32, 768, 1536, 6, 2.45f, 6)); // Q8_0, both geodesics as in the model
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  2, 384,  32, 768, 1536, 6, 2.45f, 2)); // Q8_0, 2 tokens
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536,  4, 384,  32, 768, 1536, 6, 2.45f));    // Q8_0, b1/b2 path
+    test_cases.emplace_back(new test_olala_moe(GGML_TYPE_Q8_0, 1536, 19, 384,  32, 768, 1536, 6, 2.45f));    // Q8_0, odd batch
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
@@ -11900,9 +11900,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
-    // Dragon factored TPA attention, decode at 8k and 32k cells
+    // Olala factored TPA attention, decode at 8k and 32k cells
     for (int n_kv : { 8192, 32768 }) {
-        test_cases.emplace_back(new test_dragon_tpa_attn(48, 12, 4, 128, n_kv, 1, 1, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_olala_tpa_attn(48, 12, 4, 128, n_kv, 1, 1, GGML_TYPE_F16));
     }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
@@ -12364,10 +12364,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // Dragon 7A1B MoE block at full size (256 experts)
+    // Olala 7A1B MoE block at full size (256 experts)
     for (ggml_type type_w : { GGML_TYPE_BF16, GGML_TYPE_Q8_0 }) {
         for (int n_tok : { 1, 4 }) {
-            test_cases.emplace_back(new test_dragon_moe(type_w, 1536, n_tok, 384, 256, 768, 1536, 6, 2.45f, 6));
+            test_cases.emplace_back(new test_olala_moe(type_w, 1536, n_tok, 384, 256, 768, 1536, 6, 2.45f, 6));
         }
     }
 

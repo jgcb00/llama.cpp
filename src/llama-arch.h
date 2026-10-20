@@ -164,7 +164,7 @@ enum llm_arch {
     LLM_ARCH_POCKETTTS,
     LLM_ARCH_MINIMAX_01,
     LLM_ARCH_HRM_TEXT,
-    LLM_ARCH_DRAGON,
+    LLM_ARCH_OLALA,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -500,16 +500,16 @@ enum llm_tensor {
     LLM_TENSOR_FFN_LATENT_UP,
     LLM_TENSOR_ATTN_Q_NORM,
     LLM_TENSOR_ATTN_K_NORM,
-    // Dragon DifferentialTensorProductAttentionV2
-    LLM_TENSOR_ATTN_WA_K,           // dragon: TPA factor A for K       (hidden -> n_kv * rank)
-    LLM_TENSOR_ATTN_WA_V,           // dragon: TPA factor A for V       (hidden -> n_kv * rank)
-    LLM_TENSOR_ATTN_WB_K,           // dragon: TPA factor B for K       (hidden -> rank * head_dim)
-    LLM_TENSOR_ATTN_WB_V,           // dragon: TPA factor B for V       (hidden -> rank * head_dim)
-    LLM_TENSOR_ATTN_SHIFT_K,        // dragon: token-shift α projection for K  (hidden -> n_kv)
-    LLM_TENSOR_ATTN_SHIFT_V,        // dragon: token-shift α projection for V  (hidden -> n_kv)
-    LLM_TENSOR_ATTN_LAMBDA,         // dragon: diff-V2 λ projection            (hidden -> n_noise)
-    LLM_TENSOR_ATTN_SOFTMAX_SCALER, // dragon: scalable-softmax per-head scaler (n_head,)
-    // Dragon geodesic residual (one pair per residual update; two per block)
+    // Olala DifferentialTensorProductAttentionV2
+    LLM_TENSOR_ATTN_WA_K,           // olala: TPA factor A for K       (hidden -> n_kv * rank)
+    LLM_TENSOR_ATTN_WA_V,           // olala: TPA factor A for V       (hidden -> n_kv * rank)
+    LLM_TENSOR_ATTN_WB_K,           // olala: TPA factor B for K       (hidden -> rank * head_dim)
+    LLM_TENSOR_ATTN_WB_V,           // olala: TPA factor B for V       (hidden -> rank * head_dim)
+    LLM_TENSOR_ATTN_SHIFT_K,        // olala: token-shift α projection for K  (hidden -> n_kv)
+    LLM_TENSOR_ATTN_SHIFT_V,        // olala: token-shift α projection for V  (hidden -> n_kv)
+    LLM_TENSOR_ATTN_LAMBDA,         // olala: diff-V2 λ projection            (hidden -> n_noise)
+    LLM_TENSOR_ATTN_SOFTMAX_SCALER, // olala: scalable-softmax per-head scaler (n_head,)
+    // Olala geodesic residual (one pair per residual update; two per block)
     LLM_TENSOR_GEODESIC_MIXER_SCALE,
     LLM_TENSOR_GEODESIC_MIXER_BIAS,
     LLM_TENSOR_GEODESIC_MLP_SCALE,
@@ -548,16 +548,16 @@ enum llm_tensor {
     LLM_TENSOR_SSM_OUT,
     LLM_TENSOR_SSM_BETA_ALPHA,      // qwen3next
     LLM_TENSOR_SSM_ALPHA,           // qwen3.5
-    // Dragon Mamba3-MIMO: in_proj is split into a "static" part (z,x,dt,A,trap)
+    // Olala Mamba3-MIMO: in_proj is split into a "static" part (z,x,dt,A,trap)
     // and a "dynamic" part (B,C,angles); per-head biases and MIMO projections.
-    LLM_TENSOR_SSM_IN_DYN,          // dragon: in_proj_dyn (B,C,angles)
-    LLM_TENSOR_SSM_B_BIAS,          // dragon: per-head bias on B before SSM
-    LLM_TENSOR_SSM_C_BIAS,          // dragon: per-head bias on C before SSM
-    LLM_TENSOR_SSM_DT_BIAS,         // dragon: per-head dt bias (additive before softplus)
-    LLM_TENSOR_SSM_MIMO_X,          // dragon: MIMO up-proj for x  (nheads, R, headdim)
-    LLM_TENSOR_SSM_MIMO_Z,          // dragon: MIMO up-proj for z  (nheads, R, headdim)
-    LLM_TENSOR_SSM_MIMO_O,          // dragon: MIMO down-proj for output (nheads, R, headdim)
-    LLM_TENSOR_SSM_M3_BIAS,         // dragon: packed GGML_OP_MAMBA3_MIMO constants (optional)
+    LLM_TENSOR_SSM_IN_DYN,          // olala: in_proj_dyn (B,C,angles)
+    LLM_TENSOR_SSM_B_BIAS,          // olala: per-head bias on B before SSM
+    LLM_TENSOR_SSM_C_BIAS,          // olala: per-head bias on C before SSM
+    LLM_TENSOR_SSM_DT_BIAS,         // olala: per-head dt bias (additive before softplus)
+    LLM_TENSOR_SSM_MIMO_X,          // olala: MIMO up-proj for x  (nheads, R, headdim)
+    LLM_TENSOR_SSM_MIMO_Z,          // olala: MIMO up-proj for z  (nheads, R, headdim)
+    LLM_TENSOR_SSM_MIMO_O,          // olala: MIMO down-proj for output (nheads, R, headdim)
+    LLM_TENSOR_SSM_M3_BIAS,         // olala: packed GGML_OP_MAMBA3_MIMO constants (optional)
     LLM_TENSOR_SSM_M3_MXZ,
     LLM_TENSOR_SSM_M3_NORMS,
     LLM_TENSOR_SSM_M3_MISC,

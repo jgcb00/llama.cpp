@@ -1105,7 +1105,7 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         return common_chat_params_init_llm_jp_harmony(tmpl, params);
     }
 
-    // Olala (Dragon 7A1B) - <|channel_start|>NAME<|content|>...<|channel_end|> channels with
+    // Olala 7A1B - <|channel_start|>NAME<|content|>...<|channel_end|> channels with
     // XML-wrapped JSON tool calls. Checked before GPT-OSS, whose markers are <|channel|>/<|message|>.
     if (src.find("<|channel_start|>") != std::string::npos &&
         src.find("<|channel_end|>") != std::string::npos &&

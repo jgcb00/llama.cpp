@@ -922,7 +922,7 @@ struct ggml_metal_device {
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
 
-    // zero-initialized scratch of the fused Dragon MoE kernel (barrier counters and atomic sums, reset by the kernel)
+    // zero-initialized scratch of the fused Olala MoE kernel (barrier counters and atomic sums, reset by the kernel)
     id<MTLBuffer> sync_buf;
 };
 
@@ -1144,7 +1144,7 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                 dev->props.has_simdgroup_mm = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
                 dev->props.has_unified_memory = dev->mtl_device.hasUnifiedMemory;
 
-                // GPU core count (the fused Dragon MoE kernel needs all its threadgroups resident; unknown: not used)
+                // GPU core count (the fused Olala MoE kernel needs all its threadgroups resident; unknown: not used)
                 dev->props.gpu_core_count = 0;
 #if TARGET_OS_OSX
                 {
@@ -1908,7 +1908,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                        ggml_is_contiguous_rows(op->src[7]) &&
                        smem <= dev->props.max_theadgroup_memory_size;
             }
-        case GGML_OP_DRAGON_MOE:
+        case GGML_OP_OLALA_MOE:
             {
                 if (!has_simdgroup_reduction || op->type != GGML_TYPE_F32) {
                     return false;
@@ -1955,31 +1955,31 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 const int64_t n_ff     = op->src[4]->ne[1];
                 const int64_t n_ff_sh  = op->src[7]->ne[1];
                 const int64_t k        = ggml_get_op_params_i32(op, 0);
-                const int     nsplit   = ggml_metal_op_dragon_moe_nsplit(op);
+                const int     nsplit   = ggml_metal_op_olala_moe_nsplit(op);
                 // rows are read 128 columns per simdgroup pass, up to DMOE_MAXCH (16) passes for n_embd / n_ff_sh and 8 for n_lat / n_ff
                 if (n_embd % 128 != 0 || n_ff_sh % 128 != 0 || n_lat % 128 != 0 || n_ff % 128 != 0 ||
                     n_embd > 2048 || n_ff_sh > 2048 || n_lat > 1024 || n_ff > 1024) {
                     return false;
                 }
                 for (int which = 0; which < 6; ++which) {
-                    if (which == 4 && !ggml_metal_op_dragon_moe_merged(op)) {
+                    if (which == 4 && !ggml_metal_op_olala_moe_merged(op)) {
                         continue;
                     }
-                    if (which == 5 && ggml_metal_op_dragon_moe_fused_ntg(op, dev->props.gpu_core_count) == 0) {
+                    if (which == 5 && ggml_metal_op_olala_moe_fused_ntg(op, dev->props.gpu_core_count) == 0) {
                         continue;
                     }
-                    if (ggml_metal_op_dragon_moe_smem(op, which) > dev->props.max_theadgroup_memory_size) {
+                    if (ggml_metal_op_olala_moe_smem(op, which) > dev->props.max_theadgroup_memory_size) {
                         return false;
                     }
                 }
                 // small batches: rows of [W_ld | W_r] 8 per threadgroup in kernel a
-                if (ggml_metal_op_dragon_moe_sh_split(op) && (n_lat + n_expert) % 8 != 0) {
+                if (ggml_metal_op_olala_moe_sh_split(op) && (n_lat + n_expert) % 8 != 0) {
                     return false;
                 }
                 return n_expert >= 1 && n_expert <= 256 && k >= 1 && k <= n_expert &&
                        n_ff % nsplit == 0 && n_lat % nsplit == 0 && (n_ff/nsplit) % 8 == 0;
             }
-        case GGML_OP_DRAGON_MMV:
+        case GGML_OP_OLALA_MMV:
             {
                 if (!has_simdgroup_reduction || op->type != GGML_TYPE_F32 || op->src[0]->type != GGML_TYPE_F32) {
                     return false;
@@ -1999,7 +1999,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 }
                 return n > 2048 || 4*n*sizeof(float) <= dev->props.max_theadgroup_memory_size;
             }
-        case GGML_OP_DRAGON_TPA_PREP:
+        case GGML_OP_OLALA_TPA_PREP:
             {
                 if (!has_simdgroup_reduction || op->type != GGML_TYPE_F32) {
                     return false;
@@ -2008,7 +2008,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 return Dh <= 256 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) &&
                        (2*Dh + 8)*sizeof(float) <= dev->props.max_theadgroup_memory_size;
             }
-        case GGML_OP_DRAGON_TPA_ATTN:
+        case GGML_OP_OLALA_TPA_ATTN:
             {
                 const struct ggml_tensor * q = op->src[0];
                 const int64_t Dh = q->ne[0];
@@ -2017,16 +2017,16 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 const int64_t Hn = ggml_get_op_params_i32(op, 0);
                 return has_simdgroup_reduction && has_simdgroup_mm && (Dh == 64 || Dh == 128) && H/Hn <= 8 && Hn <= 16 && R <= 8 &&
                        (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
-                       ggml_metal_op_dragon_tpa_attn_smem(op, 1) <= dev->props.max_theadgroup_memory_size;
+                       ggml_metal_op_olala_tpa_attn_smem(op, 1) <= dev->props.max_theadgroup_memory_size;
             }
-        case GGML_OP_DRAGON_TPA_EXPAND:
+        case GGML_OP_OLALA_TPA_EXPAND:
             {
                 const int64_t Dh = op->ne[0];
                 const int64_t Hn = op->ne[1];
                 return Dh % 4 == 0 && ggml_is_contiguous(op) && Hn*Dh/4 <= 1024 &&
                        (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32);
             }
-        case GGML_OP_DRAGON_DIFF_GATE:
+        case GGML_OP_OLALA_DIFF_GATE:
             return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
                    ggml_is_contiguous_rows(op->src[1]) && ggml_is_contiguous_rows(op->src[2]);
         case GGML_OP_GEODESIC:
