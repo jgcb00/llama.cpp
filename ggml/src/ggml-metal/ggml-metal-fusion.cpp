@@ -269,7 +269,7 @@ static bool ggml_metal_fusion_check_gdn_cache(
     return true;
 }
 
-// DRAGON_TPA_PREP + CPY (pre-shift last K/V -> recurrent cache) + SET_ROWS (K -> KV cache) + SET_ROWS (V -> KV cache),
+// OLALA_TPA_PREP + CPY (pre-shift last K/V -> recurrent cache) + SET_ROWS (K -> KV cache) + SET_ROWS (V -> KV cache),
 // decode only (one token per sequence: the kernel reads the previous K/V of a sequence from the recurrent cache row it
 // then overwrites, in the same thread)
 static bool ggml_metal_fusion_check_tpa_prep_cache(
@@ -286,6 +286,10 @@ static bool ggml_metal_fusion_check_tpa_prep_cache(
 
     const ggml_tensor * prep = nodes[0];
     const ggml_tensor * cpy  = nodes[1];
+
+    if (ggml_get_op_params_i32(prep, 9) != 0) {
+        return false; // factored rows: written by SET_ROWS
+    }
 
     const int64_t H      = ggml_get_op_params_i32(prep, 0);
     const int64_t Hn     = ggml_get_op_params_i32(prep, 1);
@@ -793,7 +797,7 @@ static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_O
 static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 
 static const std::vector<ggml_op> ops_mamba3_cache = { GGML_OP_MAMBA3_MIMO, GGML_OP_CPY };
-static const std::vector<ggml_op> ops_tpa_prep_cache = { GGML_OP_DRAGON_TPA_PREP, GGML_OP_CPY, GGML_OP_SET_ROWS, GGML_OP_SET_ROWS };
+static const std::vector<ggml_op> ops_tpa_prep_cache = { GGML_OP_OLALA_TPA_PREP, GGML_OP_CPY, GGML_OP_SET_ROWS, GGML_OP_SET_ROWS };
 
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
 

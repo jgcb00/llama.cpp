@@ -346,8 +346,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_step35(params);
         case LLM_ARCH_SPARK2_5:
             return new llama_model_spark2_5(params);
-        case LLM_ARCH_DRAGON:
-            return new llama_model_dragon(params);
+        case LLM_ARCH_OLALA:
+            return new llama_model_olala(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -2360,6 +2360,55 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+bool llama_model::tpa_cache_factored(llama_tpa_cache_type type) const {
+    if (arch != LLM_ARCH_OLALA || hparams.olala_tpa_rank == 0) {
+        return false;
+    }
+    switch (type) {
+        case LLAMA_TPA_CACHE_TYPE_FACTORED:
+            return true;
+        case LLAMA_TPA_CACHE_TYPE_FULL:
+            return false;
+        case LLAMA_TPA_CACHE_TYPE_AUTO:
+            break;
+    }
+    // auto: factored when every attention layer is on a device with matrix units (Metal: TENSOR feature, M5 / A19)
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (hparams.is_recr(il)) {
+            continue;
+        }
+        ggml_backend_dev_t dev = dev_layer(il);
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto * get_features = reg ? (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features") : nullptr;
+        bool tensor = false;
+        for (ggml_backend_feature * f = get_features ? get_features(reg) : nullptr; f && f->name; f++) {
+            tensor = tensor || (strcmp(f->name, "TENSOR") == 0 && strcmp(f->value, "1") == 0);
+        }
+        if (!tensor) {
+            return false;
+        }
+    }
+    return true;
+}
+
+const llama_hparams & llama_model::hparams_tpa_factored() const {
+    std::call_once(hparams_tpa_once, [this] {
+        // the KV cache sizes its rows as n_embd_head * n_head_kv: factor rows padded to a multiple of n_head_kv
+        // (ggml_olala_tpa_row_k / _v)
+        const int Hn = (int) hparams.olala_n_noise_heads;
+        const int R  = (int) hparams.olala_tpa_rank;
+        const int Dh = (int) hparams.n_embd_head_k_full;
+        hparams_tpa = std::make_unique<llama_hparams>(hparams);
+        hparams_tpa->n_embd_head_k_full = (uint32_t) (ggml_olala_tpa_row_k(Hn, R, Dh)/Hn);
+        hparams_tpa->n_embd_head_v_full = (uint32_t) (ggml_olala_tpa_row_v(Hn, R, Dh)/Hn);
+        GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE);
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            GGML_ASSERT(hparams.is_recr(il) || hparams.n_head_kv(il) == (uint32_t) Hn);
+        }
+    });
+    return *hparams_tpa;
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
@@ -2729,7 +2778,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 filter_idx = [&](uint32_t il) { return il >= hparams.n_layer(); };
                             }
                         }
-                    } else if (arch == LLM_ARCH_DRAGON) {
+                    } else if (arch == LLM_ARCH_OLALA) {
                         // V-layers (= !is_recurrent) need both attention K/V AND a
                         // recurrent slot for token-shift K_prev/V_prev. M-layers
                         // need only a recurrent slot.
@@ -2779,11 +2828,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_recr       */ std::move(filter_recr),
                             /* filter_idx        */ std::move(filter_idx));
                     } else {
+                        // TPA factored cache (Olala): rows of TPA factors, never transposed (read by GGML_OP_OLALA_TPA_ATTN)
+                        const bool tpa_factored = arch == LLM_ARCH_OLALA && params.tpa_factored;
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
-                            /* attn_v_trans      */ !cparams.flash_attn,
+                            /* attn_v_trans      */ !cparams.flash_attn && !tpa_factored,
                             /* attn_kv_size      */ cparams.n_ctx_seq,
                             /* attn_n_pad        */ 1,
                             /* attn_n_swa        */ hparams.n_swa,
@@ -2796,7 +2847,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* attn_hparams      */ tpa_factored ? &hparams_tpa_factored() : nullptr);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;
@@ -3073,7 +3125,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_GLM5_NEXT:
-        case LLM_ARCH_DRAGON:
+        case LLM_ARCH_OLALA:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values

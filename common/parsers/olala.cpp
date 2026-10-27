@@ -1,6 +1,6 @@
 #include "parsers.h"
 
-// Olala (Dragon 7A1B) - named channels with XML-wrapped JSON tool calls:
+// Olala 7A1B - named channels with XML-wrapped JSON tool calls:
 //   <|im_start|>assistant
 //     <|channel_start|>analysis<|content|>{reasoning}<|channel_end|>
 //     <|channel_start|>final<|content|>{answer}<|channel_end|>

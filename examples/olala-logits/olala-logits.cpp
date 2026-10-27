@@ -2,14 +2,14 @@
 // a binary file. Used for numerical comparison against a reference (e.g. HF).
 //
 // Usage:
-//   dragon-logits -m model.gguf -o out.bin [-t threads] "prompt text"
+//   olala-logits -m model.gguf -o out.bin [-t threads] "prompt text"
 //
 // Output file format (little-endian):
 //   int32  n_tokens
 //   int32  n_vocab
 //   float  logits[n_tokens * n_vocab]
 //
-// If DRAGON_DUMP_DIR=<dir> is set in the environment, the Dragon graph also
+// If OLALA_DUMP_DIR=<dir> is set in the environment, the Olala graph also
 // writes per-block hidden states to <dir>/block_XX_in.bin for debugging.
 
 #include "llama.h"
@@ -26,6 +26,7 @@ int main(int argc, char ** argv) {
     std::string prompt    = "Hello world";
     int n_threads     = -1;
     int n_gpu_layers  = 0;
+    bool f32_cache    = false;
 
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) {
@@ -36,6 +37,8 @@ int main(int argc, char ** argv) {
             n_threads = atoi(argv[++i]);
         } else if ((!strcmp(argv[i], "-ngl") || !strcmp(argv[i], "--n-gpu-layers")) && i + 1 < argc) {
             n_gpu_layers = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--f32-cache")) {
+            f32_cache = true;
         } else if (!strcmp(argv[i], "-p") && i + 1 < argc) {
             // Consume only the next arg as the prompt; trailing flags (-n, -ngl, ...)
             // still get parsed by the outer loop.
@@ -55,7 +58,7 @@ int main(int argc, char ** argv) {
     }
 
     if (model_path.empty()) {
-        fprintf(stderr, "usage: %s -m model.gguf -o out.bin [-t threads] [-ngl N] \"prompt\"\n", argv[0]);
+        fprintf(stderr, "usage: %s -m model.gguf -o out.bin [-t threads] [-ngl N] [--f32-cache] \"prompt\"\n", argv[0]);
         return 1;
     }
 
@@ -87,6 +90,10 @@ int main(int argc, char ** argv) {
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx     = n_tokens;
     cp.n_batch   = n_tokens;
+    if (f32_cache) {
+        cp.type_k = GGML_TYPE_F32;
+        cp.type_v = GGML_TYPE_F32;
+    }
     cp.no_perf   = true;
     if (n_threads > 0) {
         cp.n_threads       = n_threads;

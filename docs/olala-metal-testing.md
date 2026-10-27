@@ -1,4 +1,4 @@
-# Dragon / Olala 7A1B on Apple Metal: build & test checklist
+# Olala 7A1B on Apple Metal: build & test checklist
 
 The Metal kernels for `GGML_OP_MAMBA3_MIMO` and `GGML_OP_GEODESIC`
 (`ggml/src/ggml-metal/kernels/mamba3.metal`) were written on Linux without a Metal
@@ -53,7 +53,7 @@ the start of every run.) Expected:
 10/10 `MAMBA3_MIMO`, 4/4 `MAMBA3_MIMO_CACHE_FUSION`, 4/4 `GEODESIC` OK. The cases
 cover decode (T = 1), batched decode, short prefill (serial kernel, T < 64), chunked
 prefill (T >= 64, incl. a partial tail chunk and multi-sequence), the register-state
-fast path (Dragon dims 128/4/64) and the generic path (other dims), and the
+fast path (Olala dims 128/4/64) and the generic path (other dims), and the
 MAMBA3_MIMO + CPY cache fusion.
 
 If `MAMBA3_MIMO_CACHE_FUSION` fails while `MAMBA3_MIMO` passes, rerun it with
@@ -65,7 +65,7 @@ Per-op timings (useful for tuning):
 ./build/bin/test-backend-ops perf -b MTL0 -o MAMBA3_MIMO,GEODESIC 2>&1 | tee /tmp/perf-ops.txt
 ```
 
-Optional broader check of the other ops the Dragon graph uses (takes several minutes):
+Optional broader check of the other ops the Olala graph uses (takes several minutes):
 
 ```sh
 ./build/bin/test-backend-ops -b MTL0 -o MUL_MAT,MUL_MAT_ID,FLASH_ATTN_EXT,ARGSORT,GET_ROWS,SET_ROWS,L2_NORM,RMS_NORM,CONCAT 2>&1 | tail -5
@@ -73,7 +73,7 @@ Optional broader check of the other ops the Dragon graph uses (takes several min
 
 ## 4. Full model
 
-Greedy completion, CPU reference vs Metal. `DRAGON_PORTABLE=1` makes the CPU run use the
+Greedy completion, CPU reference vs Metal. `OLALA_PORTABLE=1` makes the CPU run use the
 exact graph the GPU runs (verified on Linux: token-identical to the default CPU graph for
 this prompt):
 
@@ -82,7 +82,7 @@ M=olala-dpo99k-bf16.gguf
 P="The history of the Roman Empire is a long and complex story that begins with"
 
 # CPU reference (no GPU device at all)
-DRAGON_PORTABLE=1 ./build/bin/llama-completion -m $M --device none -p "$P" -n 64 --temp 0 --seed 1 \
+OLALA_PORTABLE=1 ./build/bin/llama-completion -m $M --device none -p "$P" -n 64 --temp 0 --seed 1 \
     -no-cnv -fa 1 -fit off -c 4096 --no-display-prompt > /tmp/cpu.txt
 
 # Metal, everything offloaded; GGML_METAL_FUSION_DEBUG=1 prints fusion counts at exit
@@ -98,7 +98,7 @@ with a long prompt (>= 64 tokens) for the chunked prefill path:
 
 ```sh
 python3 -c "print('In 1820 the town council met to discuss the new bridge. ' * 30)" > /tmp/long.txt
-DRAGON_PORTABLE=1 ./build/bin/llama-completion -m $M --device none -f /tmp/long.txt -n 64 --temp 0 --seed 1 \
+OLALA_PORTABLE=1 ./build/bin/llama-completion -m $M --device none -f /tmp/long.txt -n 64 --temp 0 --seed 1 \
     -no-cnv -fa 1 -fit off -c 4096 --no-display-prompt > /tmp/cpu-long.txt
 ./build/bin/llama-completion -m $M -ngl 99 -f /tmp/long.txt -n 64 --temp 0 --seed 1 \
     -no-cnv -fa 1 -fit off -c 4096 --no-display-prompt > /tmp/metal-long.txt
@@ -129,7 +129,7 @@ Benchmarks:
   than on M3/M4.
 - Quantized GGUFs: decode matmuls (mat-vec) keep f32 activations; prefill matmuls
   (mat-mat, > 8 tokens) convert the activations to **f16** for K-quants/q8_0, so
-  activations above 65504 would overflow. Dragon has large outlier activations (the
+  activations above 65504 would overflow. Olala has large outlier activations (the
   same root cause as the CUDA quant failures); if quantized models produce garbage on
   long prompts but not on short ones, that is the likely cause, not the new kernels.
   Test bf16 first.

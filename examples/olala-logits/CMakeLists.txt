@@ -1,5 +1,5 @@
-set(TARGET dragon-generate)
-add_executable(${TARGET} dragon-generate.cpp)
+set(TARGET olala-logits)
+add_executable(${TARGET} olala-logits.cpp)
 install(TARGETS ${TARGET} RUNTIME)
 target_link_libraries(${TARGET} PRIVATE llama ggml ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(${TARGET} PRIVATE cxx_std_17)

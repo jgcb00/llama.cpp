@@ -2,7 +2,7 @@
 
 Step-by-step: get the code, make the GGUF files once, then build and run on
 **CPU (x86 / ARM)**, **Mac (Apple Silicon, Metal)** or **NVIDIA (CUDA)**.
-Background, measurements and debug switches: [dragon.md](dragon.md).
+Background, measurements and debug switches: [olala.md](olala.md).
 
 | hardware | weights | status |
 |---|---|---|
@@ -12,7 +12,7 @@ Background, measurements and debug switches: [dragon.md](dragon.md).
 | Mac, Metal | **bf16** | validated (M5 Pro 24 GB, macOS 26.4): pp512 ≈ 2070 t/s, tg128 ≈ 70 t/s |
 | NVIDIA, CUDA | **bf16** | validated (H100) |
 
-Quantized weights on GPUs (CUDA, Metal) can produce NaN/garbage: Dragon's outlier
+Quantized weights on GPUs (CUDA, Metal) can produce NaN/garbage: Olala's outlier
 activations overflow the fp16 activation scales those backends use. Use bf16 there.
 
 ---
@@ -46,7 +46,7 @@ uses the token saved by `hf auth login` (or `HF_TOKEN`). Two caveats: `--remote`
 
 `olala-bf16.gguf` (12.7 GiB) is the GPU file. For CPU, quantize it — **always with the
 safe overrides** (plain llama-quantize recipes silently produce NaN-prone files on this
-model, see [dragon.md §3](dragon.md)):
+model, see [olala.md §3](olala.md)):
 
 ```sh
 SAFE="--tensor-type ffn_latent_up=bf16 --tensor-type ffn_up_exps=q8_0"
@@ -81,7 +81,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j 16
 ```
 
-The fast Dragon kernels are ggml-cpu ops with AVX-512, AVX2 and NEON paths. For a binary
+The fast Olala kernels are ggml-cpu ops with AVX-512, AVX2 and NEON paths. For a binary
 that runs on several CPU generations, add `-DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON`
 (runtime ISA dispatch).
 
@@ -126,13 +126,13 @@ q5_k_m, 0.7 GiB small) plus ≈ 0.3 GiB of buffers stays in RAM.
 - Output is identical to the normal fused CPU path (greedy, token for token).
 - Experts that were released stay in the OS page cache, which the kernel gives back
   under memory pressure, so the mode adapts to the RAM that is free. To keep the page
-  cache out of it too (strict footprint, slower), set `DRAGON_EXPERT_DROP_CACHE=1`.
-  `DRAGON_EXPERT_CACHE_MB=N` keeps the N MiB of most recently used experts mapped.
+  cache out of it too (strict footprint, slower), set `OLALA_EXPERT_DROP_CACHE=1`.
+  `OLALA_EXPERT_CACHE_MB=N` keeps the N MiB of most recently used experts mapped.
 - Linux, Windows and macOS all release the experts after use (Linux `madvise`,
   Windows `VirtualUnlock` = out of the working set, macOS `madvise`), and all read
   them ahead in large requests (`madvise` / `PrefetchVirtualMemory`). Linux also maps
   them in one call per thread; on Windows and macOS this is page faults, a bit slower.
-  The CI test `test-dragon-moe-paging` checks the release on Linux and Windows
+  The CI test `test-olala-moe-paging` checks the release on Linux and Windows
   (macOS does not count clean file-backed pages in a process's memory anyway).
 - Windows laptop: in a terminal from the "x64 Native Tools" prompt (or any shell
   with Visual Studio 2022 + CMake),
@@ -182,7 +182,7 @@ Validated on an Apple M5 Pro (24 GB, macOS 26.4.1, PR #1): op tests 18/18, CPU-v
 greedy output identical on 15- and 481-token prompts, pp512 ≈ 2070 t/s, pp2048 ≈ 2250 t/s,
 tg128 ≈ 70 t/s (49 t/s at 32k context), 8 users × 128 tokens ≈ 290 t/s total. On a new
 machine or macOS version it is still worth running the checklist in
-[dragon-metal-testing.md](dragon-metal-testing.md) (`test-backend-ops -b MTL0`,
+[olala-metal-testing.md](olala-metal-testing.md) (`test-backend-ops -b MTL0`,
 CPU-vs-Metal greedy diff) before relying on the output.
 
 Then:
@@ -191,6 +191,29 @@ Then:
 ./build/bin/llama-bench  -m olala-bf16.gguf -ngl 99 -fa 1 -p 512 -n 128
 ./build/bin/llama-server -m olala-bf16.gguf -ngl 99 -fa 1 -c 32768 -np 4 --port 8080
 ```
+
+**Attention KV cache layout (chosen automatically, no option).** The 7 attention layers can keep
+either the expanded K/V (*full*) or only the TPA factors of each token (*factored*, 2.6x less KV
+memory, more attention compute). The choice is made per GPU:
+
+- **M1 to M4: full.** On these chips the factored cache is slower, so full is worth its extra
+  memory. Measured on M3 Ultra, Q8_0, one sequence:
+
+  | | full | factored |
+  |---|---|---|
+  | decode, empty / 8k / 32k context | 194 / 168 / 126 t/s | 178 / 145 / 100 t/s |
+  | prefill pp512, empty / 8k / 32k context | 3393 / 2539 / 1358 t/s | 3524 / 2575 / 1270 t/s |
+  | KV cache at 32k context, per sequence | 1344 MiB | 509 MiB |
+
+  The factored cache also needs ~180 MiB more compute buffer, shared by all the sequences.
+  So full costs ~650 MiB more for one sequence at 32k, ~835 MiB more for each additional one,
+  and twice that at 64k.
+- **M5 / A19 (GPUs with the Metal tensor API): factored.** Not measured yet.
+- **Other backends: full** (the factored kernels exist only for Metal and CPU).
+
+Applications that link libllama can force the layout with `llama_context_params.tpa_cache_type`
+(`LLAMA_TPA_CACHE_TYPE_FULL` / `_FACTORED`); perplexity is the same either way (wikitext-2, 8
+chunks: 12.90 full, 12.88-12.89 factored).
 
 If Metal fails or the machine has < 16 GB: run on the Mac CPU instead with a quantized file
 — same build, add `-ngl 0` (or `--device none`) and use `olala-q5_k_m.gguf`
@@ -207,7 +230,7 @@ cmake --build build-cuda -j 16
 #   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.x/bin/nvcc -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-12
 ```
 
-Check the Dragon ops against the CPU reference, then benchmark:
+Check the Olala ops against the CPU reference, then benchmark:
 
 ```sh
 ./build-cuda/bin/test-backend-ops -o MAMBA3_MIMO
@@ -247,7 +270,7 @@ curl -s http://localhost:8080/v1/chat/completions -H 'Content-Type: application/
 ```
 
 - `reasoning_effort`: `none`, `low`, `medium`, `high` (passed to the template).
-- The recurrent (Mamba) state is kept in f32 — do not set `DRAGON_BF16_STATE`
+- The recurrent (Mamba) state is kept in f32 — do not set `OLALA_BF16_STATE`
   (long generations degrade into repetition loops with a bf16 state).
 - Prompts longer than `-c` fail (recurrent models cannot context-shift): size `-c` for
   your longest conversation × `-np`.
@@ -258,7 +281,7 @@ curl -s http://localhost:8080/v1/chat/completions -H 'Content-Type: application/
 |---|---|
 | NaN / `?????` / empty output with a quantized GGUF on GPU | fp16 activation-scale overflow; use bf16 on GPUs |
 | NaN with a quantized GGUF on CPU | file made without the `$SAFE` overrides; re-quantize |
-| `unknown model architecture: 'dragon'` | binary not built from `olala-master` |
+| `unknown model architecture: 'olala'` | binary not built from `olala-master` |
 | no `reasoning_content` / raw `<\|channel_start\|>` in output | GGUF converted without `chat_template.jinja`; reconvert |
 | CPU much slower than the table | too many threads (`-t` > physical cores, or machine busy), `-fa` off, or repack on (add `-nr` / `--repack 0`) |
 | Mac: `failed to build 'mamba3' library` | Metal shader compile error — send the log (see Metal checklist) |

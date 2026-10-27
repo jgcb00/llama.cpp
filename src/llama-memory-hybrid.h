@@ -39,7 +39,9 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                            /* hparams of the attention cache layout (null: the model's) */
+    const llama_hparams   * attn_hparams = nullptr);
 
     ~llama_memory_hybrid() = default;
 

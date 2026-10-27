@@ -52,21 +52,31 @@ void ggml_graph_optimize(struct ggml_cgraph * gf);
 bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op, size_t max_tg_mem);
 bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
 
-// GGML_OP_DRAGON_MMV: x staged in threadgroup memory (larger batches) or read from device memory
-bool ggml_metal_op_dragon_mmv_staged(const struct ggml_tensor * op);
+// GGML_OP_OLALA_MMV: x staged in threadgroup memory (larger batches) or read from device memory
+bool ggml_metal_op_olala_mmv_staged(const struct ggml_tensor * op);
 
-// GGML_OP_DRAGON_MOE: FF slices per expert (up to 32), each slice a multiple of 8 columns
-int ggml_metal_op_dragon_moe_nsplit (const struct ggml_tensor * op);
-int ggml_metal_op_dragon_moe_nsplit2(const struct ggml_tensor * op);
+// GGML_OP_OLALA_MOE: FF slices per expert (up to 32), each slice a multiple of 8 columns
+int ggml_metal_op_olala_moe_nsplit (const struct ggml_tensor * op);
+int ggml_metal_op_olala_moe_nsplit2(const struct ggml_tensor * op);
 // threadgroup memory of kernel `which` (0: a, 1: b1, 2: b2, 3: c), keep in sync with kernels/mamba3.metal
-size_t ggml_metal_op_dragon_moe_smem(const struct ggml_tensor * op, int which);
+size_t ggml_metal_op_olala_moe_smem(const struct ggml_tensor * op, int which);
 // shared expert off the critical path (in b1/b2) for batches up to 2 tokens
-bool ggml_metal_op_dragon_moe_sh_split(const struct ggml_tensor * op);
-int  ggml_metal_op_dragon_moe_msplit (const struct ggml_tensor * op);
-int  ggml_metal_op_dragon_moe_sh_rows(const struct ggml_tensor * op);
-bool ggml_metal_op_dragon_moe_merged (const struct ggml_tensor * op);
-int  ggml_metal_op_dragon_moe_fused_ntg(const struct ggml_tensor * op, int gpu_cores);
+bool ggml_metal_op_olala_moe_sh_split(const struct ggml_tensor * op);
+int  ggml_metal_op_olala_moe_msplit (const struct ggml_tensor * op);
+int  ggml_metal_op_olala_moe_sh_rows(const struct ggml_tensor * op);
+bool ggml_metal_op_olala_moe_merged (const struct ggml_tensor * op);
+int  ggml_metal_op_olala_moe_fused_ntg(const struct ggml_tensor * op, int gpu_cores);
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
+
+// GGML_OP_OLALA_TPA_ATTN: cells per block, cells per chunk and chunks (one threadgroup per chunk and token), and the
+// threadgroup memory of kernel_olala_tpa_attn
+struct ggml_metal_olala_tpa_attn_split {
+    int nc;
+    int chunk;
+    int n_chunk;
+};
+struct ggml_metal_olala_tpa_attn_split ggml_metal_op_olala_tpa_attn_split(const struct ggml_tensor * op, int gpu_cores);
+size_t ggml_metal_op_olala_tpa_attn_smem(const struct ggml_tensor * op, int nc);
 
 #ifdef __cplusplus
 }

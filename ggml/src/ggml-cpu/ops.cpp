@@ -8,7 +8,7 @@
 #include "quants.h"
 #include "unary-ops.h"
 #include "vec.h"
-#include "dragon-pager.h"
+#include "olala-pager.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -12532,16 +12532,16 @@ void ggml_compute_forward_dsv4_hc_post(
 
 // read prefetch hint, low temporal locality (MSVC has no __builtin_prefetch)
 #if defined(__GNUC__) || defined(__clang__)
-#define DRAGON_PREFETCH_L2(p) __builtin_prefetch((p), 0, 1)
+#define OLALA_PREFETCH_L2(p) __builtin_prefetch((p), 0, 1)
 #elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
-#define DRAGON_PREFETCH_L2(p) _mm_prefetch((const char *) (p), _MM_HINT_T1)
+#define OLALA_PREFETCH_L2(p) _mm_prefetch((const char *) (p), _MM_HINT_T1)
 #else
-#define DRAGON_PREFETCH_L2(p) ((void) (p))
+#define OLALA_PREFETCH_L2(p) ((void) (p))
 #endif
 
 // ggml_compute_forward_mamba3_mimo
 //
-// fused Dragon Mamba3-MIMO mixer core (see ggml.h). Work unit = one head; a
+// fused Olala Mamba3-MIMO mixer core (see ggml.h). Work unit = one head; a
 // thread owns a fixed set of heads for ALL sequences of the batch, serial over
 // tokens, so the per-head state is updated in place in its destination row:
 //   - result mode:   the state comes from src[7] (gathered rows) and the new
@@ -13226,13 +13226,13 @@ static void ggml_compute_forward_mamba3_mimo_f32(
                     if (tok + 2 < tok1) {
                         const char * pn = (const char *) pstat->data + (tok + 2)*pstat->nb[1] + h*(2*D_v + 3)*sizeof(float);
                         for (size_t off = 0; off < (2*D_v + 3)*sizeof(float); off += 64) {
-                            DRAGON_PREFETCH_L2(pn + off);
+                            OLALA_PREFETCH_L2(pn + off);
                         }
                     }
                     if (tok + 1 < tok1) {
                         const char * bn = (const char *) (shared + (tok + 1)*prep_stride);
                         for (size_t off = 0; off < (2*R*D_qk + n_ang)*sizeof(float); off += 64) {
-                            DRAGON_PREFETCH_L2(bn + off);
+                            OLALA_PREFETCH_L2(bn + off);
                         }
                     }
                     const float gamma = trap*dt;
@@ -13397,9 +13397,9 @@ void ggml_compute_forward_geodesic(
 }
 
 
-// ggml_compute_forward_dragon_moe
+// ggml_compute_forward_olala_moe
 //
-// Fused Dragon latent-MoE block for small token counts (decode). Four stages
+// Fused Olala latent-MoE block for small token counts (decode). Four stages
 // separated by three barriers instead of ~14 graph nodes:
 //   A: lat = W_ld x, logits = W_r x, ush = W_us x          (rows split over threads)
 //   B: sel/weights (every thread, redundant); up = W_up[sel] lat; dsh = W_ds relu2(ush)
@@ -13418,16 +13418,16 @@ void ggml_compute_forward_geodesic(
 // faults would read 4 KiB at a time), then maps them in one call before use
 // (Linux MADV_POPULATE_READ instead of one fault per page). After the last stage
 // that reads them, the slabs are unmapped from the process except the most
-// recently used ones that fit in the budget (see dragon-pager.cpp for what
+// recently used ones that fit in the budget (see olala-pager.cpp for what
 // happens to the page cache; Windows: PrefetchVirtualMemory + VirtualUnlock).
 // Only non-destructive calls are used.
 
-struct dragon_moe_dims {
+struct olala_moe_dims {
     int64_t n_embd, n_tok, n_lat, n_expert, n_ff, n_ff_sh, k;
 };
 
-static dragon_moe_dims dragon_moe_get_dims(const ggml_tensor * op) {
-    dragon_moe_dims d;
+static olala_moe_dims olala_moe_get_dims(const ggml_tensor * op) {
+    olala_moe_dims d;
     d.n_embd   = op->src[0]->ne[0];
     d.n_tok    = op->src[0]->ne[1];
     d.n_lat    = op->src[1]->ne[1];
@@ -13439,22 +13439,22 @@ static dragon_moe_dims dragon_moe_get_dims(const ggml_tensor * op) {
 }
 
 // padded size of one quantized activation row for weights of type wtype
-static inline size_t dragon_moe_qrow(enum ggml_type wtype, int64_t n) {
+static inline size_t olala_moe_qrow(enum ggml_type wtype, int64_t n) {
     const enum ggml_type vdt = ggml_get_type_traits_cpu(wtype)->vec_dot_type;
     return GGML_PAD(ggml_row_size(vdt, n), 64);
 }
 
-struct dragon_moe_ws {
+struct olala_moe_ws {
     // shared (bytes from the start of the work buffer)
     size_t lat, logits, ush, up, dsh, down, ev_ptr, ev_size, ev_n, s_ptr, s_size, s_copy, c_slab, c_rd, c_n, shared;
     // per-thread (bytes from the start of the thread's scratch)
     size_t xq_ld, xq_r, xq_sh, latq, upq, ushq, routedq, routed, tmp, sel, wsel, scores, taken, order, cnt, per_thread;
 };
 
-static dragon_moe_ws dragon_moe_layout(const ggml_tensor * op) {
-    const dragon_moe_dims d = dragon_moe_get_dims(op);
+static olala_moe_ws olala_moe_layout(const ggml_tensor * op) {
+    const olala_moe_dims d = olala_moe_get_dims(op);
     const int64_t T = d.n_tok, k = d.k;
-    dragon_moe_ws w;
+    olala_moe_ws w;
     size_t off = 0;
     auto take = [&](size_t bytes) { const size_t o = off; off += GGML_PAD(bytes, 64); return o; };
     w.lat    = take(T*d.n_lat*sizeof(float));
@@ -13470,17 +13470,17 @@ static dragon_moe_ws dragon_moe_layout(const ggml_tensor * op) {
     w.s_size  = take(2*d.n_expert*sizeof(size_t));
     w.s_copy  = take(2*d.n_expert*sizeof(const char *));          // expert cache: their copies
     w.c_slab  = take(2*d.n_expert*sizeof(const char *));          // expert cache: copy of each up/down slab
-    w.c_rd    = take(2*d.n_expert*sizeof(dragon_pager_read));     // expert cache: reads to do
+    w.c_rd    = take(2*d.n_expert*sizeof(olala_pager_read));     // expert cache: reads to do
     w.c_n     = take(sizeof(int32_t));                            // number of reads, -1 = cache not usable
     w.shared = off;
     off = 0;
-    w.xq_ld   = take(T*dragon_moe_qrow(op->src[1]->type, d.n_embd));
-    w.xq_r    = take(T*dragon_moe_qrow(op->src[2]->type, d.n_embd));
-    w.xq_sh   = take(T*dragon_moe_qrow(op->src[7]->type, d.n_embd));
-    w.latq    = take(T*dragon_moe_qrow(op->src[4]->type, d.n_lat));
-    w.upq     = take(T*k*dragon_moe_qrow(op->src[5]->type, d.n_ff));
-    w.ushq    = take(T*dragon_moe_qrow(op->src[8]->type, d.n_ff_sh));
-    w.routedq = take(T*dragon_moe_qrow(op->src[6]->type, d.n_lat));
+    w.xq_ld   = take(T*olala_moe_qrow(op->src[1]->type, d.n_embd));
+    w.xq_r    = take(T*olala_moe_qrow(op->src[2]->type, d.n_embd));
+    w.xq_sh   = take(T*olala_moe_qrow(op->src[7]->type, d.n_embd));
+    w.latq    = take(T*olala_moe_qrow(op->src[4]->type, d.n_lat));
+    w.upq     = take(T*k*olala_moe_qrow(op->src[5]->type, d.n_ff));
+    w.ushq    = take(T*olala_moe_qrow(op->src[8]->type, d.n_ff_sh));
+    w.routedq = take(T*olala_moe_qrow(op->src[6]->type, d.n_lat));
     w.routed  = take(T*d.n_lat*sizeof(float));
     w.tmp     = take(std::max({d.n_ff, d.n_ff_sh, d.n_lat})*sizeof(float));
     w.sel     = take(T*k*sizeof(int32_t));
@@ -13493,12 +13493,12 @@ static dragon_moe_ws dragon_moe_layout(const ggml_tensor * op) {
     return w;
 }
 
-size_t ggml_dragon_moe_work_size(const ggml_tensor * op, int n_threads) {
-    const dragon_moe_ws w = dragon_moe_layout(op);
+size_t ggml_olala_moe_work_size(const ggml_tensor * op, int n_threads) {
+    const olala_moe_ws w = olala_moe_layout(op);
     return w.shared + (size_t) n_threads*w.per_thread + 64;
 }
 
-static void dragon_moe_quantize(enum ggml_type wtype, const float * src, void * dst, int64_t n) {
+static void olala_moe_quantize(enum ggml_type wtype, const float * src, void * dst, int64_t n) {
     const enum ggml_type vdt = ggml_get_type_traits_cpu(wtype)->vec_dot_type;
     if (vdt == GGML_TYPE_F32) {
         memcpy(dst, src, n*sizeof(float));
@@ -13509,11 +13509,11 @@ static void dragon_moe_quantize(enum ggml_type wtype, const float * src, void * 
     from_float(src, dst, n);
 }
 
-// the Dragon activations can leave the range of the f16 values of the dot operands (Q8_0 block scale: block
+// the Olala activations can leave the range of the f16 values of the dot operands (Q8_0 block scale: block
 // max > ~8e6 -> inf; F16: > 65504): a row whose max exceeds the limit of the vec_dot type of wtype is divided by a
 // power of two before the conversion (exact), the dot products are multiplied back by the returned factor (1 for the
 // usual rows). F32/BF16 operands need no guard.
-static inline float dragon_moe_row_mul(enum ggml_type wtype, const float * src, int64_t n) {
+static inline float olala_moe_row_mul(enum ggml_type wtype, const float * src, int64_t n) {
     const enum ggml_type vdt = ggml_get_type_traits_cpu(wtype)->vec_dot_type;
     if (vdt == GGML_TYPE_F32 || vdt == GGML_TYPE_BF16) {
         return 1.0f;
@@ -13530,11 +13530,11 @@ static inline float dragon_moe_row_mul(enum ggml_type wtype, const float * src, 
 }
 
 // expert cache budget in bytes
-static inline size_t dragon_moe_budget(int32_t mib) {
+static inline size_t olala_moe_budget(int32_t mib) {
     return (uint64_t) mib >= SIZE_MAX/(1024*1024) ? SIZE_MAX : (size_t) mib*1024*1024;
 }
 
-static inline void dragon_moe_scale(float * x, int64_t n, float mul) {
+static inline void olala_moe_scale(float * x, int64_t n, float mul) {
     if (mul != 1.0f) {
         const float inv = 1.0f/mul;
         for (int64_t i = 0; i < n; ++i) {
@@ -13543,23 +13543,23 @@ static inline void dragon_moe_scale(float * x, int64_t n, float mul) {
     }
 }
 
-static inline void dragon_moe_relu2(float * dst, const float * src, int64_t n) {
+static inline void olala_moe_relu2(float * dst, const float * src, int64_t n) {
     for (int64_t i = 0; i < n; ++i) {
         const float r = src[i] > 0.0f ? src[i] : 0.0f;
         dst[i] = r*r;
     }
 }
 
-static inline float dragon_moe_sigmoid(float x) {
+static inline float olala_moe_sigmoid(float x) {
     return 1.0f/(1.0f + expf(-x));
 }
 
 // scores = sigmoid(logits) + bias; ids of the k largest (desc, ties -> lower
 // index, all-NaN -> in-bounds fallback), same as the graph path.
-static void dragon_moe_select(const float * lt, const float * bd, int64_t n_expert, int64_t k,
+static void olala_moe_select(const float * lt, const float * bd, int64_t n_expert, int64_t k,
                               int32_t * ids, float * scores, uint8_t * taken) {
     for (int64_t e = 0; e < n_expert; ++e) {
-        scores[e] = dragon_moe_sigmoid(lt[e]) + bd[e];
+        scores[e] = olala_moe_sigmoid(lt[e]) + bd[e];
         taken[e]  = 0;
     }
     for (int64_t i = 0; i < k; ++i) {
@@ -13580,7 +13580,7 @@ static void dragon_moe_select(const float * lt, const float * bd, int64_t n_expe
 }
 
 // out[t*out_stride + r] = W[r] . xq[t], r in [r0, r1)
-static void dragon_moe_gemv(const ggml_tensor * W, const char * wbase, int64_t K, int64_t r0, int64_t r1,
+static void olala_moe_gemv(const ggml_tensor * W, const char * wbase, int64_t K, int64_t r0, int64_t r1,
                             const char * xq, size_t xq_stride, int64_t T, float * out, int64_t out_stride) {
     ggml_vec_dot_t const vec_dot = ggml_get_type_traits_cpu(W->type)->vec_dot;
     const size_t nb1 = W->nb[1];
@@ -13592,30 +13592,30 @@ static void dragon_moe_gemv(const ggml_tensor * W, const char * wbase, int64_t K
     }
 }
 
-static inline void dragon_moe_split(int64_t n, int ith, int nth, int64_t * a, int64_t * b) {
+static inline void olala_moe_split(int64_t n, int ith, int nth, int64_t * a, int64_t * b) {
     *a = n*ith/nth;
     *b = n*(ith + 1)/nth;
 }
 
-// ---- low-memory mode helpers (paging calls in dragon-pager.cpp)
+// ---- low-memory mode helpers (paging calls in olala-pager.cpp)
 
 // populate the rows [r0, r1) of expert e of W unless the previous call of this
 // thread already covered them
-struct dragon_moe_populated {
+struct olala_moe_populated {
     int64_t e = -1, r0 = 0, r1 = 0;
 
     void rows(const ggml_tensor * W, int64_t e_, int64_t r0_, int64_t r1_) {
         if (e_ == e && r0_ >= r0 && r1_ <= r1) {
             return;
         }
-        dragon_pager_populate((const char *) W->data + (size_t) e_*W->nb[2] + (size_t) r0_*W->nb[1], (size_t) (r1_ - r0_)*W->nb[1]);
+        olala_pager_populate((const char *) W->data + (size_t) e_*W->nb[2] + (size_t) r0_*W->nb[1], (size_t) (r1_ - r0_)*W->nb[1]);
         e = e_; r0 = r0_; r1 = r1_;
     }
 };
 
 // the up and down slabs of the experts flagged in used[] (expert order, so the
 // reads are in file order)
-static int dragon_moe_slabs(const ggml_tensor * W_up, const ggml_tensor * W_down, const uint8_t * used,
+static int olala_moe_slabs(const ggml_tensor * W_up, const ggml_tensor * W_down, const uint8_t * used,
                             int64_t n_expert, const char ** ptrs, size_t * sizes) {
     int n = 0;
     for (const ggml_tensor * W : { W_up, W_down }) {
@@ -13630,7 +13630,7 @@ static int dragon_moe_slabs(const ggml_tensor * W_up, const ggml_tensor * W_down
     return n;
 }
 
-static void ggml_compute_forward_dragon_moe_f32(
+static void ggml_compute_forward_olala_moe_f32(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     const ggml_tensor * x      = dst->src[0];
@@ -13643,7 +13643,7 @@ static void ggml_compute_forward_dragon_moe_f32(
     const ggml_tensor * W_us   = dst->src[7];
     const ggml_tensor * W_ds   = dst->src[8];
 
-    const dragon_moe_dims d = dragon_moe_get_dims(dst);
+    const olala_moe_dims d = olala_moe_get_dims(dst);
     const int64_t T = d.n_tok, k = d.k;
     float w_scale;
     memcpy(&w_scale, (const int32_t *) dst->op_params + 1, sizeof(float));
@@ -13651,7 +13651,7 @@ static void ggml_compute_forward_dragon_moe_f32(
     const int ith = params->ith;
     const int nth = params->nth;
 
-    const dragon_moe_ws ws = dragon_moe_layout(dst);
+    const olala_moe_ws ws = olala_moe_layout(dst);
     GGML_ASSERT(params->wsize >= ws.shared + (size_t) nth*ws.per_thread);
     char * shared = (char *) params->wdata;
     char * mine   = shared + ws.shared + (size_t) ith*ws.per_thread;
@@ -13685,13 +13685,13 @@ static void ggml_compute_forward_dragon_moe_f32(
     bool cached = false;
     const char * const * c_slab = (const char * const *) (shared + ws.c_slab);
 
-    const size_t qs_ld = dragon_moe_qrow(W_ld->type,   d.n_embd);
-    const size_t qs_r  = dragon_moe_qrow(W_r->type,    d.n_embd);
-    const size_t qs_sh = dragon_moe_qrow(W_us->type,   d.n_embd);
-    const size_t qs_up = dragon_moe_qrow(W_up->type,   d.n_lat);
-    const size_t qs_dn = dragon_moe_qrow(W_down->type, d.n_ff);
-    const size_t qs_ds = dragon_moe_qrow(W_ds->type,   d.n_ff_sh);
-    const size_t qs_lu = dragon_moe_qrow(W_lu->type,   d.n_lat);
+    const size_t qs_ld = olala_moe_qrow(W_ld->type,   d.n_embd);
+    const size_t qs_r  = olala_moe_qrow(W_r->type,    d.n_embd);
+    const size_t qs_sh = olala_moe_qrow(W_us->type,   d.n_embd);
+    const size_t qs_up = olala_moe_qrow(W_up->type,   d.n_lat);
+    const size_t qs_dn = olala_moe_qrow(W_down->type, d.n_ff);
+    const size_t qs_ds = olala_moe_qrow(W_ds->type,   d.n_ff_sh);
+    const size_t qs_lu = olala_moe_qrow(W_lu->type,   d.n_lat);
 
     const float * xd = (const float *) x->data;
     const float * bd = (const float *) r_bias->data;
@@ -13704,13 +13704,13 @@ static void ggml_compute_forward_dragon_moe_f32(
         const enum ggml_type vdt_r  = ggml_get_type_traits_cpu(W_r->type)->vec_dot_type;
         const enum ggml_type vdt_sh = ggml_get_type_traits_cpu(W_us->type)->vec_dot_type;
         for (int64_t t = 0; t < T; ++t) {
-            dragon_moe_quantize(W_ld->type, xd + t*d.n_embd, xq_ld + t*qs_ld, d.n_embd);
+            olala_moe_quantize(W_ld->type, xd + t*d.n_embd, xq_ld + t*qs_ld, d.n_embd);
         }
         const char * xq_r_use = xq_ld;
         size_t qs_r_use = qs_ld;
         if (vdt_r != vdt_ld) {
             for (int64_t t = 0; t < T; ++t) {
-                dragon_moe_quantize(W_r->type, xd + t*d.n_embd, xq_r + t*qs_r, d.n_embd);
+                olala_moe_quantize(W_r->type, xd + t*d.n_embd, xq_r + t*qs_r, d.n_embd);
             }
             xq_r_use = xq_r;
             qs_r_use = qs_r;
@@ -13723,19 +13723,19 @@ static void ggml_compute_forward_dragon_moe_f32(
                 qs_sh_use = qs_r_use;
             } else {
                 for (int64_t t = 0; t < T; ++t) {
-                    dragon_moe_quantize(W_us->type, xd + t*d.n_embd, xq_sh + t*qs_sh, d.n_embd);
+                    olala_moe_quantize(W_us->type, xd + t*d.n_embd, xq_sh + t*qs_sh, d.n_embd);
                 }
                 xq_sh_use = xq_sh;
                 qs_sh_use = qs_sh;
             }
         }
 
-        dragon_moe_split(d.n_lat, ith, nth, &a, &b);
-        dragon_moe_gemv(W_ld, (const char *) W_ld->data, d.n_embd, a, b, xq_ld, qs_ld, T, lat, d.n_lat);
-        dragon_moe_split(d.n_expert, ith, nth, &a, &b);
-        dragon_moe_gemv(W_r, (const char *) W_r->data, d.n_embd, a, b, xq_r_use, qs_r_use, T, logits, d.n_expert);
-        dragon_moe_split(d.n_ff_sh, ith, nth, &a, &b);
-        dragon_moe_gemv(W_us, (const char *) W_us->data, d.n_embd, a, b, xq_sh_use, qs_sh_use, T, ush, d.n_ff_sh);
+        olala_moe_split(d.n_lat, ith, nth, &a, &b);
+        olala_moe_gemv(W_ld, (const char *) W_ld->data, d.n_embd, a, b, xq_ld, qs_ld, T, lat, d.n_lat);
+        olala_moe_split(d.n_expert, ith, nth, &a, &b);
+        olala_moe_gemv(W_r, (const char *) W_r->data, d.n_embd, a, b, xq_r_use, qs_r_use, T, logits, d.n_expert);
+        olala_moe_split(d.n_ff_sh, ith, nth, &a, &b);
+        olala_moe_gemv(W_us, (const char *) W_us->data, d.n_embd, a, b, xq_sh_use, qs_sh_use, T, ush, d.n_ff_sh);
     }
     ggml_barrier(params->threadpool);
 
@@ -13745,10 +13745,10 @@ static void ggml_compute_forward_dragon_moe_f32(
             const float * lt = logits + t*d.n_expert;
             int32_t * st = sel  + t*k;
             float   * wt = wsel + t*k;
-            dragon_moe_select(lt, bd, d.n_expert, k, st, scores, taken);
+            olala_moe_select(lt, bd, d.n_expert, k, st, scores, taken);
             float sum = 0.0f;
             for (int64_t i = 0; i < k; ++i) {
-                wt[i] = dragon_moe_sigmoid(lt[st[i]]);
+                wt[i] = olala_moe_sigmoid(lt[st[i]]);
                 sum += wt[i];
             }
             if (sum < 6.103515625e-5f) {
@@ -13779,9 +13779,9 @@ static void ggml_compute_forward_dragon_moe_f32(
         // slabs to their copies in the cache (pinned until the end of stage C),
         // then every thread reads a share of the misses (in 128 KiB pieces, so
         // the SSD sees many requests at once)
-        if (cache_mib >= 0 && dragon_pager_cache_enabled()) {
+        if (cache_mib >= 0 && olala_pager_cache_enabled()) {
             const char ** c_slab_w = (const char **) (shared + ws.c_slab);
-            dragon_pager_read * c_rd = (dragon_pager_read *) (shared + ws.c_rd);
+            olala_pager_read * c_rd = (olala_pager_read *) (shared + ws.c_rd);
             int32_t * c_n = (int32_t *) (shared + ws.c_n);
             if (ith == 0) {
                 for (int64_t e = 0; e < d.n_expert; ++e) {
@@ -13793,9 +13793,9 @@ static void ggml_compute_forward_dragon_moe_f32(
                 const char ** ptrs   = (const char **) (shared + ws.s_ptr);
                 size_t      * sizes  = (size_t *)      (shared + ws.s_size);
                 const char ** copies = (const char **) (shared + ws.s_copy);
-                const int n = dragon_moe_slabs(W_up, W_down, taken, d.n_expert, ptrs, sizes);
+                const int n = olala_moe_slabs(W_up, W_down, taken, d.n_expert, ptrs, sizes);
                 int n_rd = 0;
-                if (dragon_pager_cache_get(ptrs, sizes, n, dragon_moe_budget(cache_mib), copies, c_rd, &n_rd)) {
+                if (olala_pager_cache_get(ptrs, sizes, n, olala_moe_budget(cache_mib), copies, c_rd, &n_rd)) {
                     // slabs are listed up then down, each in expert order
                     int j = 0;
                     for (int w = 0; w < 2; ++w) {
@@ -13816,13 +13816,13 @@ static void ggml_compute_forward_dragon_moe_f32(
                 for (int32_t j = 0; j < *c_n; ++j) {
                     for (size_t o = 0; o < c_rd[j].n; o += piece, ++idx) {
                         if (idx % nth == ith) {
-                            dragon_pager_cache_read(c_rd[j], o, std::min(piece, c_rd[j].n - o));
+                            olala_pager_cache_read(c_rd[j], o, std::min(piece, c_rd[j].n - o));
                         }
                     }
                 }
                 // also the slabs another op (context) is reading
                 if (ith == 0) {
-                    dragon_pager_cache_wait(c_slab, (int) (2*d.n_expert));
+                    olala_pager_cache_wait(c_slab, (int) (2*d.n_expert));
                 }
                 ggml_barrier(params->threadpool);
             }
@@ -13837,7 +13837,7 @@ static void ggml_compute_forward_dragon_moe_f32(
                 const ggml_tensor * Wx = w == 0 ? W_up : W_down;
                 const int64_t n_r = w == 0 ? d.n_ff : d.n_lat;
                 int64_t a2, b2;
-                dragon_moe_split(T*k*n_r, ith, nth, &a2, &b2);
+                olala_moe_split(T*k*n_r, ith, nth, &a2, &b2);
                 int64_t le = -1, l0 = 0, l1 = 0;
                 for (int64_t i = a2; i < b2; ) {
                     const int64_t pair = order[i/n_r];
@@ -13845,7 +13845,7 @@ static void ggml_compute_forward_dragon_moe_f32(
                     const int64_t r1   = std::min<int64_t>(n_r, r0 + (b2 - i));
                     const int64_t e    = sel[pair];
                     if (!(e == le && r0 >= l0 && r1 <= l1)) {
-                        dragon_pager_prefetch((const char *) Wx->data + (size_t) e*Wx->nb[2] + (size_t) r0*Wx->nb[1], (size_t) (r1 - r0)*Wx->nb[1]);
+                        olala_pager_prefetch((const char *) Wx->data + (size_t) e*Wx->nb[2] + (size_t) r0*Wx->nb[1], (size_t) (r1 - r0)*Wx->nb[1]);
                         le = e; l0 = r0; l1 = r1;
                     }
                     i += r1 - r0;
@@ -13854,21 +13854,21 @@ static void ggml_compute_forward_dragon_moe_f32(
         }
 
         // shared expert down: relu2 of ush, then W_ds rows
-        dragon_moe_split(d.n_embd, ith, nth, &a, &b);
+        olala_moe_split(d.n_embd, ith, nth, &a, &b);
         if (a < b) {
             bool scaled = false;
             for (int64_t t = 0; t < T; ++t) {
-                dragon_moe_relu2(tmp, ush + t*d.n_ff_sh, d.n_ff_sh);
-                const float mul = dragon_moe_row_mul(W_ds->type, tmp, d.n_ff_sh);
+                olala_moe_relu2(tmp, ush + t*d.n_ff_sh, d.n_ff_sh);
+                const float mul = olala_moe_row_mul(W_ds->type, tmp, d.n_ff_sh);
                 scaled |= mul != 1.0f;
-                dragon_moe_scale(tmp, d.n_ff_sh, mul);
-                dragon_moe_quantize(W_ds->type, tmp, ushq + t*qs_ds, d.n_ff_sh);
+                olala_moe_scale(tmp, d.n_ff_sh, mul);
+                olala_moe_quantize(W_ds->type, tmp, ushq + t*qs_ds, d.n_ff_sh);
             }
-            dragon_moe_gemv(W_ds, (const char *) W_ds->data, d.n_ff_sh, a, b, ushq, qs_ds, T, dsh, d.n_embd);
+            olala_moe_gemv(W_ds, (const char *) W_ds->data, d.n_ff_sh, a, b, ushq, qs_ds, T, dsh, d.n_embd);
             if (scaled) {
                 for (int64_t t = 0; t < T; ++t) {
-                    dragon_moe_relu2(tmp, ush + t*d.n_ff_sh, d.n_ff_sh);
-                    const float mul = dragon_moe_row_mul(W_ds->type, tmp, d.n_ff_sh);
+                    olala_moe_relu2(tmp, ush + t*d.n_ff_sh, d.n_ff_sh);
+                    const float mul = olala_moe_row_mul(W_ds->type, tmp, d.n_ff_sh);
                     for (int64_t r = a; r < b && mul != 1.0f; ++r) {
                         dsh[t*d.n_embd + r] *= mul;
                     }
@@ -13877,15 +13877,15 @@ static void ggml_compute_forward_dragon_moe_f32(
         }
 
         for (int64_t t = 0; t < T; ++t) {
-            dragon_moe_quantize(W_up->type, lat + t*d.n_lat, latq + t*qs_up, d.n_lat);
+            olala_moe_quantize(W_up->type, lat + t*d.n_lat, latq + t*qs_up, d.n_lat);
         }
 
         // expert up rows, flattened over (pair in expert order, row)
         {
             ggml_vec_dot_t const vec_dot = ggml_get_type_traits_cpu(W_up->type)->vec_dot;
             const int64_t n_rows = T*k*d.n_ff;
-            dragon_moe_split(n_rows, ith, nth, &a, &b);
-            dragon_moe_populated pop;
+            olala_moe_split(n_rows, ith, nth, &a, &b);
+            olala_moe_populated pop;
             for (int64_t i = a; i < b; ) {
                 const int64_t pair = order[i/d.n_ff];
                 const int64_t t    = pair/k;
@@ -13911,10 +13911,10 @@ static void ggml_compute_forward_dragon_moe_f32(
     {
         ggml_vec_dot_t const vec_dot = ggml_get_type_traits_cpu(W_down->type)->vec_dot;
         const int64_t n_rows = T*k*d.n_lat;
-        dragon_moe_split(n_rows, ith, nth, &a, &b);
+        olala_moe_split(n_rows, ith, nth, &a, &b);
         int64_t last_pair = -1;
         float   mul_dn    = 1.0f;
-        dragon_moe_populated pop;
+        olala_moe_populated pop;
         for (int64_t i = a; i < b; ) {
             const int64_t pair = order[i/d.n_lat];
             const int64_t r0 = i % d.n_lat;
@@ -13923,10 +13923,10 @@ static void ggml_compute_forward_dragon_moe_f32(
                 pop.rows(W_down, sel[pair], r0, r1);
             }
             if (pair != last_pair) {
-                dragon_moe_relu2(tmp, up + pair*d.n_ff, d.n_ff);
-                mul_dn = dragon_moe_row_mul(W_down->type, tmp, d.n_ff);
-                dragon_moe_scale(tmp, d.n_ff, mul_dn);
-                dragon_moe_quantize(W_down->type, tmp, upq + pair*qs_dn, d.n_ff);
+                olala_moe_relu2(tmp, up + pair*d.n_ff, d.n_ff);
+                mul_dn = olala_moe_row_mul(W_down->type, tmp, d.n_ff);
+                olala_moe_scale(tmp, d.n_ff, mul_dn);
+                olala_moe_quantize(W_down->type, tmp, upq + pair*qs_dn, d.n_ff);
                 last_pair = pair;
             }
             const int32_t e = sel[pair];
@@ -13944,12 +13944,12 @@ static void ggml_compute_forward_dragon_moe_f32(
 
     // explicit expert cache: no thread reads the copies past this point
     if (cached && ith == 0) {
-        dragon_pager_cache_release(c_slab, (int) (2*d.n_expert));
+        olala_pager_cache_release(c_slab, (int) (2*d.n_expert));
     }
 
     // ---- stage D: weighted reduce (redundant per thread), latent up + shared
     {
-        dragon_moe_split(d.n_embd, ith, nth, &a, &b);
+        olala_moe_split(d.n_embd, ith, nth, &a, &b);
         if (a < b) {
             for (int64_t t = 0; t < T; ++t) {
                 const float * et = down + t*k*d.n_lat;
@@ -13965,15 +13965,15 @@ static void ggml_compute_forward_dragon_moe_f32(
                         ot[i] += ei[i]*wi;
                     }
                 }
-                const float mul = dragon_moe_row_mul(W_lu->type, ot, d.n_lat);
+                const float mul = olala_moe_row_mul(W_lu->type, ot, d.n_lat);
                 memcpy(tmp, ot, d.n_lat*sizeof(float));
-                dragon_moe_scale(tmp, d.n_lat, mul);
-                dragon_moe_quantize(W_lu->type, tmp, routedq + t*qs_lu, d.n_lat);
+                olala_moe_scale(tmp, d.n_lat, mul);
+                olala_moe_quantize(W_lu->type, tmp, routedq + t*qs_lu, d.n_lat);
             }
             float * out = (float *) dst->data;
-            dragon_moe_gemv(W_lu, (const char *) W_lu->data, d.n_lat, a, b, routedq, qs_lu, T, out, d.n_embd);
+            olala_moe_gemv(W_lu, (const char *) W_lu->data, d.n_lat, a, b, routedq, qs_lu, T, out, d.n_embd);
             for (int64_t t = 0; t < T; ++t) {
-                const float mul = dragon_moe_row_mul(W_lu->type, routed + t*d.n_lat, d.n_lat);
+                const float mul = olala_moe_row_mul(W_lu->type, routed + t*d.n_lat, d.n_lat);
                 for (int64_t r = a; r < b; ++r) {
                     out[t*d.n_embd + r] = out[t*d.n_embd + r]*mul + dsh[t*d.n_embd + r];
                 }
@@ -13998,24 +13998,24 @@ static void ggml_compute_forward_dragon_moe_f32(
             }
             const char ** ptrs  = (const char **) (shared + ws.s_ptr);
             size_t      * sizes = (size_t *)      (shared + ws.s_size);
-            const int n = dragon_moe_slabs(W_up, W_down, taken, d.n_expert, ptrs, sizes);
-            *ev_n = dragon_pager_used(ptrs, sizes, n, dragon_moe_budget(cache_mib),
+            const int n = olala_moe_slabs(W_up, W_down, taken, d.n_expert, ptrs, sizes);
+            *ev_n = olala_pager_used(ptrs, sizes, n, olala_moe_budget(cache_mib),
                                       ev_ptr, ev_size, (int) (4*d.n_expert));
         }
         ggml_barrier(params->threadpool);
         for (int32_t j = ith; j < *ev_n; j += nth) {
-            dragon_pager_release(ev_ptr[j], ev_size[j]);
+            olala_pager_release(ev_ptr[j], ev_size[j]);
         }
     }
 }
 
-void ggml_compute_forward_dragon_moe(
+void ggml_compute_forward_olala_moe(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     switch (dst->src[0]->type) {
         case GGML_TYPE_F32:
             {
-                ggml_compute_forward_dragon_moe_f32(params, dst);
+                ggml_compute_forward_olala_moe_f32(params, dst);
             } break;
         default:
             {
@@ -14813,9 +14813,9 @@ void ggml_compute_forward_lightning_indexer(
 }
 
 
-// ---- Dragon V-layer helpers (reference implementations; the production CPU path keeps the author's graph) ----
+// ---- Olala V-layer helpers (reference implementations; the production CPU path keeps the author's graph) ----
 
-static inline void dragon_row_to_f32(const ggml_tensor * W, int64_t r, float * dst) {
+static inline void olala_row_to_f32(const ggml_tensor * W, int64_t r, float * dst) {
     const char * p = (const char *) W->data + (size_t) r*W->nb[1];
     if (W->type == GGML_TYPE_F32) {
         memcpy(dst, p, (size_t) W->ne[0]*sizeof(float));
@@ -14827,7 +14827,7 @@ static inline void dragon_row_to_f32(const ggml_tensor * W, int64_t r, float * d
 }
 
 // y = concat_i(W_i^T x): rows split across the threads
-void ggml_compute_forward_dragon_mmv(const ggml_compute_params * params, ggml_tensor * dst) {
+void ggml_compute_forward_olala_mmv(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * x = dst->src[0];
     const int64_t n = x->ne[0];
     const int64_t T = x->ne[1];
@@ -14850,7 +14850,7 @@ void ggml_compute_forward_dragon_mmv(const ggml_compute_params * params, ggml_te
         const int64_t a = std::max<int64_t>(r0, base);
         const int64_t b = std::min<int64_t>(r1, base + nr);
         for (int64_t r = a; r < b; ++r) {
-            dragon_row_to_f32(W, r - base, w);
+            olala_row_to_f32(W, r - base, w);
             for (int64_t t = 0; t < T; ++t) {
                 const float * xt = xd + t*n;
                 float s = 0.0f;
@@ -14864,10 +14864,10 @@ void ggml_compute_forward_dragon_mmv(const ggml_compute_params * params, ggml_te
     }
 }
 
-static inline float dragon_sigmoid_f32(float x) { return 1.0f/(1.0f + expf(-x)); }
+static inline float olala_sigmoid_f32(float x) { return 1.0f/(1.0f + expf(-x)); }
 
-// see ggml_dragon_tpa_prep (ggml.h) for the layouts; the math follows build_dragon_v_mixer (llama.cpp src/models/dragon.cpp)
-void ggml_compute_forward_dragon_tpa_prep(const ggml_compute_params * params, ggml_tensor * dst) {
+// see ggml_olala_tpa_prep (ggml.h) for the layouts; the math follows build_olala_v_mixer (llama.cpp src/models/olala.cpp)
+void ggml_compute_forward_olala_tpa_prep(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * pr   = dst->src[0];
     const ggml_tensor * prev = dst->src[1];
     const ggml_tensor * pos  = dst->src[2];
@@ -14884,12 +14884,16 @@ void ggml_compute_forward_dragon_tpa_prep(const ggml_compute_params * params, gg
     const float eps    = ggml_get_op_params_f32(dst, 6);
     const float wsize  = ggml_get_op_params_f32(dst, 7);
     const float gate_b = ggml_get_op_params_f32(dst, 8);
+    const bool  factored = ggml_get_op_params_i32(dst, 9) != 0;
 
     const int64_t T = pr->ne[1];
     const int64_t n_seq_t = T/n_seqs;
     const int64_t ROW = pr->ne[0];
     const int64_t OAK = (int64_t) H*Dh, OAV = OAK + Hn*R, OBK = OAV + Hn*R, OBV = OBK + R*Dh, OSK = OBV + R*Dh, OSV = OSK + Hn, OLAM = OSV + Hn, OG = OLAM + Hn;
-    const int64_t o_k = T*H*Dh, o_v = o_k + T*Hn*Dh, o_lam = o_v + T*Hn*Dh, o_g = o_lam + T*Hn, o_last = o_g + (int64_t) T*Hs*Dh;
+    // per-token rows of the K / V outputs: expanded (Hn*Dh) or factored (ggml_olala_tpa_row_k / _v)
+    const int64_t KR = factored ? ggml_olala_tpa_row_k(Hn, R, Dh) : (int64_t) Hn*Dh;
+    const int64_t VR = factored ? ggml_olala_tpa_row_v(Hn, R, Dh) : (int64_t) Hn*Dh;
+    const int64_t o_k = T*H*Dh, o_v = o_k + T*KR, o_lam = o_v + T*VR, o_g = o_lam + T*Hn, o_last = o_g + (int64_t) T*Hs*Dh;
 
     const float   * prd  = (const float *) pr->data;
     const int32_t * posd = (const int32_t *) pos->data;
@@ -14946,19 +14950,42 @@ void ggml_compute_forward_dragon_tpa_prep(const ggml_compute_params * params, gg
                 memcpy(out + o_last + s*2*Hn*Dh + hn*Dh,         kr, Dh*sizeof(float));
                 memcpy(out + o_last + s*2*Hn*Dh + Hn*Dh + hn*Dh, vr, Dh*sizeof(float));
             }
-            const float ak = dragon_sigmoid_f32(p[OSK + hn])*pmask;
-            const float av = dragon_sigmoid_f32(p[OSV + hn])*pmask;
+            const float ak = olala_sigmoid_f32(p[OSK + hn])*pmask;
+            const float av = olala_sigmoid_f32(p[OSV + hn])*pmask;
             const float bk = ak*-1.0f + 1.0f;
             const float bv = av*-1.0f + 1.0f;
             float ss = 0.0f;
             for (int d = 0; d < Dh; ++d) {
                 kx[d] = kp[d]*ak + kr[d]*bk;
                 ss += kx[d]*kx[d];
-                out[o_v + (t*Hn + hn)*Dh + d] = vp[d]*av + vr[d]*bv;
+                if (!factored) {
+                    out[o_v + (t*Hn + hn)*Dh + d] = vp[d]*av + vr[d]*bv;
+                }
             }
             const float rs = 1.0f/sqrtf(ss/(float) Dh + eps);
-            for (int d = 0; d < Dh; ++d) {
-                out[o_k + (t*Hn + hn)*Dh + d] = (kx[d]*rs)*kn[d];
+            if (factored) {
+                // the factors of this token (B rows written by the first kv head) and the per-head scalars
+                float * ko = out + o_k + t*KR;
+                float * vo = out + o_v + t*VR;
+                if (hn == 0) {
+                    memcpy(ko, p + OBK, (size_t) R*Dh*sizeof(float));
+                    memcpy(vo, p + OBV, (size_t) R*Dh*sizeof(float));
+                    for (int64_t i = (int64_t) R*Dh + Hn*R + 2*Hn; i < KR; ++i) {
+                        ko[i] = 0.0f;
+                    }
+                    for (int64_t i = (int64_t) R*Dh + Hn*R + Hn; i < VR; ++i) {
+                        vo[i] = 0.0f;
+                    }
+                }
+                memcpy(ko + R*Dh + hn*R, p + OAK + hn*R, R*sizeof(float));
+                memcpy(vo + R*Dh + hn*R, p + OAV + hn*R, R*sizeof(float));
+                ko[R*Dh + Hn*R + hn]      = rs/(float) R;
+                ko[R*Dh + Hn*R + Hn + hn] = ak;
+                vo[R*Dh + Hn*R + hn]      = av;
+            } else {
+                for (int d = 0; d < Dh; ++d) {
+                    out[o_k + (t*Hn + hn)*Dh + d] = (kx[d]*rs)*kn[d];
+                }
             }
         }
         {
@@ -14969,12 +14996,13 @@ void ggml_compute_forward_dragon_tpa_prep(const ggml_compute_params * params, gg
             }
             const float rs = 1.0f/sqrtf(ss/(float) Dh + eps);
             for (int d = 0; d < Dh; ++d) {
-                out[(t*H + h)*Dh + d] = (((q[d]*rs)*qn[d])*lp)*sc[h];
+                // factored: the k_norm weight moves from K to q (q.(w*k) = (q*w).k)
+                out[(t*H + h)*Dh + d] = (((q[d]*rs)*qn[d])*lp)*sc[h]*(factored ? kn[d] : 1.0f);
             }
         }
         if (h == 0) {
             for (int i = 0; i < Hn; ++i) {
-                out[o_lam + t*Hn + i] = dragon_sigmoid_f32(p[OLAM + i]);
+                out[o_lam + t*Hn + i] = olala_sigmoid_f32(p[OLAM + i]);
             }
             for (int64_t i = 0; i < (int64_t) Hs*Dh; ++i) {
                 const float g = p[OG + i] + gate_b;
@@ -14984,7 +15012,165 @@ void ggml_compute_forward_dragon_tpa_prep(const ggml_compute_params * params, gg
     }
 }
 
-void ggml_compute_forward_dragon_diff_gate(const ggml_compute_params * params, ggml_tensor * dst) {
+// see ggml_olala_tpa_attn (ggml.h): reference implementation, one (stream, token, head) row at a time
+void ggml_compute_forward_olala_tpa_attn(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * v    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * prev = dst->src[4];
+
+    const int   Hn      = ggml_get_op_params_i32(dst, 0);
+    const int   R       = ggml_get_op_params_i32(dst, 1);
+    const float scale   = ggml_get_op_params_f32(dst, 2);
+    const float softcap = ggml_get_op_params_f32(dst, 3);
+
+    const int64_t Dh   = q->ne[0];
+    const int64_t H    = q->ne[1];
+    const int64_t T    = q->ne[2];
+    const int64_t ns   = q->ne[3];
+    const int64_t n_kv = k->ne[1];
+    const int64_t G    = H/Hn;
+
+    const bool kf16 = k->type == GGML_TYPE_F16;
+    auto ld = [&](const ggml_tensor * x, int64_t c, int64_t s, int64_t i) -> float {
+        const char * row = (const char *) x->data + c*x->nb[1] + s*x->nb[2];
+        return kf16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) row)[i]) : ((const float *) row)[i];
+    };
+    auto mk = [&](int64_t c, int64_t t, int64_t s) -> float {
+        const char * row = (const char *) mask->data + t*mask->nb[1] + s*mask->nb[3];
+        return mask->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) row)[c]) : ((const float *) row)[c];
+    };
+
+    const int64_t oA = (int64_t) R*Dh, oS = oA + (int64_t) Hn*R; // offsets in a row: A, then the scalars
+
+    float * P  = (float *) params->wdata + ((R + 1)*n_kv + Dh + CACHE_LINE_SIZE_F32)*params->ith; // (n_kv, R): q.B_k
+    float * sc = P + R*n_kv;                                                                       // (n_kv) scores
+    float * o  = sc + n_kv;                                                                        // (Dh)
+
+    const int64_t n_rows = ns*T*H;
+    for (int64_t ir = params->ith; ir < n_rows; ir += params->nth) {
+        const int64_t s = ir/(T*H);
+        const int64_t t = (ir - s*T*H)/H;
+        const int64_t h = ir - s*T*H - t*H;
+        const int64_t g = h/G;
+        const float * qr = (const float *) ((const char *) q->data + h*q->nb[1] + t*q->nb[2] + s*q->nb[3]);
+        const int32_t * pv = (const int32_t *) ((const char *) prev->data + s*prev->nb[1]);
+
+        for (int64_t c = 0; c < n_kv; ++c) {
+            for (int r = 0; r < R; ++r) {
+                float acc = 0.0f;
+                for (int64_t d = 0; d < Dh; ++d) {
+                    acc += qr[d]*ld(k, c, s, r*Dh + d);
+                }
+                P[c*R + r] = acc;
+            }
+        }
+        float mx = -INFINITY;
+        for (int64_t c = 0; c < n_kv; ++c) {
+            const float m = mk(c, t, s);
+            if (m == -INFINITY) {
+                sc[c] = -INFINITY;
+                continue;
+            }
+            const int64_t p = pv[c];
+            const float ak = ld(k, c, s, oS + Hn + g);
+            float cur = 0.0f, prv = 0.0f;
+            for (int r = 0; r < R; ++r) {
+                cur += ld(k, c, s, oA + g*R + r)*P[c*R + r];
+                if (p >= 0) {
+                    prv += ld(k, p, s, oA + g*R + r)*P[p*R + r];
+                }
+            }
+            float x = scale*ld(k, c, s, oS + g)*((1.0f - ak)*cur + ak*prv);
+            if (softcap != 0.0f) {
+                x = softcap*tanhf(x/softcap);
+            }
+            sc[c] = x + m;
+            mx = std::max(mx, sc[c]);
+        }
+        for (int64_t d = 0; d < Dh; ++d) {
+            o[d] = 0.0f;
+        }
+        float sum = 0.0f;
+        if (mx != -INFINITY) {
+            for (int64_t c = 0; c < n_kv; ++c) {
+                if (sc[c] == -INFINITY) {
+                    continue;
+                }
+                const float w = expf(sc[c] - mx);
+                sum += w;
+                const int64_t p = pv[c];
+                const float av = ld(v, c, s, oS + g);
+                for (int r = 0; r < R; ++r) {
+                    const float wc = w*(1.0f - av)*ld(v, c, s, oA + g*R + r);
+                    const float wp = p >= 0 ? w*av*ld(v, p, s, oA + g*R + r) : 0.0f;
+                    for (int64_t d = 0; d < Dh; ++d) {
+                        o[d] += wc*ld(v, c, s, r*Dh + d) + (p >= 0 ? wp*ld(v, p, s, r*Dh + d) : 0.0f);
+                    }
+                }
+            }
+        }
+        float * y = (float *) ((char *) dst->data + h*dst->nb[1] + t*dst->nb[2] + s*dst->nb[3]);
+        const float norm = sum > 0.0f ? 1.0f/(sum*(float) R) : 0.0f;
+        for (int64_t d = 0; d < Dh; ++d) {
+            y[d] = o[d]*norm;
+        }
+    }
+}
+
+// see ggml_olala_tpa_expand (ggml.h); one (stream, cell) row at a time
+void ggml_compute_forward_olala_tpa_expand(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * rows = dst->src[0];
+    const ggml_tensor * prev = dst->src[1];
+
+    const int  Hn   = ggml_get_op_params_i32(dst, 0);
+    const int  R    = ggml_get_op_params_i32(dst, 1);
+    const bool is_v = ggml_get_op_params_i32(dst, 2) != 0;
+
+    const int64_t Dh   = dst->ne[0];
+    const int64_t n_kv = dst->ne[2];
+    const int64_t ns   = dst->ne[3];
+    const int64_t oA   = (int64_t) R*Dh, oS = oA + (int64_t) Hn*R;
+
+    const bool f16 = rows->type == GGML_TYPE_F16;
+    auto ld = [&](int64_t c, int64_t s, int64_t i) -> float {
+        const char * row = (const char *) rows->data + c*rows->nb[1] + s*rows->nb[2];
+        return f16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) row)[i]) : ((const float *) row)[i];
+    };
+
+    for (int64_t ir = params->ith; ir < ns*n_kv; ir += params->nth) {
+        const int64_t s = ir/n_kv;
+        const int64_t c = ir - s*n_kv;
+        const int32_t p = ((const int32_t *) ((const char *) prev->data + s*prev->nb[1]))[c];
+        for (int g = 0; g < Hn; ++g) {
+            float w1, w2;
+            if (is_v) {
+                const float av = ld(c, s, oS + g);
+                w1 = (1.0f - av)/(float) R;
+                w2 = av/(float) R;
+            } else {
+                const float ck = ld(c, s, oS + g);
+                const float ak = ld(c, s, oS + Hn + g);
+                w1 = ck*(1.0f - ak);
+                w2 = ck*ak;
+            }
+            ggml_fp16_t * y = (ggml_fp16_t *) ((char *) dst->data + g*dst->nb[1] + c*dst->nb[2] + s*dst->nb[3]);
+            for (int64_t d = 0; d < Dh; ++d) {
+                float x = 0.0f, xp = 0.0f;
+                for (int r = 0; r < R; ++r) {
+                    x += ld(c, s, oA + g*R + r)*ld(c, s, r*Dh + d);
+                    if (p >= 0) {
+                        xp += ld(p, s, oA + g*R + r)*ld(p, s, r*Dh + d);
+                    }
+                }
+                y[d] = GGML_CPU_FP32_TO_FP16(w1*x + w2*xp);
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_olala_diff_gate(const ggml_compute_params * params, ggml_tensor * dst) {
     const ggml_tensor * attn = dst->src[0];
     const ggml_tensor * lam  = dst->src[1];
     const ggml_tensor * gs   = dst->src[2];

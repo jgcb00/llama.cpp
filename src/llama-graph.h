@@ -350,6 +350,10 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
+    // optional, created by the models that need it: I32 [n_kv, n_stream], cell of the previous position of the same
+    // sequence (llama_kv_cache::set_input_prev_cell)
+    ggml_tensor * self_prev_cell = nullptr;
+
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;

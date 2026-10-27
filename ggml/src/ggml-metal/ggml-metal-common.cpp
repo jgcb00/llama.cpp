@@ -35,13 +35,13 @@ bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op, size_t max_tg
            ggml_metal_fwht_supported_size(op->src[1]->ne[0], max_tg_mem);
 }
 
-// DRAGON_MMV: x staged in threadgroup memory (8 simdgroups, one row each) above 4 tokens, otherwise read from device
+// OLALA_MMV: x staged in threadgroup memory (8 simdgroups, one row each) above 4 tokens, otherwise read from device
 // memory by 4 simdgroups, one row each
-bool ggml_metal_op_dragon_mmv_staged(const struct ggml_tensor * op) {
+bool ggml_metal_op_olala_mmv_staged(const struct ggml_tensor * op) {
     return op->src[0]->ne[1] > 4;
 }
 
-int ggml_metal_op_dragon_moe_nsplit(const struct ggml_tensor * op) {
+int ggml_metal_op_olala_moe_nsplit(const struct ggml_tensor * op) {
     const int64_t n_ff  = op->src[4]->ne[1];
     const int64_t n_lat = op->src[1]->ne[1];
     const int want = 32;
@@ -54,7 +54,7 @@ int ggml_metal_op_dragon_moe_nsplit(const struct ggml_tensor * op) {
 }
 
 // n_lat row slices of kernel b2: rows per threadgroup RS = n_lat/nsplit2 with k*RS <= 8*DMOE_B2_MAXI (= 32) items
-int ggml_metal_op_dragon_moe_nsplit2(const struct ggml_tensor * op) {
+int ggml_metal_op_olala_moe_nsplit2(const struct ggml_tensor * op) {
     const int64_t n_lat = op->src[1]->ne[1];
     const int64_t k     = ggml_get_op_params_i32(op, 0);
     const int want_rs = 4;
@@ -66,7 +66,7 @@ int ggml_metal_op_dragon_moe_nsplit2(const struct ggml_tensor * op) {
     return (int) n_lat;
 }
 
-size_t ggml_metal_op_dragon_moe_smem(const struct ggml_tensor * op, int which) {
+size_t ggml_metal_op_olala_moe_smem(const struct ggml_tensor * op, int which) {
     const int64_t n_embd  = op->src[0]->ne[0];
     const int64_t n_tok   = op->src[0]->ne[1];
     const int64_t n_lat   = op->src[1]->ne[1];
@@ -83,17 +83,17 @@ size_t ggml_metal_op_dragon_moe_smem(const struct ggml_tensor * op, int which) {
     }
     if (which == 5) {
         // fused kernel: [ y (n_embd) | red (16) | part (32) | phase scratch: routed (lat | h slice), shared us, acc ]
-        const int64_t ffs = n_ff/ggml_metal_op_dragon_moe_msplit(op);
-        n = n_embd + 48 + std::max<int64_t>(((n_lat + 3) & ~3) + ffs, ggml_metal_op_dragon_moe_sh_rows(op));
+        const int64_t ffs = n_ff/ggml_metal_op_olala_moe_msplit(op);
+        n = n_embd + 48 + std::max<int64_t>(((n_lat + 3) & ~3) + ffs, ggml_metal_op_olala_moe_sh_rows(op));
         return GGML_PAD(n*sizeof(float), 16);
     }
     if (which == 4) {
         // kernel m: routed [ lat | red | redi | selv | sele | h slice ], shared [ x (T x n_embd) | us (T x sh_rows) ]
-        const int64_t ffs = n_ff/ggml_metal_op_dragon_moe_msplit(op);
-        n = std::max<int64_t>(((n_lat + 3) & ~3) + ffs, n_tok*(n_embd + ggml_metal_op_dragon_moe_sh_rows(op)));
+        const int64_t ffs = n_ff/ggml_metal_op_olala_moe_msplit(op);
+        n = std::max<int64_t>(((n_lat + 3) & ~3) + ffs, n_tok*(n_embd + ggml_metal_op_olala_moe_sh_rows(op)));
         return GGML_PAD(n*sizeof(float), 16);
     }
-    if (ggml_metal_op_dragon_moe_sh_split(op)) {
+    if (ggml_metal_op_olala_moe_sh_split(op)) {
         // the shared expert runs in extra threadgroups of b1 (up, as kernel a) and b2 (down, as kernel c)
         switch (which) {
             case 1: n = std::max<int64_t>(n, tb*n_embd); break;
@@ -106,7 +106,7 @@ size_t ggml_metal_op_dragon_moe_smem(const struct ggml_tensor * op, int which) {
 }
 
 // kernel m (merged up + down) FF slices of an expert and shared-expert rows per threadgroup; 0: not usable
-int ggml_metal_op_dragon_moe_msplit(const struct ggml_tensor * op) {
+int ggml_metal_op_olala_moe_msplit(const struct ggml_tensor * op) {
     const int64_t n_ff = op->src[4]->ne[1];
     const int want = 24;
     const int64_t n_lat = op->src[1]->ne[1];
@@ -121,7 +121,7 @@ int ggml_metal_op_dragon_moe_msplit(const struct ggml_tensor * op) {
     return 0;
 }
 
-int ggml_metal_op_dragon_moe_sh_rows(const struct ggml_tensor * op) {
+int ggml_metal_op_olala_moe_sh_rows(const struct ggml_tensor * op) {
     const int64_t n_ff_sh = op->src[7]->ne[1];
     const int want = 16;
     const int step = 4;
@@ -134,20 +134,20 @@ int ggml_metal_op_dragon_moe_sh_rows(const struct ggml_tensor * op) {
 }
 
 // kernel m replaces b1 and b2 for up to 2 tokens
-bool ggml_metal_op_dragon_moe_merged(const struct ggml_tensor * op) {
+bool ggml_metal_op_olala_moe_merged(const struct ggml_tensor * op) {
     // kernel m reads W_up, W_down, W_us and W_ds with one weight type
     const bool same_type = op->src[4]->type == op->src[7]->type && op->src[4]->type == op->src[8]->type;
-    return same_type && op->src[0]->ne[1] <= 2 && ggml_metal_op_dragon_moe_msplit(op) > 0 && ggml_metal_op_dragon_moe_sh_rows(op) > 0;
+    return same_type && op->src[0]->ne[1] <= 2 && ggml_metal_op_olala_moe_msplit(op) > 0 && ggml_metal_op_olala_moe_sh_rows(op) > 0;
 }
 
 // fused single-dispatch kernel (decode): number of persistent threadgroups, 0 when not usable. All the threadgroups
 // must be resident at once (they wait for each other): at most 3 per GPU core (measured on M3 Ultra: 240 of 80 cores
 // run, 288 do not), so the kernel is not used when the core count is unknown or too small.
-// Opt-in (GGML_METAL_DRAGON_MOE_FUSED=1): Metal does not guarantee that the threadgroups of a dispatch are co-resident,
+// Opt-in (GGML_METAL_OLALA_MOE_FUSED=1): Metal does not guarantee that the threadgroups of a dispatch are co-resident,
 // and on M3 Ultra it is on par with the 3-dispatch path for Q8_0 (+3% for BF16).
-int ggml_metal_op_dragon_moe_fused_ntg(const struct ggml_tensor * op, int gpu_cores) {
-    static const bool enabled = [] { const char * e = getenv("GGML_METAL_DRAGON_MOE_FUSED"); return e && atoi(e) != 0; }();
-    if (!enabled || gpu_cores <= 0 || op->src[0]->ne[1] != 1 || !ggml_metal_op_dragon_moe_merged(op)) {
+int ggml_metal_op_olala_moe_fused_ntg(const struct ggml_tensor * op, int gpu_cores) {
+    static const bool enabled = [] { const char * e = getenv("GGML_METAL_OLALA_MOE_FUSED"); return e && atoi(e) != 0; }();
+    if (!enabled || gpu_cores <= 0 || op->src[0]->ne[1] != 1 || !ggml_metal_op_olala_moe_merged(op)) {
         return 0;
     }
     const ggml_type t = op->src[1]->type;
@@ -161,14 +161,14 @@ int ggml_metal_op_dragon_moe_fused_ntg(const struct ggml_tensor * op, int gpu_co
     const int64_t n_expert = op->src[2]->ne[1];
     const int64_t n_ff_sh  = op->src[7]->ne[1];
     const int64_t k        = ggml_get_op_params_i32(op, 0);
-    const int64_t R        = k*ggml_metal_op_dragon_moe_msplit(op);
+    const int64_t R        = k*ggml_metal_op_olala_moe_msplit(op);
     if (n_lat > GGML_METAL_DMOE_F_MAX_LAT || n_embd > GGML_METAL_DMOE_F_MAX_EMBD || (n_embd/128) % 2 != 0 || (n_lat + n_expert) % 4 != 0) {
         return 0;
     }
     // needed: rows of [W_ld | W_r] 4 per threadgroup, W_lu rows 16 per threadgroup, one shared-expert threadgroup
     // after the routed ones; wanted: every shared-expert slice on its own threadgroup
     const int64_t need = std::max<int64_t>({ (n_lat + n_expert)/4, (n_embd + 15)/16, R + 1 });
-    const int64_t want = R + n_ff_sh/ggml_metal_op_dragon_moe_sh_rows(op);
+    const int64_t want = R + n_ff_sh/ggml_metal_op_olala_moe_sh_rows(op);
     const int64_t cap  = 3*(int64_t) gpu_cores;
     const int64_t P    = std::min(want, cap);
     if (P < need) {
@@ -177,8 +177,32 @@ int ggml_metal_op_dragon_moe_fused_ntg(const struct ggml_tensor * op, int gpu_co
     return (int) P;
 }
 
-bool ggml_metal_op_dragon_moe_sh_split(const struct ggml_tensor * op) {
+bool ggml_metal_op_olala_moe_sh_split(const struct ggml_tensor * op) {
     return op->src[0]->ne[1] <= 2;
+}
+
+size_t ggml_metal_op_olala_tpa_attn_smem(const struct ggml_tensor * op, int nc) {
+    const int64_t Dh = op->src[0]->ne[0];
+    const int64_t Hn = ggml_get_op_params_i32(op, 0);
+    const int64_t R  = ggml_get_op_params_i32(op, 1);
+    // [ kv (Hn*nc*Dh half) | per simdgroup: 64 float + 64 half | coefficients (nc*(2*Hn*R + 2*Hn) half) | mask, prev (nc) ]
+    return Hn*nc*Dh*2 + Hn*(64*4 + 64*2) + (nc*(2*Hn*R + 2*Hn) + 1)/2*2*2 + 2*nc*4;
+}
+
+struct ggml_metal_olala_tpa_attn_split ggml_metal_op_olala_tpa_attn_split(const struct ggml_tensor * op, int gpu_cores) {
+    const int64_t n_kv = op->src[1]->ne[1];
+    const int64_t T    = op->src[0]->ne[2]*op->src[0]->ne[3];
+
+    ggml_metal_olala_tpa_attn_split res;
+    res.nc = 8; // DTPA_NC
+    // decode: one threadgroup per GPU core (a single wave: one threadgroup fits per core), fewer chunks per token for
+    // batches; unknown core count: 64
+    const int64_t ntg  = gpu_cores > 0 ? gpu_cores : 64;
+    const int64_t want = std::max<int64_t>(1, std::min<int64_t>((ntg + T - 1)/T, (n_kv + 4*res.nc - 1)/(4*res.nc)));
+    const int64_t chunk = ((n_kv + want - 1)/want + res.nc - 1)/res.nc*res.nc;
+    res.chunk   = (int) std::max<int64_t>(chunk, res.nc);
+    res.n_chunk = (int) ((n_kv + res.chunk - 1)/res.chunk);
+    return res;
 }
 
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {

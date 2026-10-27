@@ -42,7 +42,7 @@ def find_token(token_list: Sequence[int], token: str) -> Sequence[int]:
     return token_ids
 
 
-def copy_with_new_metadata(reader: gguf.GGUFReader, writer: gguf.GGUFWriter, new_metadata: dict[str, MetadataDetails], remove_metadata: Sequence[str]) -> None:
+def copy_with_new_metadata(reader: gguf.GGUFReader, writer: gguf.GGUFWriter, new_metadata: dict[str, MetadataDetails], remove_metadata: Sequence[str], rename_arch: tuple[str, str] | None = None) -> None:
     for field in reader.fields.values():
         # Suppress virtual fields and fields written by GGUFWriter
         if field.name == gguf.Keys.General.ARCHITECTURE or field.name.startswith('GGUF.'):
@@ -70,7 +70,12 @@ def copy_with_new_metadata(reader: gguf.GGUFReader, writer: gguf.GGUFWriter, new
             logger.debug(f'Copying {field.name}')
 
         if val.value is not None:
-            writer.add_key_value(field.name, val.value, val.type, sub_type=sub_type if val.sub_type is None else val.sub_type)
+            name = field.name
+            # keys of the architecture, e.g. "<arch>.block_count", follow its new name
+            if rename_arch is not None and name.startswith(rename_arch[0] + '.'):
+                name = rename_arch[1] + name[len(rename_arch[0]):]
+                logger.debug(f'Renaming {field.name} -> {name}')
+            writer.add_key_value(name, val.value, val.type, sub_type=sub_type if val.sub_type is None else val.sub_type)
 
     if gguf.Keys.Tokenizer.CHAT_TEMPLATE in new_metadata:
         logger.debug('Adding chat template(s)')
@@ -114,6 +119,7 @@ def main() -> None:
     parser.add_argument("--chat-template-file",                        type=Path, help="Jinja file containing chat template", metavar='chat_template.jinja')
     parser.add_argument("--pre-tokenizer",                             type=str,  help="The models tokenizer.ggml.pre", metavar='"pre tokenizer"')
     parser.add_argument("--remove-metadata",      action="append",     type=str,  help="Remove metadata (by key name) from output model", metavar='general.url')
+    parser.add_argument("--architecture",                              type=str,  help="Rename the architecture (general.architecture and the keys prefixed with it)", metavar='"arch"')
     parser.add_argument("--special-token",        action="append",     type=str,  help="Special token by value", nargs=2, metavar=(' | '.join(token_names.keys()), '"<token>"'))
     parser.add_argument("--special-token-by-id",  action="append",     type=str,  help="Special token by id", nargs=2, metavar=(' | '.join(token_names.keys()), '0'))
     parser.add_argument("--force",                action="store_true",            help="Bypass warnings without confirmation")
@@ -202,6 +208,12 @@ def main() -> None:
             sys.exit(0)
 
     logger.info(f'* Writing: {args.output}')
+    rename_arch = None
+    if args.architecture and args.architecture != arch:
+        logger.info(f'* Renaming the architecture: {arch} -> {args.architecture}')
+        rename_arch = (arch, args.architecture)
+        arch = args.architecture
+
     writer = gguf.GGUFWriter(args.output, arch=arch, endianess=reader.endianess)
 
     alignment = get_field_data(reader, gguf.Keys.General.ALIGNMENT)
@@ -209,7 +221,7 @@ def main() -> None:
         logger.debug(f'Setting custom alignment: {alignment}')
         writer.data_alignment = alignment
 
-    copy_with_new_metadata(reader, writer, new_metadata, remove_metadata)
+    copy_with_new_metadata(reader, writer, new_metadata, remove_metadata, rename_arch)
 
 
 if __name__ == '__main__':

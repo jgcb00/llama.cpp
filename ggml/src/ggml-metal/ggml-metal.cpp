@@ -240,9 +240,13 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             {
                 res += ggml_metal_op_mamba3_mimo_extra_ws(tensor);
             } break;
-        case GGML_OP_DRAGON_MOE:
+        case GGML_OP_OLALA_MOE:
             {
-                res += ggml_metal_op_dragon_moe_extra_ws(tensor);
+                res += ggml_metal_op_olala_moe_extra_ws(tensor);
+            } break;
+        case GGML_OP_OLALA_TPA_ATTN:
+            {
+                res += ggml_metal_op_olala_tpa_attn_extra_tmp(tensor, ggml_metal_device_get_props((ggml_metal_device_t) buft->device->context)->gpu_core_count);
             } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
@@ -886,17 +890,22 @@ static ggml_backend_dev_t ggml_backend_metal_reg_device_get(ggml_backend_reg_t r
     return ctx->devices[index];
 }
 
-static ggml_backend_feature g_ggml_backend_metal_features[] = {
-#if defined(GGML_METAL_EMBED_LIBRARY)
-    { "EMBED_LIBRARY", "1" },
-#endif
-    { NULL, NULL },
-};
-
 static ggml_backend_feature * ggml_backend_metal_get_features(ggml_backend_reg_t reg) {
-    return g_ggml_backend_metal_features;
-
-    GGML_UNUSED(reg);
+    // TENSOR: the first device has the tensor API (matrix units of M5 / A19)
+    static ggml_backend_feature features[3];
+    static std::once_flag once;
+    std::call_once(once, [reg] {
+        ggml_backend_metal_reg_t ctx = (ggml_backend_metal_reg_t) reg->context;
+        int n = 0;
+#if defined(GGML_METAL_EMBED_LIBRARY)
+        features[n++] = { "EMBED_LIBRARY", "1" };
+#endif
+        if (!ctx->devices.empty() && ggml_metal_device_get_props((ggml_metal_device_t) ctx->devices[0]->context)->has_tensor) {
+            features[n++] = { "TENSOR", "1" };
+        }
+        features[n] = { NULL, NULL };
+    });
+    return features;
 }
 
 // test/tune-only override for the FA vec (Q, NE) selection, reached via proc_address.

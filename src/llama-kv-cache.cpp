@@ -1797,6 +1797,68 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+void llama_kv_cache::set_input_prev_cell(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+
+    const int64_t n_kv     = dst->ne[0];
+    const int64_t n_stream = dst->ne[1];
+    const int64_t n_tps    = ubatch->n_tokens/n_stream;
+
+    // a sequence of the cell (the lowest one: the cells shared by several sequences are their common prefix)
+    auto seq_first = [](const llama_kv_cells & cells, uint32_t i) -> llama_seq_id {
+        for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+            if (cells.seq_has(i, s)) {
+                return s;
+            }
+        }
+        return -1;
+    };
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        const llama_seq_id seq0 = ubatch->seq_id[s*n_tps][0];
+        const auto & cells = v_cells.at(seq_to_stream[seq0]);
+
+        int32_t * data = (int32_t *) ((char *) dst->data + s*dst->nb[1]);
+
+        // (seq, pos) -> cell, built only when a previous position is not in the cell just before
+        std::unordered_map<uint64_t, int32_t> idx;
+        auto key = [](llama_seq_id seq, llama_pos pos) { return ((uint64_t) (uint32_t) seq << 32) | (uint32_t) pos; };
+
+        for (int64_t i = 0; i < n_kv; ++i) {
+            data[i] = -1;
+            if (i >= (int64_t) cells.size() || cells.is_empty(i)) {
+                continue;
+            }
+            const llama_pos    p   = cells.pos_get(i);
+            const llama_seq_id seq = seq_first(cells, i);
+            if (p == 0 || seq < 0) {
+                continue;
+            }
+            if (i > 0 && !cells.is_empty(i - 1) && cells.pos_get(i - 1) == p - 1 && cells.seq_has(i - 1, seq)) {
+                data[i] = (int32_t) (i - 1);
+                continue;
+            }
+            if (idx.empty()) {
+                for (int64_t j = 0; j < n_kv && j < (int64_t) cells.size(); ++j) {
+                    if (cells.is_empty(j)) {
+                        continue;
+                    }
+                    for (llama_seq_id sj = 0; sj < LLAMA_MAX_SEQ; ++sj) {
+                        if (cells.seq_has(j, sj)) {
+                            idx[key(sj, cells.pos_get(j))] = (int32_t) j;
+                        }
+                    }
+                }
+            }
+            const auto it = idx.find(key(seq, p - 1));
+            if (it != idx.end()) {
+                data[i] = it->second;
+            }
+        }
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -2915,6 +2977,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_prev_cell(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_prev_cell(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
