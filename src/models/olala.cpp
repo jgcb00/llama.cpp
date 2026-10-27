@@ -72,6 +72,7 @@ static bool olala_state_bf16() { return olala_state_mode() != OLALA_STATE_F32; }
 static thread_local bool olala_layer_cpu = true;
 // the layer runs on the Metal backend, which implements GGML_OP_OLALA_MOE (3 dispatches)
 static thread_local bool olala_layer_metal = false;
+static thread_local ggml_backend_dev_t olala_layer_dev = nullptr;
 
 // the Metal Olala kernels (fused MoE, TPA prep) are decode kernels: ubatches above this many tokens use the graph path
 // (OLALA_NO_FUSED_MOE forces the graph path for the MoE)
@@ -3538,13 +3539,20 @@ static ggml_tensor * build_olala_v_mixer(
 
     // Metal: the whole preparation in 3 ops (9 projections in one GEMV, TPA expand + token shift + norms + scalable softmax
     // + lambda + gate in one kernel, differential combine x gate in one kernel); the attention itself stays in build_attn.
+    ggml_tensor * pr = nullptr;
     if (olala_layer_metal && layer.attn_shift_k != nullptr && n_tokens <= OLALA_METAL_MAX_TOKENS) {
+        ggml_tensor * wlist[9] = { layer.wq, layer.attn_wa_k, layer.attn_wa_v, layer.attn_wb_k, layer.attn_wb_v,
+                                   layer.attn_shift_k, layer.attn_shift_v, layer.attn_lambda, layer.attn_gate };
+        pr = ggml_olala_mmv(ctx, cur, wlist, 9);
+        // weights the Metal kernel cannot read (e.g. mixed types): the portable path below, not a CPU round trip
+        if (!ggml_backend_dev_supports_op(olala_layer_dev, pr)) {
+            pr = nullptr;
+        }
+    }
+    if (pr) {
         const int64_t n_seqs = gctx.ubatch.n_seqs;
         GGML_ASSERT(n_tokens % n_seqs == 0);
 
-        ggml_tensor * wlist[9] = { layer.wq, layer.attn_wa_k, layer.attn_wa_v, layer.attn_wb_k, layer.attn_wb_v,
-                                   layer.attn_shift_k, layer.attn_shift_v, layer.attn_lambda, layer.attn_gate };
-        ggml_tensor * pr = ggml_olala_mmv(ctx, cur, wlist, 9);
         ggml_set_name(pr, "v_proj_fused");
 
         ggml_tensor * states_all = mctx_recr->get_r_l(il);
@@ -3820,6 +3828,7 @@ llama_model_olala::graph::graph(const llama_model & model, const llm_graph_param
     for (int il = 0; il < n_layer; ++il) {
         {
             ggml_backend_dev_t dev = model.dev_layer(il);
+            olala_layer_dev = dev;
             static const bool force_portable = olala_env_on("OLALA_PORTABLE");
             olala_layer_cpu = !force_portable &&
                 (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -3870,10 +3879,11 @@ llama_model_olala::graph::graph(const llama_model & model, const llm_graph_param
             !olala_tensor_repacked(model.layers[il].ffn_latent_up) &&
             !olala_tensor_repacked(model.layers[il].ffn_up_shexp) &&
             !olala_tensor_repacked(model.layers[il].ffn_down_shexp);
+        ggml_tensor * moe_op = nullptr;
         if (use_moe_op) {
             // Whole MoE block (latent down, router, top-k, experts, latent up,
             // shared expert, sum) as one CPU op: 3 barriers instead of ~14 nodes.
-            y_mlp = ggml_olala_moe(ctx0, cur,
+            moe_op = ggml_olala_moe(ctx0, cur,
                     model.layers[il].ffn_latent_down,
                     model.layers[il].ffn_gate_inp,
                     model.layers[il].ffn_exp_probs_b,
@@ -3884,6 +3894,14 @@ llama_model_olala::graph::graph(const llama_model & model, const llm_graph_param
                     model.layers[il].ffn_down_shexp,
                     (int) n_expert_used, hparams.expert_weights_scale,
                     lazy_experts ? olala_expert_cache_mib(model) : -1);
+            // a Metal layer whose weights the Metal kernels cannot read (e.g. Q5_K experts) takes the graph path below:
+            // the op would otherwise fall back to the CPU, one round trip per layer
+            if (metal_moe && !lazy_experts && !ggml_backend_dev_supports_op(olala_layer_dev, moe_op)) {
+                moe_op = nullptr;
+            }
+        }
+        if (moe_op) {
+            y_mlp = moe_op;
             cb(y_mlp, "mlp_out", il);
         } else {
             // n_embd → moe_latent_size bottleneck before the routed experts.

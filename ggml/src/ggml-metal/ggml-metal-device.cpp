@@ -814,7 +814,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_olala_moe(ggml_m
     const int32_t msplit = ggml_metal_op_olala_moe_msplit(op);
     const int32_t nf    = msplit > 0 ? (int32_t) (op->src[4]->ne[1]/msplit/4) : 1;
 
-    snprintf(base, 256, "kernel_olala_moe_%s_%s", kname, ggml_type_name(w->type));
+    const int           is = ggml_metal_op_olala_moe_sh_src(which);
+    const ggml_tensor * ws = is >= 0 ? op->src[is] : w;
+    const bool m_mixed = which == 4 && (op->src[5]->type != w->type || op->src[7]->type != w->type || op->src[8]->type != w->type);
+    if (m_mixed) {
+        snprintf(base, 256, "kernel_olala_moe_m_%s_%s_%s_%s", ggml_type_name(w->type), ggml_type_name(op->src[5]->type),
+                 ggml_type_name(op->src[7]->type), ggml_type_name(op->src[8]->type));
+    } else if (ws->type == w->type) {
+        snprintf(base, 256, "kernel_olala_moe_%s_%s", kname, ggml_type_name(w->type));
+    } else {
+        snprintf(base, 256, "kernel_olala_moe_%s_%s_%s", kname, ggml_type_name(w->type), ggml_type_name(ws->type));
+    }
     snprintf(name, 256, "%s_e%d_l%d_f%d_s%d_m%d", base, nch_e, nch_l, nch_f, nch_s, nf);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -967,6 +977,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
     return res;
 }
 
+// weight types with a bfloat-operand matrix-matrix kernel (kernel_mul_mm[_id]_<type>_f32_bf)
+static bool ggml_metal_mm_has_bf(ggml_type t) {
+    return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];
@@ -991,8 +1006,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    // src1 precision >= BF16 [TAG_GGML_PREC]: bfloat operands instead of half (Q8_0)
-    const bool s1_bf = !has_tensor && tsrc0 == GGML_TYPE_Q8_0 && tsrc1 == GGML_TYPE_F32 && ggml_get_op_params_i32(op, 3) == GGML_PREC_BF16 &&
+    // src1 precision >= BF16 [TAG_GGML_PREC]: bfloat operands instead of half
+    const bool s1_bf = !has_tensor && ggml_metal_mm_has_bf(tsrc0) && tsrc1 == GGML_TYPE_F32 && ggml_get_op_params_i32(op, 3) == GGML_PREC_BF16 &&
         ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_bfloat;
 
     snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), s1_bf ? "_bf" : "");
@@ -1339,8 +1354,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     // src1 prec [TAG_GGML_PREC]
     const bool amax = ggml_get_op_params_i32(op, 3) == GGML_PREC_F32;
 
-    // src1 precision >= BF16 [TAG_GGML_PREC]: bfloat operands instead of half (Q8_0)
-    const bool s1_bf = tsrc0 == GGML_TYPE_Q8_0 && tsrc1 == GGML_TYPE_F32 && ggml_get_op_params_i32(op, 3) == GGML_PREC_BF16 &&
+    // src1 precision >= BF16 [TAG_GGML_PREC]: bfloat operands instead of half
+    const bool s1_bf = ggml_metal_mm_has_bf(tsrc0) && tsrc1 == GGML_TYPE_F32 && ggml_get_op_params_i32(op, 3) == GGML_PREC_BF16 &&
         ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_bfloat;
 
     snprintf(base, 256, "kernel_mul_mm_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), s1_bf ? "_bf" : "");

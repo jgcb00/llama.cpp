@@ -135,8 +135,20 @@ int ggml_metal_op_olala_moe_sh_rows(const struct ggml_tensor * op) {
 
 // kernel m replaces b1 and b2 for up to 2 tokens
 bool ggml_metal_op_olala_moe_merged(const struct ggml_tensor * op) {
-    // kernel m reads W_up, W_down, W_us and W_ds with one weight type
-    const bool same_type = op->src[4]->type == op->src[7]->type && op->src[4]->type == op->src[8]->type;
+    // kernel m reads W_up, W_down, W_us and W_ds with one weight type or one of the combinations instantiated in
+    // mamba3.metal (kernel_olala_moe_m_<W_up>_<W_down>_<W_us>_<W_ds>)
+    static const ggml_type mixed[][4] = {
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_BF16 },
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_BF16 },
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 },
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K },
+        { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K },
+    };
+    const ggml_type t[4] = { op->src[4]->type, op->src[5]->type, op->src[7]->type, op->src[8]->type };
+    bool same_type = t[1] == t[0] && t[2] == t[0] && t[3] == t[0];
+    for (const auto & m : mixed) {
+        same_type = same_type || (t[0] == m[0] && t[1] == m[1] && t[2] == m[2] && t[3] == m[3]);
+    }
     return same_type && op->src[0]->ne[1] <= 2 && ggml_metal_op_olala_moe_msplit(op) > 0 && ggml_metal_op_olala_moe_sh_rows(op) > 0;
 }
 
@@ -175,6 +187,52 @@ int ggml_metal_op_olala_moe_fused_ntg(const struct ggml_tensor * op, int gpu_cor
         return 0;
     }
     return (int) P;
+}
+
+int ggml_metal_op_olala_moe_sh_src(int which) {
+    switch (which) {
+        case 0: return 7; // a : W_ld | W_us
+        case 1: return 7; // b1: W_up | W_us (sh_split)
+        case 2: return 8; // b2: W_down | W_ds (sh_split)
+        case 3: return 8; // c : W_lu | W_ds
+        default: return -1;
+    }
+}
+
+// weight types of kernels a, b1, b2 and c (routed-path weight, shared-expert weight) and of kernel m (W_up, W_down, W_us,
+// W_ds), as instantiated in mamba3.metal: one type among F32 / F16 / BF16 / Q8_0 for all, or the combinations of the
+// q8_0-safe2 and q5_k_m (safe overrides) files below
+static bool dmoe_uniform_type(ggml_type t) {
+    return t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_BF16 || t == GGML_TYPE_Q8_0;
+}
+
+bool ggml_metal_op_olala_moe_types_ok(const struct ggml_tensor * op, bool has_bfloat) {
+    struct pair { int which; ggml_type w, s; };
+    static const pair mixed[] = {
+        { 0, GGML_TYPE_Q8_0, GGML_TYPE_BF16 }, { 0, GGML_TYPE_BF16, GGML_TYPE_Q8_0 }, { 0, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K },
+        { 1, GGML_TYPE_Q8_0, GGML_TYPE_BF16 }, { 1, GGML_TYPE_BF16, GGML_TYPE_Q8_0 }, { 1, GGML_TYPE_Q8_0, GGML_TYPE_Q5_K },
+        { 2, GGML_TYPE_Q8_0, GGML_TYPE_BF16 }, { 2, GGML_TYPE_BF16, GGML_TYPE_Q8_0 },
+        { 2, GGML_TYPE_Q6_K, GGML_TYPE_BF16 }, { 2, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 },
+        { 2, GGML_TYPE_Q5_K, GGML_TYPE_Q5_K }, { 2, GGML_TYPE_Q6_K, GGML_TYPE_Q6_K },
+        { 3, GGML_TYPE_Q8_0, GGML_TYPE_BF16 }, { 3, GGML_TYPE_BF16, GGML_TYPE_Q8_0 },
+        { 3, GGML_TYPE_BF16, GGML_TYPE_Q5_K }, { 3, GGML_TYPE_BF16, GGML_TYPE_Q6_K },
+    };
+    static const int routed[4] = { 1, 4, 5, 6 };
+    for (int which = 0; which < 4; ++which) {
+        const ggml_type tw = op->src[routed[which]]->type;
+        const ggml_type ts = op->src[ggml_metal_op_olala_moe_sh_src(which)]->type;
+        if ((tw == GGML_TYPE_BF16 || ts == GGML_TYPE_BF16) && !has_bfloat) {
+            return false;
+        }
+        bool ok = tw == ts && dmoe_uniform_type(tw);
+        for (const pair & p : mixed) {
+            ok = ok || (p.which == which && p.w == tw && p.s == ts);
+        }
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool ggml_metal_op_olala_moe_sh_split(const struct ggml_tensor * op) {

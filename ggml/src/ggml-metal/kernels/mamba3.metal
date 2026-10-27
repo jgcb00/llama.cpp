@@ -670,7 +670,7 @@ kernel void kernel_geodesic_f32(
 // ---------------------------------------------------------------------------------------------
 // GGML_OP_OLALA_MOE: the Olala latent MoE block in 4 dispatches (semantic reference:
 // ggml_compute_forward_olala_moe_f32 in ggml-cpu/ops.cpp). Activations f32, weights T4 =
-// float4 / half4 / bfloat4, 256 threads (8 simdgroups) per threadgroup, lanes over 4-wide
+// float4 / half4 / bfloat4 / Q8_0 (W_down also Q6_K), 256 threads (8 simdgroups) per threadgroup, lanes over 4-wide
 // columns (rows must be 16-byte aligned: n % 8 == 0 for f16/bf16). Every dot product first
 // issues all of its row loads (up to DMOE_MAXCH float4 per lane, unrolled) so that the memory
 // latency is paid once per row group, not once per load: decode is latency-bound, not
@@ -680,6 +680,9 @@ kernel void kernel_geodesic_f32(
 //       sigmoid + bias, ties -> lower index; slice 0 publishes sel / w_k), h = relu(W_up[e]^T lat)^2
 //   b2: per (token, kk, n_lat row slice): o[t][kk][rows] = w_k * W_down[e][rows]^T h
 //   c:  out = W_lu^T sum_kk o[t][kk] + W_ds^T ush                                       -> dst
+// a, b1, b2 and c take the type of their routed-path weight (T4) and of the shared-expert weight they read (TS), so
+// that mixed files (e.g. Q8_0 experts, Q6_K W_down, BF16 W_lu / W_ds) stay on these kernels; m takes the types of
+// W_up, W_down, W_us and W_ds; f takes one type
 
 #define DMOE_NTH   256
 #define DMOE_NSG   8
@@ -695,10 +698,13 @@ constant int FC_dmoe_nch_f [[function_constant(FC_OLALA_MOE + 2)]];
 constant int FC_dmoe_nch_s [[function_constant(FC_OLALA_MOE + 3)]];
 constant int FC_dmoe_nf    [[function_constant(FC_OLALA_MOE + 4)]]; // kernel m: float4 per W_down row slice
 
-// weight access of the Olala kernels, by weight type T4: float4 / half4 / bfloat4 (4 elements of the row type), or
-// dmoe_q8 for Q8_0 rows (blocks of 32: f16 scale + 32 int8). dmoe_rb: bytes of n elements (n a multiple of 32 for
-// Q8_0: whole rows and block-aligned slices), dmoe_ld: elements e .. e+3 of a row (e a multiple of 4)
-struct dmoe_q8 { char4 v; };
+// weight access of the Olala kernels, by weight type T4: float4 / half4 / bfloat4 (4 elements of the row type),
+// dmoe_q8 for Q8_0 rows (blocks of 32: f16 scale + 32 int8), dmoe_q5k / dmoe_q6k for Q5_K / Q6_K rows (256 elements).
+// dmoe_rb: bytes of n elements (n a multiple of the block size: whole rows and block-aligned slices), dmoe_ld:
+// elements e .. e+3 of a row (e a multiple of 4)
+struct dmoe_q8  { char4 v; };
+struct dmoe_q5k { char4 v; };
+struct dmoe_q6k { char4 v; };
 
 template<typename T4>
 static inline size_t dmoe_rb(size_t n) {
@@ -707,6 +713,15 @@ static inline size_t dmoe_rb(size_t n) {
 template<>
 inline size_t dmoe_rb<dmoe_q8>(size_t n) {
     return (n/32)*34;
+}
+
+template<>
+inline size_t dmoe_rb<dmoe_q5k>(size_t n) {
+    return (n/256)*176;
+}
+template<>
+inline size_t dmoe_rb<dmoe_q6k>(size_t n) {
+    return (n/256)*210;
 }
 
 template<typename T4>
@@ -719,6 +734,48 @@ inline float4 dmoe_ld<dmoe_q8>(device const char * row, int e) {
     const float d = (float) *(device const half *) b;
     const packed_char4 q = *(device const packed_char4 *) (b + 2 + (e & 31)); // 2-byte aligned
     return float4(q)*d;
+}
+// Q5_K (as dequantize_row_q5_K): element i = 64*g + 32*u + l of a block: low 4 bits in qs[32*g + l] (high nibble when
+// u = 1), 5th bit at bit 2*g + u of qh[l], 6-bit scale / min number 2*g + u (get_scale_min_k4); the 4 elements share g, u
+template<>
+inline float4 dmoe_ld<dmoe_q5k>(device const char * row, int e) {
+    device const uchar * b = (device const uchar *) row + (size_t) (e >> 8)*176;
+    const int i = e & 255;
+    const int j = i >> 5; // 2*g + u
+    const int l = i & 31;
+    device const uchar * sc = b + 4;
+    uchar ls;
+    uchar lm;
+    if (j < 4) {
+        ls = sc[j] & 63;
+        lm = sc[j + 4] & 63;
+    } else {
+        ls = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4);
+        lm = (sc[j + 4] >> 4)  | ((sc[j]     >> 6) << 4);
+    }
+    const uchar4 qs = uchar4(*(device const packed_uchar4 *) (b + 48 + 32*(j >> 1) + l));
+    const uchar4 qh = uchar4(*(device const packed_uchar4 *) (b + 16 + l));
+    const uchar4 lo = (j & 1) ? (qs >> 4) : (qs & (uchar) 0xF);
+    const uchar4 hi = (qh >> (uchar) j) & (uchar) 1;
+    const float  d  = (float) *(device const half *) (b + 0)*(float) ls;
+    const float  m  = (float) *(device const half *) (b + 2)*(float) lm;
+    return float4(lo | (hi << 4))*d - m;
+}
+// Q6_K (as dequantize_row_q6_K): element i = 128*h + 32*q + l of a block: low 4 bits in ql[64*h + 32*(q&1) + l] (high
+// nibble when q >= 2), high 2 bits at bit 2*q of qh[32*h + l], scale scales[8*h + l/16 + 2*q]; the 4 elements share h, q
+template<>
+inline float4 dmoe_ld<dmoe_q6k>(device const char * row, int e) {
+    device const uchar * b = (device const uchar *) row + (size_t) (e >> 8)*210;
+    const int i = e & 255;
+    const int h = i >> 7;
+    const int q = (i >> 5) & 3;
+    const int l = i & 31;
+    const uchar4 ql = uchar4(*(device const packed_uchar4 *) (b + 64*h + 32*(q & 1) + l));
+    const uchar4 qh = uchar4(*(device const packed_uchar4 *) (b + 128 + 32*h + l));
+    const uchar4 lo = (q & 2) ? (ql >> 4) : (ql & (uchar) 0xF);
+    const uchar4 hi = (qh >> (uchar) (2*q)) & (uchar) 3;
+    const float  d  = (float) *(device const half *) (b + 208)*(float) *(device const char *) (b + 192 + 8*h + (l >> 4) + 2*q);
+    return (float4(int4(lo | (hi << 4))) - 32.0f)*d;
 }
 
 // loads the lane's chunks of one weight row: w[i] = row[tiisg*4 + i*128 .. +3], i < nch
@@ -961,7 +1018,7 @@ static inline void dmoe_geodesic_row_tg(
 
 // stage a, threadgroup tgx: rows tgx*8 + sgitg of [W_ld | W_r | W_us]; KS = 2: rows tgx*4 + sgitg%4, simdgroup sgitg/4
 // takes the second half of the row (K split, the halves summed through threadgroup memory)
-template<typename T4, typename WSP, int KS = 1>
+template<typename T4, typename WSP, int KS = 1, typename TS = T4>
 static inline void dmoe_stage_a(
         constant ggml_metal_kargs_olala_moe & args,
         device const float * x,
@@ -1006,7 +1063,7 @@ static inline void dmoe_stage_a(
         stride = args.n_expert;
         is_f32 = true;
     } else if (row < nC) {
-        wt     = w_us + dmoe_rb<T4>((size_t) (row - nB)*n);
+        wt     = w_us + dmoe_rb<TS>((size_t) (row - nB)*n);
         out    = ws + args.off_ush + (row - nB);
         stride = args.n_ff_sh;
         relu2  = true;
@@ -1019,6 +1076,8 @@ static inline void dmoe_stage_a(
     if (row < nC) {
         if (is_f32) {
             dmoe_load_row<float4, DMOE_MAXCH/KS>(w, (device const char *) (wf + ko), nch, tiisg);
+        } else if (relu2) {
+            dmoe_load_row<TS, DMOE_MAXCH/KS>(w, wt + dmoe_rb<TS>(ko), nch, tiisg);
         } else {
             dmoe_load_row<T4, DMOE_MAXCH/KS>(w, wt + dmoe_rb<T4>(ko), nch, tiisg);
         }
@@ -1089,7 +1148,7 @@ static inline void dmoe_stage_a(
     }
 }
 
-template<typename T4>
+template<typename T4, typename TS = T4>
 kernel void kernel_olala_moe_a(
         constant ggml_metal_kargs_olala_moe & args,
         device const float * x,
@@ -1119,24 +1178,24 @@ kernel void kernel_olala_moe_a(
 
     if (args.a_ks == 4) {
         if (args.pre_geo) {
-            dmoe_stage_a<T4, device float *, 4>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg, pg, pg_scale, pg_bias, pg_out);
+            dmoe_stage_a<T4, device float *, 4, TS>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg, pg, pg_scale, pg_bias, pg_out);
         } else {
-            dmoe_stage_a<T4, device float *, 4>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg);
+            dmoe_stage_a<T4, device float *, 4, TS>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg);
         }
         return;
     }
     if (args.a_ks == 2) {
         if (args.pre_geo) {
-            dmoe_stage_a<T4, device float *, 2>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg, pg, pg_scale, pg_bias, pg_out);
+            dmoe_stage_a<T4, device float *, 2, TS>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg, pg, pg_scale, pg_bias, pg_out);
         } else {
-            dmoe_stage_a<T4, device float *, 2>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg);
+            dmoe_stage_a<T4, device float *, 2, TS>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg);
         }
         return;
     }
     if (args.pre_geo) {
-        dmoe_stage_a<T4>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg, pg, pg_scale, pg_bias, pg_out);
+        dmoe_stage_a<T4, device float *, 1, TS>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg, pg, pg_scale, pg_bias, pg_out);
     } else {
-        dmoe_stage_a<T4>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg);
+        dmoe_stage_a<T4, device float *, 1, TS>(args, x, w_ld, w_r, w_us, ws, shm, 0, tgpig.x, tiitg, sgitg, tiisg);
     }
 }
 
@@ -1261,7 +1320,7 @@ static inline void dmoe_stage_b1(
     }
 }
 
-template<typename T4>
+template<typename T4, typename TS = T4>
 kernel void kernel_olala_moe_b1(
         constant ggml_metal_kargs_olala_moe & args,
         device const float * ws_in,
@@ -1280,7 +1339,7 @@ kernel void kernel_olala_moe_b1(
     if ((int) tgpig.x >= nb) {
         // sh_split: shared-expert up rows (the rows of kernel a after lat and logits), all the tokens
         if (tgpig.y == 0) {
-            dmoe_stage_a<T4>(args, x, w_us, (device const float *) w_us, w_us, ws_out, shm,
+            dmoe_stage_a<TS>(args, x, w_us, (device const float *) w_us, w_us, ws_out, shm,
                              args.n_lat + args.n_expert, tgpig.x - nb, tiitg, sgitg, tiisg);
         }
         return;
@@ -1385,7 +1444,7 @@ static inline void dmoe_stage_ds(
     }
 }
 
-template<typename T4>
+template<typename T4, typename TS = T4>
 kernel void kernel_olala_moe_b2(
         constant ggml_metal_kargs_olala_moe & args,
         device const float * ws_in,
@@ -1401,7 +1460,7 @@ kernel void kernel_olala_moe_b2(
     if ((int) tgpig.x >= nb) {
         // sh_split: shared-expert down
         if ((int) tgpig.y*args.tbc < args.n_tok) {
-            dmoe_stage_ds<T4>(args, ws_out, w_ds, shm, tgpig.x - nb, tgpig.y, tiitg, sgitg, tiisg);
+            dmoe_stage_ds<TS>(args, ws_out, w_ds, shm, tgpig.x - nb, tgpig.y, tiitg, sgitg, tiisg);
         }
         return;
     }
@@ -1495,7 +1554,7 @@ static inline int dmoe_route_sg(
 // routed part computes the FF slice p%nsplit of the expert slot p/nsplit (into threadgroup memory), then its share of
 // the down projection (the slice columns of every W_down row) and adds it, weighted, to acc[t] by float atomics.
 // The extra threadgroups do the same for the shared expert (sh_rows FF rows each, all the tokens) into dsh.
-template<typename T4, typename WSP = device float *>
+template<typename T4, typename WSP = device float *, typename TD = T4> // TD: W_down type
 static inline void dmoe_stage_m_routed(
         constant ggml_metal_kargs_olala_moe & args,
         WSP                  ws,
@@ -1533,18 +1592,18 @@ static inline void dmoe_stage_m_routed(
 
     // down weights issued first (they depend only on the routing): columns [sp*FFS, (sp+1)*FFS) of the W_down[ex]
     // rows tiitg + i*DMOE_NTH (FFS <= 4*DMOE_MF)
-    device const char * wdn = w_down + dmoe_rb<T4>((size_t) ex*n_lat*n_ff); // slice: elements sp*FFS + ...
+    device const char * wdn = w_down + dmoe_rb<TD>((size_t) ex*n_lat*n_ff); // slice: elements sp*FFS + ...
     const int nf = FC_dmoe_nf; // FFS/4
     float4 wd[DMOE_MD][DMOE_MF];
 #pragma unroll
     for (int i = 0; i < DMOE_MD; ++i) {
         const int d = tiitg + i*DMOE_NTH;
         if (d < n_lat) {
-            device const char * r = wdn + dmoe_rb<T4>((size_t) d*n_ff);
+            device const char * r = wdn + dmoe_rb<TD>((size_t) d*n_ff);
 #pragma unroll
             for (int f = 0; f < DMOE_MF; ++f) {
                 if (f < nf) {
-                    wd[i][f] = dmoe_ld<T4>(r, sp*FFS + f*4);
+                    wd[i][f] = dmoe_ld<TD>(r, sp*FFS + f*4);
                 }
             }
         }
@@ -1595,7 +1654,7 @@ static inline void dmoe_stage_m_routed(
     }
 }
 
-template<typename T4>
+template<typename T4, typename TD = T4> // T4: W_us type, TD: W_ds type
 static inline void dmoe_stage_m_shared(
         constant ggml_metal_kargs_olala_moe & args,
         device       float * ws,
@@ -1640,10 +1699,10 @@ static inline void dmoe_stage_m_shared(
     // down: columns [s*SR, (s+1)*SR) of every W_ds row, one row per thread
     device const char * wds = w_ds; // slice: elements s*SR + ...
     for (int d = tiitg; d < n; d += DMOE_NTH) {
-        device const char * r = wds + dmoe_rb<T4>((size_t) d*n_sh);
+        device const char * r = wds + dmoe_rb<TD>((size_t) d*n_sh);
         float acc[DMOE_TB] = { 0.0f };
         for (int f = 0; f < SR/4; ++f) {
-            const float4 w = dmoe_ld<T4>(r, s*SR + f*4);
+            const float4 w = dmoe_ld<TD>(r, s*SR + f*4);
             for (int j = 0; j < T; ++j) {
                 acc[j] += dot(w, ((threadgroup const float4 *) (us + j*SR))[f]);
             }
@@ -1654,7 +1713,8 @@ static inline void dmoe_stage_m_shared(
     }
 }
 
-template<typename T4>
+// T4: W_up type, TD: W_down, TS: W_us, TDS: W_ds
+template<typename T4, typename TD = T4, typename TS = T4, typename TDS = TS>
 kernel void kernel_olala_moe_m(
         constant ggml_metal_kargs_olala_moe & args,
         device       float * ws,
@@ -1672,15 +1732,15 @@ kernel void kernel_olala_moe_m(
     const int nb = args.k*args.nsplit;
     if ((int) tgpig.x >= nb) {
         if (tgpig.y == 0) {
-            dmoe_stage_m_shared<T4>(args, ws, x, w_us, w_ds, shm, tgpig.x - nb, tiitg, sgitg, tiisg);
+            dmoe_stage_m_shared<TS, TDS>(args, ws, x, w_us, w_ds, shm, tgpig.x - nb, tiitg, sgitg, tiisg);
         }
         return;
     }
-    dmoe_stage_m_routed<T4>(args, ws, bias, w_up, w_down, shm, tgpig.x, tgpig.y, tiitg, sgitg, tiisg);
+    dmoe_stage_m_routed<T4, device float *, TD>(args, ws, bias, w_up, w_down, shm, tgpig.x, tgpig.y, tiitg, sgitg, tiisg);
 }
 
 // stage c of (output row block tgx, token pair tgy)
-template<typename T4, typename WSP, typename DP>
+template<typename T4, typename TS, typename WSP, typename DP>
 static inline void dmoe_stage_c(
         constant ggml_metal_kargs_olala_moe & args,
         WSP                  ws,
@@ -1758,7 +1818,7 @@ static inline void dmoe_stage_c(
         float4 wl[8];
         float4 wd[DMOE_MAXCH];
         dmoe_load_row<T4, 8>         (wl, w_lu + dmoe_rb<T4>((size_t) row*n_lat), nch_l, tiisg);
-        dmoe_load_row<T4, DMOE_MAXCH>(wd, w_ds + dmoe_rb<T4>((size_t) row*n_sh),  nch_s, tiisg);
+        dmoe_load_row<TS, DMOE_MAXCH>(wd, w_ds + dmoe_rb<TS>((size_t) row*n_sh),  nch_s, tiisg);
 #pragma unroll
         for (int j = 0; j < 2; ++j) {
             if (j < nt) {
@@ -1772,7 +1832,7 @@ static inline void dmoe_stage_c(
     }
 }
 
-template<typename T4>
+template<typename T4, typename TS = T4>
 kernel void kernel_olala_moe_c(
         constant ggml_metal_kargs_olala_moe & args,
         device       float * ws,
@@ -1791,7 +1851,7 @@ kernel void kernel_olala_moe_c(
         uint3  ntgp [[threadgroups_per_grid]]) {
     const int n = args.n_embd;
 
-    dmoe_stage_c<T4>(args, ws, w_lu, w_ds, dst, shm, tgpig.x, tgpig.y, tiitg, sgitg, tiisg);
+    dmoe_stage_c<T4, TS>(args, ws, w_lu, w_ds, dst, shm, tgpig.x, tgpig.y, tiitg, sgitg, tiisg);
 
     if (!args.geo) {
         return;
@@ -2138,6 +2198,36 @@ template [[host_name("kernel_olala_moe_c_q8_0")]]  kernel kernel_olala_moe_c_t  
 template [[host_name("kernel_olala_moe_m_q8_0")]]   kernel kernel_olala_moe_m_t  kernel_olala_moe_m<dmoe_q8>;
 template [[host_name("kernel_olala_moe_f_q8_0")]]   kernel kernel_olala_moe_f_t  kernel_olala_moe_f<dmoe_q8>;
 
+// mixed weight types (kernel_<routed type>_<shared-expert type>), e.g. q8_0-safe2 files: Q8_0 W_ld / W_up / W_us,
+// Q6_K W_down, BF16 W_lu / W_ds (see ggml_metal_olala_moe_types_ok)
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_olala_moe_a_q8_0_bf16")]]  kernel kernel_olala_moe_a_t  kernel_olala_moe_a<dmoe_q8, bfloat4>;
+template [[host_name("kernel_olala_moe_a_bf16_q8_0")]]  kernel kernel_olala_moe_a_t  kernel_olala_moe_a<bfloat4, dmoe_q8>;
+template [[host_name("kernel_olala_moe_b1_q8_0_bf16")]] kernel kernel_olala_moe_b1_t kernel_olala_moe_b1<dmoe_q8, bfloat4>;
+template [[host_name("kernel_olala_moe_b1_bf16_q8_0")]] kernel kernel_olala_moe_b1_t kernel_olala_moe_b1<bfloat4, dmoe_q8>;
+template [[host_name("kernel_olala_moe_b2_q8_0_bf16")]] kernel kernel_olala_moe_b2_t kernel_olala_moe_b2<dmoe_q8, bfloat4>;
+template [[host_name("kernel_olala_moe_b2_bf16_q8_0")]] kernel kernel_olala_moe_b2_t kernel_olala_moe_b2<bfloat4, dmoe_q8>;
+template [[host_name("kernel_olala_moe_b2_q6_K_bf16")]] kernel kernel_olala_moe_b2_t kernel_olala_moe_b2<dmoe_q6k, bfloat4>;
+template [[host_name("kernel_olala_moe_c_q8_0_bf16")]]  kernel kernel_olala_moe_c_t  kernel_olala_moe_c<dmoe_q8, bfloat4>;
+template [[host_name("kernel_olala_moe_c_bf16_q8_0")]]  kernel kernel_olala_moe_c_t  kernel_olala_moe_c<bfloat4, dmoe_q8>;
+// kernel m: kernel_olala_moe_m_<W_up>_<W_down>_<W_us>_<W_ds> (see ggml_metal_op_olala_moe_merged)
+template [[host_name("kernel_olala_moe_m_q8_0_q6_K_q8_0_bf16")]] kernel kernel_olala_moe_m_t kernel_olala_moe_m<dmoe_q8, dmoe_q6k, dmoe_q8, bfloat4>;
+template [[host_name("kernel_olala_moe_m_q8_0_q8_0_q8_0_bf16")]] kernel kernel_olala_moe_m_t kernel_olala_moe_m<dmoe_q8, dmoe_q8,  dmoe_q8, bfloat4>;
+#endif
+template [[host_name("kernel_olala_moe_b2_q6_K_q8_0")]] kernel kernel_olala_moe_b2_t kernel_olala_moe_b2<dmoe_q6k, dmoe_q8>;
+template [[host_name("kernel_olala_moe_m_q8_0_q6_K_q8_0_q8_0")]] kernel kernel_olala_moe_m_t kernel_olala_moe_m<dmoe_q8, dmoe_q6k, dmoe_q8, dmoe_q8>;
+// q5_k_m files with the safe overrides: Q5_K W_ld / W_us, Q8_0 W_up, Q5_K or Q6_K W_down / W_ds (per layer), BF16 W_lu
+template [[host_name("kernel_olala_moe_a_q5_K")]]       kernel kernel_olala_moe_a_t  kernel_olala_moe_a<dmoe_q5k>;
+template [[host_name("kernel_olala_moe_b1_q8_0_q5_K")]] kernel kernel_olala_moe_b1_t kernel_olala_moe_b1<dmoe_q8, dmoe_q5k>;
+template [[host_name("kernel_olala_moe_b2_q5_K")]]      kernel kernel_olala_moe_b2_t kernel_olala_moe_b2<dmoe_q5k>;
+template [[host_name("kernel_olala_moe_b2_q6_K")]]      kernel kernel_olala_moe_b2_t kernel_olala_moe_b2<dmoe_q6k>;
+template [[host_name("kernel_olala_moe_m_q8_0_q5_K_q5_K_q5_K")]] kernel kernel_olala_moe_m_t kernel_olala_moe_m<dmoe_q8, dmoe_q5k, dmoe_q5k, dmoe_q5k>;
+template [[host_name("kernel_olala_moe_m_q8_0_q6_K_q5_K_q6_K")]] kernel kernel_olala_moe_m_t kernel_olala_moe_m<dmoe_q8, dmoe_q6k, dmoe_q5k, dmoe_q6k>;
+#if defined(GGML_METAL_HAS_BF16)
+template [[host_name("kernel_olala_moe_c_bf16_q5_K")]]  kernel kernel_olala_moe_c_t  kernel_olala_moe_c<bfloat4, dmoe_q5k>;
+template [[host_name("kernel_olala_moe_c_bf16_q6_K")]]  kernel kernel_olala_moe_c_t  kernel_olala_moe_c<bfloat4, dmoe_q6k>;
+#endif
+
 
 // ---------------------------------------------------------------------------------------------
 // Olala V-layer helpers (semantic reference: ggml_compute_forward_olala_{mmv,tpa_prep,diff_gate} in ggml-cpu/ops.cpp)
@@ -2228,6 +2318,8 @@ template [[host_name("kernel_olala_mmv_f16")]]  kernel kernel_olala_mmv_t kernel
 template [[host_name("kernel_olala_mmv_bf16")]] kernel kernel_olala_mmv_t kernel_olala_mmv<bfloat4, 1, 2>;
 #endif
 template [[host_name("kernel_olala_mmv_q8_0")]] kernel kernel_olala_mmv_t kernel_olala_mmv<dmoe_q8, 1, 2>;
+template [[host_name("kernel_olala_mmv_q5_K")]] kernel kernel_olala_mmv_t kernel_olala_mmv<dmoe_q5k, 1, 2>;
+template [[host_name("kernel_olala_mmv_q6_K")]] kernel kernel_olala_mmv_t kernel_olala_mmv<dmoe_q6k, 1, 2>;
 
 
 // staged variant for larger batches (T > 4): y = concat_i(W_i^T x): one output row per simdgroup, x staged for tb tokens (same scheme as kernel_olala_moe_a)
@@ -2303,6 +2395,8 @@ template [[host_name("kernel_olala_mmv_st_f16")]]  kernel kernel_olala_mmv_st_t 
 template [[host_name("kernel_olala_mmv_st_bf16")]] kernel kernel_olala_mmv_st_t kernel_olala_mmv_st<bfloat4>;
 #endif
 template [[host_name("kernel_olala_mmv_st_q8_0")]] kernel kernel_olala_mmv_st_t kernel_olala_mmv_st<dmoe_q8>;
+template [[host_name("kernel_olala_mmv_st_q5_K")]] kernel kernel_olala_mmv_st_t kernel_olala_mmv_st<dmoe_q5k>;
+template [[host_name("kernel_olala_mmv_st_q6_K")]] kernel kernel_olala_mmv_st_t kernel_olala_mmv_st<dmoe_q6k>;
 
 // one threadgroup per (q head h, token t); the kv head hn = h / (H/Hn) is prepared by the G threadgroups
 // sharing it (only the first writes it). threadgroup memory: [ kk (Dh) | vv (Dh) | red (8) ]
