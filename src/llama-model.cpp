@@ -2364,6 +2364,10 @@ bool llama_model::tpa_cache_factored(llama_tpa_cache_type type) const {
     if (arch != LLM_ARCH_OLALA || hparams.olala_tpa_rank == 0) {
         return false;
     }
+    // OLALA_TPA_CACHE=full|factored overrides the layout (benchmarks); the log line still reads auto (<effective>)
+    if (const char * e = getenv("OLALA_TPA_CACHE")) {
+        return strcmp(e, "factored") == 0;
+    }
     switch (type) {
         case LLAMA_TPA_CACHE_TYPE_FACTORED:
             return true;
