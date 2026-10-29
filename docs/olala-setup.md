@@ -192,7 +192,7 @@ Then:
 ./build/bin/llama-server -m olala-bf16.gguf -ngl 99 -fa 1 -c 32768 -np 4 --port 8080
 ```
 
-**Attention KV cache layout (chosen automatically, no option).** The 7 attention layers can keep
+**Attention KV cache layout (chosen automatically).** The 7 attention layers can keep
 either the expanded K/V (*full*) or only the TPA factors of each token (*factored*, 2.6x less KV
 memory, more attention compute). The choice is made per GPU:
 
@@ -208,11 +208,23 @@ memory, more attention compute). The choice is made per GPU:
   The factored cache also needs ~180 MiB more compute buffer, shared by all the sequences.
   So full costs ~650 MiB more for one sequence at 32k, ~835 MiB more for each additional one,
   and twice that at 64k.
-- **M5 / A19 (GPUs with the Metal tensor API): factored.** Not measured yet.
+- **M5 / A19 (GPUs with the Metal tensor API): factored.** The decode attention then runs on the
+  matrix units (`kernel_olala_tpa_attn_tensor_f16`) and beats full from ~8k tokens on. Measured
+  on M5 Max (128 GB, macOS 26), one sequence, `llama-bench -fa 1 -p 512 -n 128 -d 0,8192,32768,65536`:
+
+  | | full | factored |
+  |---|---|---|
+  | Q8_0 decode, empty / 8k / 32k / 64k context | 199 / 176 / 123 / 88 t/s | 190 / 174 / 145 / 117 t/s |
+  | BF16 decode, empty / 8k / 32k / 64k context | 157 / 142 / 105 / 78 t/s | 151 / 142 / 121 / 103 t/s |
+  | Q8_0 prefill pp512, empty / 8k / 32k / 64k | 3755 / 3087 / 1771 / 1114 t/s | 4155 / 3086 / 1699 / 980 t/s |
+
+  With 12 to 128 concurrent users (llama-server, ~9.7k-token slots) factored gives 3-11 % more
+  total throughput, and at 128 users its KV cache takes ~31 GiB less.
 - **Other backends: full** (the factored kernels exist only for Metal and CPU).
 
 Applications that link libllama can force the layout with `llama_context_params.tpa_cache_type`
-(`LLAMA_TPA_CACHE_TYPE_FULL` / `_FACTORED`); perplexity is the same either way (wikitext-2, 8
+(`LLAMA_TPA_CACHE_TYPE_FULL` / `_FACTORED`), and the command-line tools with the environment
+variable `OLALA_TPA_CACHE=full` or `factored`; perplexity is the same either way (wikitext-2, 8
 chunks: 12.90 full, 12.88-12.89 factored).
 
 If Metal fails or the machine has < 16 GB: run on the Mac CPU instead with a quantized file
