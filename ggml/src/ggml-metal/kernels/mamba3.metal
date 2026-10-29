@@ -2869,6 +2869,306 @@ template [[host_name("kernel_olala_tpa_attn_f16_ne4")]] kernel kernel_olala_tpa_
 template [[host_name("kernel_olala_tpa_attn_f32_ne2")]] kernel kernel_olala_tpa_attn_t kernel_olala_tpa_attn<float, float4, 2>;
 template [[host_name("kernel_olala_tpa_attn_f32_ne4")]] kernel kernel_olala_tpa_attn_t kernel_olala_tpa_attn<float, float4, 4>;
 
+#ifdef GGML_METAL_HAS_TENSOR
+// kernel_olala_tpa_attn with the Metal 4 tensor API (matrix units, M5 / A19), Olala dims only
+// (H = 48, Hn = 12, R = 4, Dh = 128, f16 cache). All H q heads attend to the R rank rows of a window of DTPA_T_NKB
+// consecutive cells, the window overlapping the previous one by a cell (token shift). Per rank r (one Z buffer):
+//   Z_r = Q B_k[r]^T            (H x NKB matmul2d, rows read in place with the cell stride)
+//   zc[h, u] += A_u[j, r] Z_r[h, u],  zp[h, u] += A_{u-1}[j, r] Z_r[h, u - 1]      (registers)
+//   score[h, u] = w1 zc + w2 zp
+//   O = diag(f) O + sum_r W_r B_v[r],  W_r[h, u] = A_u[j, r] (p[h, u] w1v(u) + p[h, u + 1] w2v(u + 1))   (W half)
+// O stays in a cooperative tensor (as kernel_flash_attn_ext_tensor). A key whose previous cell is not u - 1 gets its
+// previous-cell terms from scalar code: Q . B_p for the score, a direct update of the O elements for V (skipped for
+// a window without such a key).
+#define DTPA_T_NKB 64
+
+kernel void kernel_olala_tpa_attn_tensor_f16(
+        constant ggml_metal_kargs_olala_tpa_attn & args,
+        device const char * q,
+        device const char * kc,
+        device const char * vc,
+        device const char * mask,
+        device const char * prev,
+        device       float * dst,
+        device       float * tmp,
+        threadgroup  char  * shm [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]]) {
+    constexpr int H = 48, Hn = 12, G = H/Hn, R = 4, Dh = 128;
+    constexpr int NKB = DTPA_T_NKB, HT = H, NSG = HT/4; // all heads in a threadgroup, a simdgroup per 4 heads
+    constexpr int ZS = NKB + 4;   // Z_r row stride (floats)
+    constexpr int WS = NKB + 8;   // W_r row stride (halves)
+    constexpr int NL = NKB/8;     // keys per thread
+
+    const int ic = tgpig.x;
+    const int h0 = 0;
+    const int t  = tgpig.y;
+    const int s  = tgpig.z;
+    const int n_kv = args.n_kv;
+    const int c0 = ic*args.chunk;
+    const int c1 = min(c0 + args.chunk, n_kv);
+
+    // [ Q (H*Dh half) | Z_r (H*ZS float), or W_r (H*WS half) + far V coefficients (H*NKB half) | rescale (H float) |
+    //   previous cell of each key of the window (NKB int) ]
+    threadgroup half  * sq    = (threadgroup half  *) shm;
+    threadgroup float * zr    = (threadgroup float *) (sq + HT*Dh);
+    threadgroup half  * wr    = (threadgroup half  *) zr;
+    threadgroup half  * wb    = wr + HT*WS;
+    threadgroup float * cs    = zr + HT*ZS;
+    threadgroup int   * kprev = (threadgroup int   *) (cs + HT);
+    threadgroup float * msk   = (threadgroup float *) (kprev + NKB);   // mask of the window cells
+    threadgroup half  * kcf   = (threadgroup half  *) (msk + NKB);     // per cell: ck[Hn] ak[Hn]
+    threadgroup half  * vcf   = kcf + NKB*2*Hn;                        // per cell: av[Hn]
+
+    for (int i = tiitg; i < HT*Dh; i += 32*NSG) {
+        const int h = i/Dh;
+        sq[i] = (half) ((device const float *) (q + (h0 + h)*args.nbq1 + t*args.nbq2 + s*args.nbq3))[i - h*Dh];
+    }
+
+    const int sk1 = (int) (args.nbk1/sizeof(half));
+    const int sv1 = (int) (args.nbv1/sizeof(half));
+    device const char * kcs = kc + s*args.nbk2;
+    device const char * vcs = vc + s*args.nbv2;
+    device const int32_t * pv = (device const int32_t *) (prev + s*args.nbp1);
+    device const char * mrow = mask + t*args.nbm1 + s*args.nbm3;
+    constexpr int oA = R*Dh;
+    constexpr int oS = oA + Hn*R;
+
+    // one tile per simdgroup: Z tile (16 heads x 16 cells), O tile (16 heads x 32 dims)
+    const int sg = tiitg/32;
+    const int tr = sg/4;
+    const int tc = sg%4;
+    auto tq = tensor(sq + 16*tr*Dh, dextents<int32_t, 2>(Dh, 16));
+    auto tz = tensor(zr + 16*tr*ZS + 16*tc, dextents<int32_t, 2>(16, 16), array<int, 2>({1, ZS}));
+    auto tw = tensor(wr + 16*tr*WS, dextents<int32_t, 2>(NKB, 16), array<int, 2>({1, WS}));
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(16, 16, Dh, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+        execution_simdgroups<1>> mm_qk;
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(16, 32, NKB, false, false, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<1>> mm_pv;
+
+    auto tv0 = tensor((device half *) vcs, dextents<int32_t, 2>(32, NKB), array<int, 2>({1, sv1}));
+    auto co  = mm_pv.template get_destination_cooperative_tensor<decltype(tw), decltype(tv0), float>();
+    for (short e = 0; e < co.get_capacity(); ++e) {
+        if (co.is_valid_element(e)) {
+            co[e] = 0.0f;
+        }
+    }
+
+    // thread = (head sh, keys sl, sl + 8, ...) of the window
+    const int sh = tiitg/8; // local head
+    const int sl = tiitg%8;
+    const int hj = (h0 + sh)/G;
+    float M = -INFINITY;
+    float L = 0.0f;
+
+    for (int f = c0, u0 = 0; f < c1; f = u0 + NKB) {
+        // first cell of the window: the previous cell of f (overlap), the window kept inside the cache
+        u0 = max(min(f > 0 ? f - 1 : 0, n_kv - NKB), 0);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tiitg < NKB) {
+            const int u = u0 + tiitg;
+            kprev[tiitg] = pv[u];
+            msk[tiitg] = args.mask_f16 ? (float) ((device const half *) mrow)[u] : ((device const float *) mrow)[u];
+        }
+        // per-cell scales of the window, coalesced: K ck/ak (2*Hn halves), V av (Hn halves), as half4
+        for (int w = tiitg; w < NKB*(3*Hn/4); w += 32*NSG) {
+            const int c = w/(3*Hn/4);
+            const int k = w - c*(3*Hn/4);
+            if (k < 2*Hn/4) {
+                *((threadgroup half4 *) (kcf + c*2*Hn) + k) = *((device const half4 *) ((device const half *) (kcs + (u0 + c)*args.nbk1) + oS) + k);
+            } else {
+                *((threadgroup half4 *) (vcf + c*Hn) + (k - 2*Hn/4)) = *((device const half4 *) ((device const half *) (vcs + (u0 + c)*args.nbv1) + oS) + (k - 2*Hn/4));
+            }
+        }
+
+        // A of the thread's keys
+        float4 ak[NL];
+        for (int i = 0; i < NL; ++i) {
+            const int u = u0 + sl + 8*i;
+            ak[i] = (float4) *((device const half4 *) ((device const half *) (kcs + u*args.nbk1) + oA) + hj);
+        }
+        float zc[NL];
+        for (int i = 0; i < NL; ++i) {
+            zc[i] = 0.0f;
+        }
+
+        // Z_r = Q B_k[r]^T, accumulated per key
+        for (int r = 0; r < R; ++r) {
+            auto tk = tensor((device half *) (kcs + (u0 + 16*tc)*args.nbk1) + r*Dh, dextents<int32_t, 2>(Dh, 16), array<int, 2>({1, sk1}));
+            mm_qk.run(tq, tk, tz);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int i = 0; i < NL; ++i) {
+                const int sk = sl + 8*i;
+                zc[i] += ak[i][r]*zr[sh*ZS + sk];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // contiguous previous cell: its term is the own term of key s - 1 (lane sl - 1, or lane 7 of the previous i)
+        float zp[NL];
+        for (int i = 0; i < NL; ++i) {
+            zp[i] = simd_shuffle_up(zc[i], 1);
+            const float wrap = simd_shuffle_down(zc[max(i - 1, 0)], 7);
+            if (sl == 0) {
+                zp[i] = i > 0 ? wrap : 0.0f;
+            }
+        }
+
+        // scores of the keys f .. min(u0 + NKB, c1) - 1, online softmax
+        float sc[NL];
+        float mb = -INFINITY;
+        bool far = false;
+        for (int i = 0; i < NL; ++i) {
+            const int p = kprev[sl + 8*i];
+            far = far || (p >= 0 && p != u0 + sl + 8*i - 1);
+        }
+        far = simd_any(far);
+        for (int i = 0; i < NL; ++i) {
+            const int sk = sl + 8*i;
+            const int u  = u0 + sk;
+            float x = -INFINITY;
+            if (u >= f && u < c1) {
+                const float ck = kcf[sk*2*Hn + hj];
+                const float aw = kcf[sk*2*Hn + Hn + hj];
+                float v = ck*(1.0f - aw)*zc[i];
+                const int p = kprev[sk];
+                if (p >= 0) {
+                    float z = zp[i];
+                    if (p != u - 1) {
+                        device const half * rp = (device const half *) (kcs + p*args.nbk1);
+                        z = 0.0f;
+                        for (int r = 0; r < R; ++r) {
+                            float d = 0.0f;
+                            for (int e = 0; e < Dh; ++e) {
+                                d += (float) sq[sh*Dh + e]*(float) rp[r*Dh + e];
+                            }
+                            z += (float) rp[oA + hj*R + r]*d;
+                        }
+                    }
+                    v += ck*aw*z;
+                }
+                v *= args.scale;
+                if (args.softcap != 0.0f) {
+                    v = args.softcap*precise::tanh(v/args.softcap);
+                }
+                x = v + msk[sk];
+            }
+            sc[i] = x;
+            mb = max(mb, x);
+        }
+        mb = max(mb, simd_shuffle_xor(mb, 1));
+        mb = max(mb, simd_shuffle_xor(mb, 2));
+        mb = max(mb, simd_shuffle_xor(mb, 4));
+        const float Mn = max(M, mb);
+        const float fc = Mn == -INFINITY ? 1.0f : exp(M - Mn);
+        float pw[NL];
+        float ps = 0.0f;
+        for (int i = 0; i < NL; ++i) {
+            pw[i] = sc[i] == -INFINITY ? 0.0f : exp(sc[i] - Mn);
+            ps += pw[i];
+        }
+        ps += simd_shuffle_xor(ps, 1);
+        ps += simd_shuffle_xor(ps, 2);
+        ps += simd_shuffle_xor(ps, 4);
+        L = L*fc + ps;
+        M = Mn;
+
+        // V side: per key the weight of its rank rows, and the coefficient of a far previous cell
+        float  cw[NL];
+        float4 av4[NL];
+        for (int i = 0; i < NL; ++i) {
+            const int sk = sl + 8*i;
+            const int u  = u0 + sk;
+            // p of the next key: lane sl + 1, or the next i for sl == 7
+            float pn = simd_shuffle_down(pw[i], 1);
+            if (sl == 7) {
+                pn = i + 1 < NL ? simd_shuffle_up(pw[min(i + 1, NL - 1)], 7) : 0.0f;
+            }
+            device const half * rv = (device const half *) (vcs + u*args.nbv1);
+            const float av = vcf[sk*Hn + hj];
+            cw[i] = pw[i]*(1.0f - av)/(float) R;
+            if (sk + 1 < NKB && kprev[sk + 1] == u) {
+                cw[i] += pn*(float) vcf[(sk + 1)*Hn + hj]/(float) R;
+            }
+            av4[i] = (float4) *((device const half4 *) (rv + oA) + hj);
+            const int p = kprev[sk];
+            if (far) {
+                wb[sh*NKB + sk] = (half) (p >= 0 && p != u - 1 ? pw[i]*av/(float) R : 0.0f);
+            }
+        }
+        if (sl == 0) {
+            cs[sh] = fc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short e = 0; e < co.get_capacity(); ++e) {
+            if (co.is_valid_element(e)) {
+                co[e] *= cs[16*tr + co.get_multidimensional_index(e)[1]];
+            }
+        }
+
+        // O += sum_r W_r B_v[r]
+        for (int r = 0; r < R; ++r) {
+            if (r > 0) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            for (int i = 0; i < NL; ++i) {
+                wr[sh*WS + sl + 8*i] = (half) (cw[i]*av4[i][r]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            auto tv = tensor((device half *) (vcs + u0*args.nbv1) + r*Dh + 32*tc, dextents<int32_t, 2>(32, NKB), array<int, 2>({1, sv1}));
+            mm_pv.run(tw, tv, co);
+        }
+        // keys whose previous cell is not u - 1: O[h] += wb[h] sum_r A_p[j, r] B_p[r] (none in the window: skipped)
+        for (int sk = 0; sk < (far ? NKB : 0); ++sk) {
+            const int p = kprev[sk];
+            if (p < 0 || p == u0 + sk - 1) {
+                continue;
+            }
+            device const half * rp = (device const half *) (vcs + p*args.nbv1);
+            for (short e = 0; e < co.get_capacity(); ++e) {
+                if (co.is_valid_element(e)) {
+                    const auto ix = co.get_multidimensional_index(e);
+                    const int h = 16*tr + ix[1];
+                    const int d = 32*tc + ix[0];
+                    float x = 0.0f;
+                    for (int r = 0; r < R; ++r) {
+                        x += (float) rp[oA + ((h0 + h)/G)*R + r]*(float) rp[r*Dh + d];
+                    }
+                    co[e] += (float) wb[h*NKB + sk]*x;
+                }
+            }
+        }
+    }
+
+    // final when one chunk, else partials [m, l, o]
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const size_t row0 = ((size_t) s*args.T + t)*H + h0;
+    if (sl == 0) {
+        cs[sh] = args.n_chunk == 1 ? (L > 0.0f ? 1.0f/L : 0.0f) : 1.0f;
+        if (args.n_chunk > 1) {
+            tmp[((row0 + sh)*args.n_chunk + ic)*(Dh + 2) + 0] = M;
+            tmp[((row0 + sh)*args.n_chunk + ic)*(Dh + 2) + 1] = L;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short e = 0; e < co.get_capacity(); ++e) {
+        if (co.is_valid_element(e)) {
+            co[e] *= cs[16*tr + co.get_multidimensional_index(e)[1]];
+        }
+    }
+    if (args.n_chunk == 1) {
+        auto td = tensor(dst + (row0 + 16*tr)*Dh + 32*tc, dextents<int32_t, 2>(32, 16), array<int, 2>({1, Dh}));
+        co.store(td);
+    } else {
+        auto td = tensor(tmp + ((row0 + 16*tr)*args.n_chunk + ic)*(Dh + 2) + 2 + 32*tc, dextents<int32_t, 2>(32, 16), array<int, 2>({1, args.n_chunk*(Dh + 2)}));
+        co.store(td);
+    }
+}
+#endif // GGML_METAL_HAS_TENSOR
+
 // expanded K or V of a factored TPA cache (semantic reference: ggml_compute_forward_olala_tpa_expand): one
 // threadgroup per (cell, stream), thread item (kv head, 4 elements)
 template<typename KT, typename KT4>

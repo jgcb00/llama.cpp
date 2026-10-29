@@ -2719,10 +2719,10 @@ int ggml_metal_op_olala_tpa_prep(ggml_metal_op_t ctx, int idx) {
     return n_fuse;
 }
 
-size_t ggml_metal_op_olala_tpa_attn_extra_tmp(const ggml_tensor * op, int gpu_cores) {
+size_t ggml_metal_op_olala_tpa_attn_extra_tmp(const ggml_tensor * op, int gpu_cores, bool has_tensor) {
     assert(op->op == GGML_OP_OLALA_TPA_ATTN);
 
-    const ggml_metal_olala_tpa_attn_split sp = ggml_metal_op_olala_tpa_attn_split(op, gpu_cores);
+    const ggml_metal_olala_tpa_attn_split sp = ggml_metal_op_olala_tpa_attn_split(op, gpu_cores, has_tensor);
     if (sp.n_chunk == 1) {
         return 0;
     }
@@ -2742,7 +2742,8 @@ int ggml_metal_op_olala_tpa_attn(ggml_metal_op_t ctx, int idx) {
     const ggml_tensor * mask = op->src[3];
     const ggml_tensor * prev = op->src[4];
 
-    const ggml_metal_olala_tpa_attn_split sp = ggml_metal_op_olala_tpa_attn_split(op, ggml_metal_device_get_props(ctx->dev)->gpu_core_count);
+    const auto * props = ggml_metal_device_get_props(ctx->dev);
+    const ggml_metal_olala_tpa_attn_split sp = ggml_metal_op_olala_tpa_attn_split(op, props->gpu_core_count, props->has_tensor);
 
     ggml_metal_kargs_olala_tpa_attn args = {};
     args.H       = (int32_t) q->ne[1];
@@ -2769,8 +2770,21 @@ int ggml_metal_op_olala_tpa_attn(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_tmp = bid_dst;
     bid_tmp.offs += ggml_nbytes(op);
 
+    // matrix units (M5 / A19): the tensor-API kernel, all 48 heads per threadgroup, one simdgroup per 16 x 16 Z tile
+    const bool use_tensor = ggml_metal_op_olala_tpa_attn_use_tensor(op, props->has_tensor);
+
     auto pipeline = ggml_metal_library_get_pipeline_olala_tpa_attn(lib, op, false);
-    const int nth = 32*args.Hn; // one simdgroup per kv head
+    int nth = 32*args.Hn; // one simdgroup per kv head
+    if (use_tensor) {
+        const char * kname = "kernel_olala_tpa_attn_tensor_f16";
+        pipeline = ggml_metal_library_get_pipeline(lib, kname);
+        if (!pipeline.pipeline) {
+            pipeline = ggml_metal_library_compile_pipeline(lib, kname, kname, nullptr);
+        }
+        // [ Q (48*Dh half) | Z_r (48*68 float) = W_r + far coefficients | rescale (48 float) | prev, mask (64) | scales (64*3*12 half) ]
+        pipeline.smem = GGML_PAD(48*128*2 + 48*68*4 + 48*4 + 64*4 + 64*4 + 64*3*12*2, 16);
+        nth = 32*12;
+    }
     GGML_ASSERT(nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);

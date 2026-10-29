@@ -247,15 +247,22 @@ size_t ggml_metal_op_olala_tpa_attn_smem(const struct ggml_tensor * op, int nc) 
     return Hn*nc*Dh*2 + Hn*(64*4 + 64*2) + (nc*(2*Hn*R + 2*Hn) + 1)/2*2*2 + 2*nc*4;
 }
 
-struct ggml_metal_olala_tpa_attn_split ggml_metal_op_olala_tpa_attn_split(const struct ggml_tensor * op, int gpu_cores) {
+bool ggml_metal_op_olala_tpa_attn_use_tensor(const struct ggml_tensor * op, bool has_tensor) {
+    const ggml_tensor * q = op->src[0];
+    const ggml_tensor * k = op->src[1];
+    return has_tensor && k->type == GGML_TYPE_F16 && q->ne[0] == 128 && q->ne[1] == 48 &&
+        ggml_get_op_params_i32(op, 0) == 12 && ggml_get_op_params_i32(op, 1) == 4 && k->ne[1] >= 64;
+}
+
+struct ggml_metal_olala_tpa_attn_split ggml_metal_op_olala_tpa_attn_split(const struct ggml_tensor * op, int gpu_cores, bool has_tensor) {
     const int64_t n_kv = op->src[1]->ne[1];
     const int64_t T    = op->src[0]->ne[2]*op->src[0]->ne[3];
 
     ggml_metal_olala_tpa_attn_split res;
     res.nc = 8; // DTPA_NC
-    // decode: one threadgroup per GPU core (a single wave: one threadgroup fits per core), fewer chunks per token for
-    // batches; unknown core count: 64
-    const int64_t ntg  = gpu_cores > 0 ? gpu_cores : 64;
+    // decode: one threadgroup per GPU core (a single wave: one threadgroup fits per core), two with the tensor kernel
+    // (two fit; measured best on M5 Max), fewer chunks per token for batches; unknown core count: 64
+    const int64_t ntg  = (gpu_cores > 0 ? gpu_cores : 64)*(ggml_metal_op_olala_tpa_attn_use_tensor(op, has_tensor) ? 2 : 1);
     const int64_t want = std::max<int64_t>(1, std::min<int64_t>((ntg + T - 1)/T, (n_kv + 4*res.nc - 1)/(4*res.nc)));
     const int64_t chunk = ((n_kv + want - 1)/want + res.nc - 1)/res.nc*res.nc;
     res.chunk   = (int) std::max<int64_t>(chunk, res.nc);

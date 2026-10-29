@@ -246,7 +246,8 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             } break;
         case GGML_OP_OLALA_TPA_ATTN:
             {
-                res += ggml_metal_op_olala_tpa_attn_extra_tmp(tensor, ggml_metal_device_get_props((ggml_metal_device_t) buft->device->context)->gpu_core_count);
+                const auto * props = ggml_metal_device_get_props((ggml_metal_device_t) buft->device->context);
+                res += ggml_metal_op_olala_tpa_attn_extra_tmp(tensor, props->gpu_core_count, props->has_tensor);
             } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:

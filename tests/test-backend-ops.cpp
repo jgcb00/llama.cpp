@@ -5208,17 +5208,19 @@ struct test_olala_tpa_prep : public test_case {
 struct test_olala_tpa_attn : public test_case {
     const int H, Hn, R, Dh, n_kv, T, ns;
     const ggml_type type_kv;
+    const bool contig; // previous cell c - 1 everywhere (one sequence per stream, as in decode)
 
     std::string vars() override {
-        return VARS_TO_STR8(H, Hn, R, Dh, n_kv, T, ns, type_kv);
+        return VARS_TO_STR9(H, Hn, R, Dh, n_kv, T, ns, type_kv, contig);
     }
 
     double max_nmse_err() override {
         return 5e-4;
     }
 
-    test_olala_tpa_attn(int H = 48, int Hn = 12, int R = 4, int Dh = 128, int n_kv = 256, int T = 1, int ns = 1, ggml_type type_kv = GGML_TYPE_F16)
-        : H(H), Hn(Hn), R(R), Dh(Dh), n_kv(n_kv), T(T), ns(ns), type_kv(type_kv) {}
+    test_olala_tpa_attn(int H = 48, int Hn = 12, int R = 4, int Dh = 128, int n_kv = 256, int T = 1, int ns = 1, ggml_type type_kv = GGML_TYPE_F16,
+            bool contig = false)
+        : H(H), Hn(Hn), R(R), Dh(Dh), n_kv(n_kv), T(T), ns(ns), type_kv(type_kv), contig(contig) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, Dh, H, T, ns);
@@ -5242,7 +5244,7 @@ struct test_olala_tpa_attn : public test_case {
                 for (int i = 0; i < n_kv*ns; ++i) {
                     const int c = i % n_kv;
                     const int r = rng() % 16;
-                    p[i] = c == 0 || r == 0 ? -1 : (r == 1 ? (int) (rng() % n_kv) : c - 1);
+                    p[i] = contig ? c - 1 : (c == 0 || r == 0 ? -1 : (r == 1 ? (int) (rng() % n_kv) : c - 1));
                 }
                 ggml_backend_tensor_set(t, p.data(), 0, p.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "mask") == 0) {
@@ -11852,6 +11854,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_kv : { GGML_TYPE_F16, GGML_TYPE_F32 }) {
         test_cases.emplace_back(new test_olala_tpa_attn(48, 12, 4, 128, 256,  1, 1, type_kv));  // decode
         test_cases.emplace_back(new test_olala_tpa_attn(48, 12, 4, 128, 1000, 1, 2, type_kv));  // 2 streams, partial chunk
+        test_cases.emplace_back(new test_olala_tpa_attn(48, 12, 4, 128, 4100, 1, 1, type_kv, true)); // one sequence
         test_cases.emplace_back(new test_olala_tpa_attn(48, 12, 4, 128, 96,   7, 1, type_kv));  // several tokens
         test_cases.emplace_back(new test_olala_tpa_attn(16, 4,  3, 64,  37,   3, 1, type_kv));  // small dims
     }
@@ -11926,9 +11929,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
-    // Olala factored TPA attention, decode at 8k and 32k cells
-    for (int n_kv : { 8192, 32768 }) {
-        test_cases.emplace_back(new test_olala_tpa_attn(48, 12, 4, 128, n_kv, 1, 1, GGML_TYPE_F16));
+    // Olala factored TPA attention, decode of one sequence (contiguous cells), and the full-cache equivalent
+    // (flash_attn_ext, 12 kv heads x GQA 4, softcap 150)
+    for (int n_kv : { 256, 1024, 4096, 8192, 32768, 131072 }) {
+        test_cases.emplace_back(new test_olala_tpa_attn(48, 12, 4, 128, n_kv, 1, 1, GGML_TYPE_F16, true));
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 12, {4, 1}, n_kv, 1, true, false, 0.0f, 150.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands

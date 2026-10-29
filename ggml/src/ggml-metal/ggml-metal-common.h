@@ -78,7 +78,9 @@ struct ggml_metal_olala_tpa_attn_split {
     int chunk;
     int n_chunk;
 };
-struct ggml_metal_olala_tpa_attn_split ggml_metal_op_olala_tpa_attn_split(const struct ggml_tensor * op, int gpu_cores);
+struct ggml_metal_olala_tpa_attn_split ggml_metal_op_olala_tpa_attn_split(const struct ggml_tensor * op, int gpu_cores, bool has_tensor);
+// GGML_OP_OLALA_TPA_ATTN with the Metal 4 tensor API (kernel_olala_tpa_attn_tensor_f16): Olala dims, f16 cache
+bool ggml_metal_op_olala_tpa_attn_use_tensor(const struct ggml_tensor * op, bool has_tensor);
 size_t ggml_metal_op_olala_tpa_attn_smem(const struct ggml_tensor * op, int nc);
 
 #ifdef __cplusplus

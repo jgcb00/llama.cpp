@@ -52,7 +52,7 @@ size_t ggml_metal_op_mamba3_mimo_extra_ws(const struct ggml_tensor * op);
 
 // GGML_OP_OLALA_MOE workspace: [lat | logits | ush | weighted partial expert outputs] after dst
 size_t ggml_metal_op_olala_moe_extra_ws(const struct ggml_tensor * op);
-size_t ggml_metal_op_olala_tpa_attn_extra_tmp(const struct ggml_tensor * op, int gpu_cores);
+size_t ggml_metal_op_olala_tpa_attn_extra_tmp(const struct ggml_tensor * op, int gpu_cores, bool has_tensor);
 
 int ggml_metal_op_concat            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_repeat            (ggml_metal_op_t ctx, int idx);
