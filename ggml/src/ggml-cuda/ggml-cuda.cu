@@ -1631,6 +1631,15 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     }
 }
 
+// [TAG_GGML_PREC] src1 must not go below bf16 (activations beyond the half range): do not use the kernels with fp16 scales
+static bool ggml_cuda_mul_mat_src1_wide(const ggml_tensor * src0, const ggml_tensor * dst) {
+    if (!ggml_is_quantized(src0->type)) {
+        return false;
+    }
+    const ggml_prec prec = (ggml_prec) ggml_get_op_params_i32(dst, 3);
+    return prec == GGML_PREC_F32 || prec == GGML_PREC_BF16;
+}
+
 static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const ggml_prec prec = (ggml_prec) ggml_get_op_params_i32(dst, 0);
@@ -1648,6 +1657,9 @@ static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml
         }
     }
     // F16 is the only compute type that can not satisfy a request for BF16
+    if (ggml_cuda_mul_mat_src1_wide(src0, dst) && compute_type == GGML_TYPE_F16) {
+        compute_type = fast_bf16_hardware_available(cc) ? GGML_TYPE_BF16 : GGML_TYPE_F32;
+    }
     if (prec == GGML_PREC_BF16 && compute_type == GGML_TYPE_F16) {
         compute_type = fast_bf16_hardware_available(cc) ? GGML_TYPE_BF16 : GGML_TYPE_F32;
     } else if (prec == GGML_PREC_F32) {
@@ -1819,6 +1831,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
                              dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
+    if (ggml_cuda_mul_mat_src1_wide(src0, dst)) {
+        return false;
+    }
+
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (cc <= GGML_CUDA_CC_PASCAL) {
@@ -1880,6 +1896,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
+    if (ggml_cuda_mul_mat_src1_wide(src0, dst)) {
+        if (ggml_cuda_mmq_has_f32_scale(src0->type) && ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        } else {
+            ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        }
+        return;
+    }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
@@ -1899,6 +1923,11 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
+    }
+
+    if (ggml_cuda_mul_mat_src1_wide(src0, dst)) {
+        return !(ggml_cuda_mmq_has_f32_scale(src0->type) &&
+                 ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2]));
     }
 
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
@@ -1935,7 +1964,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    const bool src1_wide = ggml_cuda_mul_mat_src1_wide(src0, dst);
+    if (src1_wide) {
+        if (ggml_cuda_mmq_has_f32_scale(src0->type) && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+            return;
+        }
+        // else: per-expert products below (cuBLAS on the dequantized expert slices)
+    } else if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
