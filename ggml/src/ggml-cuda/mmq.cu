@@ -123,6 +123,11 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
         prec = (ggml_prec) ggml_get_op_params_i32(dst, 3);
     }
 
+    // [TAG_GGML_PREC] float precision request: the caller only sends it here for the layouts with fp32 scales
+    if (prec == GGML_PREC_F32 || prec == GGML_PREC_BF16 || prec == GGML_PREC_F16) {
+        return GGML_PREC_Q8;
+    }
+
     // Q4 only for the FP4 types on Blackwell
     GGML_ASSERT(prec == GGML_PREC_UNDEFINED || prec == GGML_PREC_Q8 || prec == GGML_PREC_Q4);
     const bool can_use_q4 = (src0->type == GGML_TYPE_NVFP4 || src0->type == GGML_TYPE_MXFP4) && blackwell_mma_available(cc);
@@ -313,6 +318,27 @@ void ggml_cuda_mul_mat_q(
         ne12, ncols_opt};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+}
+
+bool ggml_cuda_mmq_has_f32_scale(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ4_NL:
+            return mmq_get_q8_1_ds_layout(type) == MMQ_Q8_1_DS_LAYOUT_D4;
+        default:
+            return false;
+    }
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
