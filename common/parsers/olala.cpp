@@ -63,7 +63,7 @@ common_chat_params common_chat_params_init_olala(const common_chat_template &   
             data.generation_prompt += CH_END + FINAL_OPEN + msg.render_content();
         }
 
-        data.prompt += data.generation_prompt;
+        data.prompt.append(data.generation_prompt);
     }
 
     auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
@@ -72,7 +72,7 @@ common_chat_params common_chat_params_init_olala(const common_chat_template &   
     auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
     auto include_grammar     = has_response_format || tools_enabled;
 
-    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+    data.parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
         auto start = p.optional(p.literal(ASSISTANT));
 
         // with reasoning extraction off, the analysis channel stays inline in the content
@@ -107,7 +107,7 @@ common_chat_params common_chat_params_init_olala(const common_chat_template &   
 
         //   <call id="ID"><name>NAME</name><arguments>{json}</arguments></call>
         auto tool_choices = p.choice();
-        foreach_function(inputs.tools, [&](const json & tool) {
+        foreach_function(inputs.tools, [&](size_t /*tool_index*/, const json & tool) {
             const auto & function = tool.at("function");
             std::string  name     = function.at("name");
             const auto   schema   = common_chat_tool_parameters(function);
@@ -139,12 +139,10 @@ common_chat_params common_chat_params_init_olala(const common_chat_template &   
                extra_channels + trailer;
     });
 
-    data.parser = parser.save();
-
     if (include_grammar) {
         data.grammar_lazy = !has_response_format && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
-            parser.build_grammar(builder, data.grammar_lazy);
+            data.parser.build_grammar(builder, data.grammar_lazy);
         });
 
         data.grammar_triggers = {

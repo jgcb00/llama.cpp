@@ -5,7 +5,7 @@
 #include "simd-mappings.h"
 
 // TODO: add support for sizeless vector types
-#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v_intrinsic)
+#if defined(GGML_SIMD) && !defined(__ARM_FEATURE_SVE) && !defined(__riscv_v)
 
 // These are in units of GGML_F32_EPR
 #if defined(__AVX512F__)
@@ -14,7 +14,7 @@
     // on Zen 4 for the flash-attention tile shapes (M=64, K=64..256, N=64..256).
     static constexpr int GEMM_RM = 8;
     static constexpr int GEMM_RN = 2; // 16+2+1 = 19/32
-#elif defined (__ARM_NEON__)
+#elif defined(__ARM_NEON)
     static constexpr int GEMM_RM = 4;
     static constexpr int GEMM_RN = 4; // 16+4+1 = 25/32
 #elif defined(__AVX2__) || defined(__AVX__)
@@ -171,7 +171,7 @@ static void simd_gemm(
         C += N;
     }
 }
-#elif defined(GGML_SIMD) && defined(__riscv_v_intrinsic)
+#elif defined(GGML_SIMD) && defined(__riscv_v)
 // RM accumulators + 1 B vector = RM + 1 <= 8  =>  RM <= 7
 // Microkernel: C[RM x vl] += A[RM x K] * B[K x N]
 template <int RM>
