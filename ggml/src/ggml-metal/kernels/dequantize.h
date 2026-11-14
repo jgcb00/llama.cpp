@@ -683,13 +683,15 @@ void dequantize_iq4_nl(device const block_iq4_nl * xb, short il, thread type4x4 
     const float d = xb->d;
     uint32_t aux32;
     thread const uint8_t * q8 = (thread const uint8_t *)&aux32;
+    float4x4 reg_f; // computed in float, converted once: also valid for bfloat4x4 (Olala bf-operand kernels)
     for (int i = 0; i < 4; ++i) {
         aux32 = ((q4[2*i] | (q4[2*i+1] << 16)) >> 4*il) & 0x0f0f0f0f;
-        reg[i][0] = d * kvalues_iq4nl_f[q8[0]];
-        reg[i][1] = d * kvalues_iq4nl_f[q8[1]];
-        reg[i][2] = d * kvalues_iq4nl_f[q8[2]];
-        reg[i][3] = d * kvalues_iq4nl_f[q8[3]];
+        reg_f[i][0] = d * kvalues_iq4nl_f[q8[0]];
+        reg_f[i][1] = d * kvalues_iq4nl_f[q8[1]];
+        reg_f[i][2] = d * kvalues_iq4nl_f[q8[2]];
+        reg_f[i][3] = d * kvalues_iq4nl_f[q8[3]];
     }
+    reg = (type4x4) reg_f;
 }
 
 template <typename type4>

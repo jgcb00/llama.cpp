@@ -3504,7 +3504,9 @@ static ggml_tensor * build_olala_v_mixer(
 
         ggml_tensor * k4   = mctx_kv->get_k(ctx, il);                                    // (KR/n_kv, n_kv, n_kv_cells, ns)
         ggml_tensor * v4   = mctx_kv->get_v(ctx, il);
-        ggml_tensor * mask = inp_attn->get_kq_mask();                                    // (n_kv_cells, T/ns, 1, ns)
+        // v1.0: the mask is an llm_attn_mask; the factored TPA path reads all the cells (no per-sequence rows)
+        GGML_ASSERT(inp_attn->self_attn_mask.rows == nullptr);
+        ggml_tensor * mask = inp_attn->self_attn_mask.raw;                                    // (n_kv_cells, T/ns, 1, ns)
         const int64_t n_cells = k4->ne[2];
         const int64_t ns      = mask->ne[3];
         ggml_tensor * kc = ggml_view_3d(ctx, k4, KR, n_cells, ns, k4->nb[2], k4->nb[3], 0);
@@ -3523,7 +3525,7 @@ static ggml_tensor * build_olala_v_mixer(
             ggml_tensor * ve = ggml_olala_tpa_expand(ctx, vc, inp_attn->self_prev_cell, (int) n_kv, (int) rank, (int) head_dim, true);
             ggml_set_name(ke, "v_tpa_k");
             ggml_set_name(ve, "v_tpa_v");
-            attn_out = gctx.build_attn_mha(Qf, ke, ve, nullptr, mask, nullptr, nullptr, 0, kq_scale, il);
+            attn_out = gctx.build_attn_mha(Qf, ke, ve, nullptr, mask, nullptr, nullptr, nullptr, 0, kq_scale, il);
         } else {
             ggml_tensor * q4 = ggml_reshape_4d(ctx, Qf, head_dim, n_head, n_tokens/ns, ns);
             attn_out = ggml_olala_tpa_attn(ctx, q4, kc, vc, mask, inp_attn->self_prev_cell, (int) n_kv, (int) rank, kq_scale, softcap);
