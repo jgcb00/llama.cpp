@@ -12178,9 +12178,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 1024, 7, 1024));  // many rows
 
     // src1 precision: few-row paths, aligned tiles, partial tiles (K and output), broadcast batches
-    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
-        // Q8_0 requires K to be a multiple of its block size (32)
-        const int64_t k_partial = type_a == GGML_TYPE_Q8_0 ? 96 : 100;
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
+        // Q8_0 and IQ4_NL require K to be a multiple of their block size (32)
+        const int64_t k_partial = type_a == GGML_TYPE_Q8_0 || type_a == GGML_TYPE_IQ4_NL ? 96 : 100;
         test_cases.emplace_back(new test_mul_mat_prec_src1_bf16(type_a,  64,   1, 256));
         test_cases.emplace_back(new test_mul_mat_prec_src1_bf16(type_a,  64,   8, 256));
         test_cases.emplace_back(new test_mul_mat_prec_src1_bf16(type_a,  64,  32, 256));

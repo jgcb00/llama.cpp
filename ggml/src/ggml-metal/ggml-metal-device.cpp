@@ -1030,7 +1030,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
 
 // weight types with a bfloat-operand matrix-matrix kernel (kernel_mul_mm[_id]_<type>_f32_bf)
 static bool ggml_metal_mm_has_bf(ggml_type t) {
-    return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K;
+    return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K || t == GGML_TYPE_IQ4_NL;
 }
 
 // threadgroups needed to fill the GPU

@@ -1570,7 +1570,7 @@ static bool ggml_metal_supports_mul_mat_src1_prec(const struct ggml_tensor * op,
         // matrix-vector kernels read src1 as f32 [TAG_GGML_PREC]
         const enum ggml_type t = op->src[0]->type;
         return has_bfloat &&
-            (t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K);
+            (t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q6_K || t == GGML_TYPE_IQ4_NL);
     }
     return true;
 }
