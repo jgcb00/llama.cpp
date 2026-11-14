@@ -2313,6 +2313,20 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
             .run();
 
+        // tools + response_format: the response format wins and its grammar must stay eager
+        // (a lazy grammar here had an empty root and every request failed with HTTP 400)
+        tst.test(
+               "I need to output the invoice details in JSON\n"
+               "</think>\n\n"
+               R"({"amount": 123.45, "date": "2025-12-03"})")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({ special_function_tool })
+            .json_schema(invoice_schema)
+            .expect_reasoning("I need to output the invoice details in JSON")
+            .expect_content(R"({"amount": 123.45, "date": "2025-12-03"})")
+            .run();
+
         // a tool call ends the prefilled thinking block, with or without a closing </think>
         tst.test(
                "<tool_call>\n"
